@@ -5,6 +5,7 @@
 
 pub mod address_pgp;
 pub mod client;
+pub mod eip191;
 pub mod envelope;
 pub mod frame;
 pub mod listen;

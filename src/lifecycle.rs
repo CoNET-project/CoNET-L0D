@@ -30,6 +30,14 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
         }
     );
     println!(
+        "l0.eth_key     {}",
+        if cfg.l0.routing_eth_key_file.is_some() {
+            "set"
+        } else {
+            "unset"
+        }
+    );
+    println!(
         "l0.mailbox_rt  {}",
         if cfg.l0.mailbox_route_pgp_file.is_some() {
             "set"

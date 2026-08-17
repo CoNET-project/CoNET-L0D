@@ -1,13 +1,15 @@
 //! Inbound overlay: decrypt user-PGP armor and recover raw IPv4 for TUN write-back.
 //!
-//! In-crate listen worker: wrap `mining` + `listenKind: chat` to **this host's**
-//! mailbox B route PGP, `POST { "data" }` to entry **C**, read SSE, extract
-//! user-PGP armor. No `Securitykey`. No EIP-191 `signMessage` in this revision
-//! (production SI `checkSign` will reject). Tests use wiremock only.
+//! In-crate listen worker: EIP-191-sign `mining` + `listenKind: chat`, wrap
+//! `base64({ message, signMessage })` to **this host's** mailbox B route PGP,
+//! `POST { "data" }` to entry **C**, read SSE, extract user-PGP armor.
+//! No `Securitykey`. Tests use wiremock only. Do not POST production SI from tests.
 #![allow(dead_code)]
 
 use crate::error::L0dError;
-use crate::l0::{envelope, pgp, post};
+use crate::l0::eip191::EthSecret;
+use crate::l0::{eip191, envelope, pgp, post};
+use base64::Engine;
 use sequoia_openpgp::Cert;
 use serde_json::Value;
 use std::time::Duration;
@@ -31,14 +33,50 @@ pub fn encode_listen_command(wallet: &str, timestamp: u64) -> Result<String, L0d
     Ok(text)
 }
 
-/// Encrypt the listen command to mailbox **B route PGP**. HTTP body is still `{ data }`.
-pub fn wrap_listen_for_post(command_json: &str, route_pub_armored: &str) -> Result<String, L0dError> {
+/// SI inner plaintext: `base64(JSON.stringify({ message, signMessage }))`.
+/// `message` is the unsigned command JSON. `signMessage` is EIP-191 of that exact string.
+pub fn encode_signed_listen_plaintext(
+    command_json: &str,
+    eth: &EthSecret,
+) -> Result<String, L0dError> {
     if command_json.contains("Securitykey") {
         return Err(L0dError::L0(
             "refusing to encrypt a listen command that contains Securitykey".into(),
         ));
     }
-    pgp::encrypt_utf8(command_json, route_pub_armored)
+    if command_json.contains("signMessage") {
+        return Err(L0dError::L0(
+            "listen command JSON must not embed signMessage; it belongs in the SI wrapper".into(),
+        ));
+    }
+    let parsed: Value = serde_json::from_str(command_json)
+        .map_err(|e| L0dError::L0(format!("listen command JSON: {e}")))?;
+    let wallet = parsed
+        .get("walletAddress")
+        .and_then(Value::as_str)
+        .ok_or_else(|| L0dError::L0("listen command needs walletAddress".into()))?;
+    if !eip191::eoa_eq(wallet, eth.address()) {
+        return Err(L0dError::L0(
+            "routing ETH key does not match listen walletAddress".into(),
+        ));
+    }
+    let sign_message = eth.personal_sign(command_json.as_bytes())?;
+    let envelope = serde_json::json!({
+        "message": command_json,
+        "signMessage": sign_message,
+    });
+    let text = serde_json::to_string(&envelope).map_err(|e| L0dError::L0(e.to_string()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(text.as_bytes()))
+}
+
+/// Encrypt the SI listen wrapper to mailbox **B route PGP**. HTTP body is still `{ data }`.
+pub fn wrap_listen_for_post(
+    command_json: &str,
+    route_pub_armored: &str,
+    eth: &EthSecret,
+) -> Result<String, L0dError> {
+    let plaintext = encode_signed_listen_plaintext(command_json, eth)?;
+    pgp::encrypt_utf8(&plaintext, route_pub_armored)
 }
 
 pub fn looks_like_ipv4(pkt: &[u8]) -> bool {
@@ -71,9 +109,10 @@ pub fn prepare_listen_post(
     timestamp: u64,
     route_pub_armored: &str,
     entry: &str,
+    eth: &EthSecret,
 ) -> Result<(String, String), L0dError> {
     let cmd = encode_listen_command(wallet, timestamp)?;
-    let armor = wrap_listen_for_post(&cmd, route_pub_armored)?;
+    let armor = wrap_listen_for_post(&cmd, route_pub_armored, eth)?;
     let url = post::post_url(entry)?;
     Ok((url, armor))
 }
@@ -217,7 +256,14 @@ pub fn extract_pgp_armors_from_sse(chunk: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::l0::eip191::{recover_personal_sign, EthSecret};
     use crate::l0::pgp::{encrypt_utf8, generate_test_cert, mailbox_work_json, public_cert_armored};
+
+    fn test_eth() -> EthSecret {
+        let mut bytes = [0u8; 32];
+        bytes[31] = 1;
+        EthSecret::from_bytes(&bytes).unwrap()
+    }
 
     #[test]
     fn listen_command_is_chat_kind_without_secrets() {
@@ -231,13 +277,34 @@ mod tests {
     }
 
     #[test]
-    fn listen_encrypts_to_route_only() {
+    fn listen_wrap_is_si_checksign_shape() {
+        let eth = test_eth();
+        let route = generate_test_cert();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let cmd = encode_listen_command(eth.address(), 9).unwrap();
+        let armor = wrap_listen_for_post(&cmd, &route_pub, &eth).unwrap();
+        assert!(pgp::is_pgp_message_armor(&armor));
+        let b64 = pgp::decrypt_utf8(&armor, &route).unwrap();
+        assert!(!b64.contains("Securitykey"));
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .expect("si wrapper is base64");
+        let wrapper: Value = serde_json::from_slice(&raw).unwrap();
+        let message = wrapper["message"].as_str().unwrap();
+        let sig = wrapper["signMessage"].as_str().unwrap();
+        assert_eq!(message, cmd);
+        assert!(!message.contains("Securitykey"));
+        assert_eq!(recover_personal_sign(message.as_bytes(), sig).unwrap(), eth.address());
+    }
+
+    #[test]
+    fn listen_wrap_refuses_key_mismatch() {
+        let eth = test_eth();
         let route = generate_test_cert();
         let route_pub = public_cert_armored(&route).unwrap();
         let cmd = encode_listen_command("0x2222222222222222222222222222222222222222", 9).unwrap();
-        let armor = wrap_listen_for_post(&cmd, &route_pub).unwrap();
-        assert!(pgp::is_pgp_message_armor(&armor));
-        assert_eq!(pgp::decrypt_utf8(&armor, &route).unwrap(), cmd);
+        let err = wrap_listen_for_post(&cmd, &route_pub, &eth).unwrap_err();
+        assert!(err.to_string().contains("does not match"));
     }
 
     #[test]
@@ -328,15 +395,17 @@ mod tests {
             .mount(&server)
             .await;
 
+        let eth = test_eth();
         let (url, listen_armor) = prepare_listen_post(
-            "0x1111111111111111111111111111111111111111",
+            eth.address(),
             1_710_000_000,
             &route_pub,
             &server.uri(),
+            &eth,
         )
         .unwrap();
         assert!(url.ends_with("/post"));
-        assert_eq!(pgp::decrypt_utf8(&listen_armor, &route).unwrap().contains("Securitykey"), false);
+        assert!(!pgp::decrypt_utf8(&listen_armor, &route).unwrap().contains("Securitykey"));
 
         let (tx, mut rx) = mpsc::channel::<String>(4);
         let client = listen_http_client().unwrap();

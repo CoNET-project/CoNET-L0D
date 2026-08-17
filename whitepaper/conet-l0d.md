@@ -1,7 +1,7 @@
 # conet-l0d — L1 overlay on Layer Minus
 
 **Paired translation:** [简体中文](./conet-l0d.zh-CN.md)  
-**Revision:** 2026-08-17 (milestone eval 22:45Z: crate MVP accepted; P1 outbound + inbound decrypt/TUN write-back + listen HTTP+SSE worker in-crate, mock-tested, unsigned mining; production SI listen not opened; lab binary `[l0]` off)  
+**Revision:** 2026-08-17 (milestone eval 23:30Z: crate MVP accepted; P1 outbound + inbound decrypt/TUN write-back + EIP-191 listen wrap in-crate, mock-tested; production SI listen not opened; lab binary `[l0]` off)  
 **Public operator guide:** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **Public developer guide:** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -138,7 +138,7 @@ L0 extra latency is an **estimate** (tens to hundreds of milliseconds per hop), 
 | Phase | Scope |
 | --- | --- |
 | **MVP** | **Accepted (2026-08-17).** Linux command; TUN + iptables lifecycle; locator parse; static peer table; packet counters; L0 client stub |
-| **P1** | **In crate; lab binary may be installed with `[l0]` off.** Wallet-to-wallet TCP byte stream on current L0 primitives; static overlay bootnodes. Crate encrypts the overlay envelope to the peer **user PGP**, wraps `{ data, NoPush: true }` to mailbox **B route PGP**, and POSTs only `{ "data" }` when `[l0].enabled` plus peer user+route PGP files and an entry are present (default **off**). Inbound decrypt of user-PGP armor → overlay envelope → raw IPv4 queued to TUN is **in-crate** when `routing_key_file` is an OpenPGP secret cert. Listen HTTP+SSE worker is **in-crate** when enabled plus `listen_entries` (C ≠ B), `mailbox_route_pgp_file` (this host's B route **public** key), `routing_eoa`, and the user secret. Listen command is `command: mining` + `listenKind: "chat"` with **no** `Securitykey` and **no** EIP-191 in this revision; production SI `checkSign` will reject. Tests use wiremock only. **Production SI listen is not opened.** This evaluation may install that binary on the two-host lab **without** enabling `[l0]`. Not a live mailbox client. Do not advertise overlay vIPs until a bidirectional frame is proven. |
+| **P1** | **In crate; lab binary may be installed with `[l0]` off.** Wallet-to-wallet TCP byte stream on current L0 primitives; static overlay bootnodes. Crate encrypts the overlay envelope to the peer **user PGP**, wraps `{ data, NoPush: true }` to mailbox **B route PGP**, and POSTs only `{ "data" }` when `[l0].enabled` plus peer user+route PGP files and an entry are present (default **off**). Inbound decrypt of user-PGP armor → overlay envelope → raw IPv4 queued to TUN is **in-crate** when `routing_key_file` is an OpenPGP secret cert. Listen HTTP+SSE worker is **in-crate** when enabled plus `listen_entries` (C ≠ B), `mailbox_route_pgp_file` (this host's B route **public** key), `routing_eoa`, `routing_key_file`, and `routing_eth_key_file` (hex secp256k1; recovered address must match `routing_eoa`; not OpenPGP). Listen command is `command: mining` + `listenKind: "chat"` with **no** `Securitykey`, EIP-191-signed as SI `{ message, signMessage }` base64. Tests use wiremock only. **Production SI listen is not opened.** This evaluation may install that binary on the two-host lab **without** enabling `[l0]`. Not a live mailbox client. Do not advertise overlay vIPs until a bidirectional frame is proven. |
 | **P2** | Datagram adapter if discv4/discv5 must ride L0 |
 | **P3** | Hybrid production (public P2P + L0 backup); measured RTT |
 

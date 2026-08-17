@@ -17,7 +17,7 @@ Linux userspace daemon that lets CoNET L1 `geth` and Prysm `beacon-chain` use **
 
 Operators do **not** run `iptables` by hand.
 
-**Maturity: under development.** Crate MVP is accepted (CLI, locator, TUN / iptables lifecycle, packet counters). P1 outbound encrypt + mailbox wrap + `POST { data }`, inbound decrypt + TUN write-back, and a listen HTTP+SSE worker exist in-crate and default **off**. The listen command is unsigned in this revision; production SI `checkSign` will reject. A lab host may run that binary with `[l0]` still off. Production SI listen and overlay TCP over production SI are **not** shipped. Keep public P2P (geth `8400`, beacon `4200` / `4300`) for the 6-second slot. Do not advertise overlay vIPs until a bidirectional frame is proven.
+**Maturity: under development.** Crate MVP is accepted (CLI, locator, TUN / iptables lifecycle, packet counters). P1 outbound encrypt + mailbox wrap + `POST { data }`, inbound decrypt + TUN write-back, and an EIP-191 listen HTTP+SSE worker exist in-crate and default **off**. In-crate listen matches SI `checkSign`. A lab host may run that binary with `[l0]` still off. Production SI listen and overlay TCP over production SI are **not** shipped. Keep public P2P (geth `8400`, beacon `4200` / `4300`) for the 6-second slot. Do not advertise overlay vIPs until a bidirectional frame is proven.
 
 ## What it is not
 
@@ -113,7 +113,7 @@ Phase 1 uses **static** overlay peers. Do not expect discv4 / discv5 to ride L0.
 | [Whitepaper (EN)](whitepaper/conet-l0d.md) | Design (canonical technical wording) |
 | [白皮书（简体中文）](whitepaper/conet-l0d.zh-CN.md) | Paired translation |
 | [MVP](docs/MVP.md) · [MVP（中文）](docs/MVP.zh-CN.md) | Accepted crate MVP |
-| [P1](docs/P1.md) · [P1（中文）](docs/P1.zh-CN.md) | Overlay `/post` encrypt + mailbox wrap + POST; inbound decrypt + TUN write-back; listen HTTP+SSE worker in-crate (mock-tested, unsigned mining); `[l0]` default off; production SI listen not opened |
+| [P1](docs/P1.md) · [P1（中文）](docs/P1.zh-CN.md) | Overlay `/post` encrypt + mailbox wrap + POST; inbound decrypt + TUN write-back; EIP-191 listen HTTP+SSE worker in-crate (mock-tested); `[l0]` default off; production SI listen not opened |
 | [Operator flags](docs/operator-flags.md) | geth / beacon advertise flags |
 | [RULES.md](RULES.md) | Engineering constraints |
 | [GitBook Applications](https://gitbook.conet.network/applications/conet-l0d.html) | Operator how-to |
@@ -125,9 +125,9 @@ A change to the whitepaper, `RULES.md`, or MVP must update **both** GitBook page
 
 ## What this revision does / does not
 
-**Does:** overlay vIP table, `web3://` locator parse, TUN + iptables lifecycle, packet counters, P1 encrypt + mailbox wrap + `POST { data }` when `[l0]` is on and peer user+route PGP files plus an entry exist (default **off**), inbound user-PGP decrypt + TUN write queue when `routing_key_file` is set, listen HTTP+SSE worker when enabled plus `listen_entries`, `mailbox_route_pgp_file`, `routing_eoa`, and the user secret (unsigned `mining`; mock-tested).
+**Does:** overlay vIP table, `web3://` locator parse, TUN + iptables lifecycle, packet counters, P1 encrypt + mailbox wrap + `POST { data }` when `[l0]` is on and peer user+route PGP files plus an entry exist (default **off**), inbound user-PGP decrypt + TUN write queue when `routing_key_file` is set, EIP-191 listen HTTP+SSE worker when enabled plus `listen_entries`, `mailbox_route_pgp_file`, `routing_eoa`, `routing_key_file`, and `routing_eth_key_file` (mock-tested).
 
-**Does not (yet):** open a production SI listen (unsigned `mining` would fail `checkSign`), production mailbox delivery, UDP discv4 / discv5 capture, validator proxying, a live SI `p2p_stream_*` command.
+**Does not (yet):** open a production SI listen (`[l0]` stays off; do not POST production SI), production mailbox delivery, UDP discv4 / discv5 capture, validator proxying, a live SI `p2p_stream_*` command.
 
 ## License
 

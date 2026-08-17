@@ -28,9 +28,10 @@ tcp_ports = [4200]
 # Inbound decrypt + TUN write-back is in-crate when routing_key_file is an
 # OpenPGP secret cert. Listen HTTP+SSE is in-crate when enabled plus
 # listen_entries, mailbox_route_pgp_file (this host's B route PUBLIC key),
-# routing_eoa, and routing_key_file. The listen command is unsigned in this
-# revision (no EIP-191); production SI checkSign will reject. Lab stays off.
-# Do not put Securitykey in a B-decryptable listen command.
+# routing_eoa, routing_key_file, and routing_eth_key_file (hex secp256k1;
+# must match routing_eoa; not OpenPGP). Listen is EIP-191 + SI
+# { message, signMessage } base64. Lab stays off. Do not put Securitykey
+# in a B-decryptable listen command.
 # Encrypt envelope to peer user PGP, wrap { data, NoPush: true } to B route PGP,
 # POST only { "data": outerArmor } to a healthy entry A ≠ B.
 # Listen POST goes to entry C ≠ B. Do not invent a new SI command. Do not
@@ -45,6 +46,7 @@ tcp_ports = [4200]
 # listen_entries = ["https://<existing-guardian>.conet.network"]
 # routing_eoa = "0x<dedicated-routing-eoa>"
 # routing_key_file = "/etc/conet-l0d/routing.key"
+# routing_eth_key_file = "/etc/conet-l0d/routing.eth"
 # mailbox_route_pgp_file = "/etc/conet-l0d/self-mailbox-route.asc"
 #
 # Per-peer public key files (lab override; do not log contents):

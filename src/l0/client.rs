@@ -7,7 +7,8 @@
 
 use crate::config::ValidatedConfig;
 use crate::error::L0dError;
-use crate::l0::{envelope, frame, listen, pgp, post};
+use crate::l0::eip191::EthSecret;
+use crate::l0::{eip191, envelope, frame, listen, pgp, post};
 use crate::locator::{Locator, LocatorHost};
 use sequoia_openpgp::Cert;
 use std::collections::HashMap;
@@ -203,22 +204,24 @@ impl L0Client {
             None
         };
 
-        let inbound_rx = if cfg.l0.enabled
-            && user_secret.is_some()
-            && !cfg.l0.listen_entries.is_empty()
-            && !routing_eoa.is_empty()
-        {
-            match cfg.l0.mailbox_route_pgp_file.as_ref() {
-                Some(path) => match pgp::load_public_cert_armored(path) {
-                    Ok(route) => spawn_listen_worker(
-                        cfg.l0.listen_entries.clone(),
-                        route,
-                        routing_eoa.clone(),
-                    ),
+        let eth_secret = if cfg.l0.enabled {
+            match cfg.l0.routing_eth_key_file.as_ref() {
+                Some(path) => match eip191::load_eth_secret(path) {
+                    Ok(secret) => {
+                        if routing_eoa.is_empty() || !eip191::eoa_eq(secret.address(), &routing_eoa)
+                        {
+                            tracing::warn!(
+                                "P1: routing_eth_key_file does not match routing_eoa; listen worker stays off"
+                            );
+                            None
+                        } else {
+                            Some(secret)
+                        }
+                    }
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            "P1: mailbox_route_pgp_file was not loaded; listen worker stays off"
+                            "P1: routing_eth_key_file was not loaded; listen worker stays off"
                         );
                         None
                     }
@@ -227,6 +230,34 @@ impl L0Client {
             }
         } else {
             None
+        };
+
+        let inbound_rx = match (
+            cfg.l0.enabled,
+            user_secret.is_some(),
+            eth_secret.as_ref(),
+            cfg.l0.listen_entries.is_empty(),
+            routing_eoa.is_empty(),
+            cfg.l0.mailbox_route_pgp_file.as_ref(),
+        ) {
+            (true, true, Some(eth), false, false, Some(path)) => {
+                match pgp::load_public_cert_armored(path) {
+                    Ok(route) => spawn_listen_worker(
+                        cfg.l0.listen_entries.clone(),
+                        route,
+                        routing_eoa.clone(),
+                        eth.clone(),
+                    ),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "P1: mailbox_route_pgp_file was not loaded; listen worker stays off"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
         };
 
         Self {
@@ -443,6 +474,7 @@ fn spawn_listen_worker(
     entries: Vec<String>,
     mailbox_route: String,
     routing_eoa: String,
+    eth: EthSecret,
 ) -> Option<mpsc::Receiver<String>> {
     let handle = tokio::runtime::Handle::try_current().ok()?;
     let client = listen::listen_http_client().ok()?;
@@ -456,7 +488,7 @@ fn spawn_listen_worker(
                 continue;
             };
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
-            match listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, entry) {
+            match listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, entry, &eth) {
                 Ok((url, armor)) => match listen::run_listen_once(&client, &url, &armor, &tx).await
                 {
                     Ok(_) => {

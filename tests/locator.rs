@@ -24,6 +24,7 @@ fn check_config_example() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("ok"));
     assert!(stdout.contains("100.64.0.5"));
+    assert!(stdout.contains("l0.eth_key     unset"));
 }
 
 #[test]

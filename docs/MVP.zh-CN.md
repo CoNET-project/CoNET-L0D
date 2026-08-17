@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **成对：** [English](./MVP.md)  
-**Revision：** 2026-08-17（里程碑评估 22:45Z：crate MVP 已验收；P1 出站 + 入站解密/TUN 写回 + listen HTTP+SSE worker 已在 crate，mock 测过、未签 mining；未打开生产 SI listen；实验室二进制 `[l0]` 关 — 见 [P1.zh-CN.md](./P1.zh-CN.md)）
+**Revision：** 2026-08-17（里程碑评估 23:30Z：crate MVP 已验收；P1 出站 + 入站解密/TUN 写回 + EIP-191 listen wrap 已在 crate，mock 测过；未打开生产 SI listen；实验室二进制 `[l0]` 关 — 见 [P1.zh-CN.md](./P1.zh-CN.md)）
 
 公开 how-to：[Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -25,7 +25,7 @@
 
 ## 范围外（不算 MVP 失败）
 
-- 生产 mailbox 投递 / 生产 SI listen（[P1](./P1.zh-CN.md) crate 已有出站 encrypt + wrap + POST、入站解密 + TUN 写回，**以及** mock 测过且 **未签名** 的 listen HTTP+SSE worker；生产 SI `checkSign` 会拒；实验室可装该二进制；`[l0]` 保持 **关** — 不是现役 mailbox 客户端）
+- 生产 mailbox 投递 / 生产 SI listen（[P1](./P1.zh-CN.md) crate 已有出站 encrypt + wrap + POST、入站解密 + TUN 写回，**以及** mock 测过的 EIP-191 listen HTTP+SSE worker；crate 内线形状对齐 SI `checkSign`；实验室可装该二进制；`[l0]` 保持 **关** — 不是现役 mailbox 客户端）
 - 捕获 UDP discv4 / discv5
 - 代理 validator 或读取 keystore
 - 新 SI 命令或新域名
