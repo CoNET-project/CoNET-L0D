@@ -1,0 +1,18 @@
+[Unit]
+Description=CoNET L1 overlay daemon (conet-l0d)
+Documentation=https://gitbook.conet.network/applications/conet-l0d.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/conet-l0d start --config /etc/conet-l0d.toml
+ExecStop=/usr/local/sbin/conet-l0d stop --config /etc/conet-l0d.toml
+Restart=on-failure
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+# Do not put raw iptables here. The process owns CONET_L0D + TUN.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+[package]
+name = "conet-l0d"
+version = "0.1.0"
+edition = "2021"
+description = "CoNET L0 overlay daemon: catch geth/beacon overlay P2P and own TUN + iptables lifecycle"
+license = "MIT"
+publish = false
+repository = "https://github.com/CoNET-project/CoNET-L0D"
+homepage = "https://github.com/CoNET-project/CoNET-L0D"
+readme = "README.md"
+
+[[bin]]
+name = "conet-l0d"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "io-util", "fs", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

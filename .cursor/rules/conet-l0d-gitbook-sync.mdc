@@ -1,0 +1,49 @@
+---
+description: conet-l0d 白皮书 / RULES / MVP 改动必须同任务同步 GitBook Applications 与 Developers
+---
+
+# conet-l0d：白皮书与规则必须同步 GitBook 两面
+
+## 核心规则
+
+凡改动本 crate 的 **白皮书**、**`RULES.md`**、**MVP**，或面向操作员 / 开发者的命令与生命周期语义，**必须在同一任务内**更新公开书：
+
+1. **Applications** — `src/docs/gitbook/applications/conet-l0d.md`（操作员 how-to）
+2. **Developers** — `src/docs/gitbook/developers/conet-l0d.md`（CLI、config、owned TUN/iptables、现有 `/post` 合同）
+
+不得只改 crate 文档、只改 Cursor 守则、或只改其中一面。公开正文 **英语**。
+
+公开 URL（发版后）：
+
+- https://gitbook.conet.network/applications/conet-l0d.html
+- https://gitbook.conet.network/developers/conet-l0d.html
+
+## 何时触发
+
+| 改动 | 必须写 Applications + Developers |
+| --- | --- |
+| `whitepaper/conet-l0d.md` 或 `.zh-CN.md` | ✅ 且白皮书双语同行 |
+| `RULES.md` / `docs/MVP.md` | ✅ |
+| CLI 子命令、config 字段、lifecycle / iptables 语义 | ✅ |
+| 仅内部 Rust 重构、无对外语义 | ❌ 不强制本条 |
+
+索引页（`SUMMARY.md`、`applications/README.md`、`developers/README.md`、`l0/using-l0.md`、`developers/l1-node.md`、`silentpass-vpn.md`、`resources.md`）在成熟度或「What exists today」变化时一并改。
+
+## 与 L0 协议同步的边界
+
+本产品是 **应用组合**，不是新的 L0 协议层。
+
+| 改动 | 还须写 L0 协议页？ |
+| --- | --- |
+| 仅 crate / TUN / 操作员文档 | ❌ 不要扩写 `mailbox-routing` / SI 命令表冒充已上线 |
+| 新增 SI 命令（如 `p2p_stream_*`、`listenKind: l1p2p`） | ✅ 同任务：`using-l0`、mailbox routing、SI developer guide **以及** 两页 conet-l0d |
+
+全局协议守则：仓库 `.cursor/rules/conet-depin-gitbook-sync.mdc`。不要把「crate 文档更新」误写成必须改 SI。
+
+## 严禁
+
+- ❌ 只更新白皮书或只更新 Applications / 只更新 Developers
+- ❌ 把未上线的 `p2p_stream_*` / `listenKind: l1p2p` 写成 current SI
+- ❌ 把 SilentPass / `SaaS_Sock5` 写成 L1 overlay
+- ❌ 未获用户要求就跑 `deployGitbook.sh`
+- ❌ 为文档新建域名

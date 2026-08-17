@@ -1,0 +1,24 @@
+# Example overlay table. Copy to /etc/conet-l0d.toml and edit.
+# The daemon owns TUN + iptables. Do not add a second operator iptables script.
+
+tun_name = "conet-l0"
+overlay_cidr = "100.64.0.0/10"
+local_vip = "100.64.0.5"
+iptables_chain = "CONET_L0D"
+state_path = "/run/conet-l0d/state.json"
+# Optional: never capture this uid (Prysm validator).
+# validator_uid = 998
+
+[identity]
+# Peer locator, not ERC-4804 content. Routing EOA ≠ deposit keystore ≠ fee recipient.
+locator = "web3://0x1111111111111111111111111111111111111111/p2p/geth"
+
+[[peers]]
+locator = "web3://HubTag.web3/p2p/geth"
+vip = "100.64.0.1"
+tcp_ports = [8400]
+
+[[peers]]
+locator = "web3://HubTag.web3/p2p/beacon"
+vip = "100.64.0.1"
+tcp_ports = [4200]
