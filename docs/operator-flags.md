@@ -5,7 +5,8 @@ These flags **advertise** an overlay IP. They do not bind RPC or Engine to that 
 Do not run `iptables` yourself. `conet-l0d start` / `stop` owns the chain.
 
 ```bash
-# After conet-l0d is up and local_vip = 100.64.0.5
+# Only after a bidirectional overlay frame is proven on the peer TUN.
+# Lab hosts keep --nat / --p2p-host-ip on the public IP until then.
 
 geth \
   --port 8400 \
@@ -24,6 +25,8 @@ beacon-chain \
   --grpc-gateway-host=127.0.0.1 \
   --execution-endpoint=http://127.0.0.1:8551
 ```
+
+**Do not** switch `--nat=extip` or `--p2p-host-ip` to the overlay vIP until a bidirectional overlay frame is written on the peer TUN. A stub that only counts local TUN IPv4 is not enough; advertise stays on the public IP.
 
 Never set `--http.addr`, `--authrpc.addr`, `--p2p-local-ip`, or `--rpc-host` to the overlay vIP. That `bind()` fails if the TUN is down and can take Engine off loopback.
 

@@ -1,0 +1,390 @@
+//! Overlay L0 client. Default is the MVP stub.
+//!
+//! When `[l0].enabled = true` and a peer has **user + route** public key files,
+//! the daemon encrypts `conet_l0d_overlay_v1` to the peer user PGP, wraps
+//! mailbox work `{ data, NoPush: true }` to B route PGP, then POSTs `{ "data" }`.
+//! Do not POST plaintext JSON. Do not claim a live SI `p2p_stream_*` command.
+
+use crate::config::ValidatedConfig;
+use crate::error::L0dError;
+use crate::l0::{envelope, frame, pgp, post};
+use crate::locator::{Locator, LocatorHost};
+use std::collections::HashMap;
+use std::fmt;
+use std::net::Ipv4Addr;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+const POST_QUEUE: usize = 32;
+
+struct ArmoredCert(String);
+
+impl fmt::Debug for ArmoredCert {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ArmoredCert(redacted)")
+    }
+}
+
+#[derive(Debug)]
+struct PeerPgp {
+    user: ArmoredCert,
+    route: ArmoredCert,
+}
+
+struct PostJob {
+    url: String,
+    armor: String,
+}
+
+impl fmt::Debug for PostJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostJob")
+            .field("url", &self.url)
+            .field("armor_bytes", &self.armor.len())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedPost {
+    pub url: String,
+    armor: String,
+}
+
+impl PreparedPost {
+    pub fn armor_len(&self) -> usize {
+        self.armor.len()
+    }
+}
+
+pub struct L0Client {
+    enabled: bool,
+    seq: u64,
+    pub noted_packets: u64,
+    pub frames_ready: u64,
+    pub posts_prepared: u64,
+    pub posts_queued: u64,
+    pub posts_dropped: u64,
+    pub posts_refused: u64,
+    routing_eoa: String,
+    entries: Vec<String>,
+    peers: HashMap<Ipv4Addr, PeerPgp>,
+    post_tx: Option<mpsc::Sender<PostJob>>,
+}
+
+impl fmt::Debug for L0Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("L0Client")
+            .field("enabled", &self.enabled)
+            .field("noted_packets", &self.noted_packets)
+            .field("frames_ready", &self.frames_ready)
+            .field("posts_prepared", &self.posts_prepared)
+            .field("posts_queued", &self.posts_queued)
+            .field("posts_dropped", &self.posts_dropped)
+            .field("posts_refused", &self.posts_refused)
+            .field("entries", &self.entries.len())
+            .field("peers_with_pgp", &self.peers.len())
+            .field("post_worker", &self.post_tx.is_some())
+            .finish()
+    }
+}
+
+impl Default for L0Client {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl L0Client {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            seq: 0,
+            noted_packets: 0,
+            frames_ready: 0,
+            posts_prepared: 0,
+            posts_queued: 0,
+            posts_dropped: 0,
+            posts_refused: 0,
+            routing_eoa: String::new(),
+            entries: Vec::new(),
+            peers: HashMap::new(),
+            post_tx: None,
+        }
+    }
+
+    pub fn from_config(cfg: &ValidatedConfig) -> Self {
+        let routing_eoa = cfg
+            .l0
+            .routing_eoa
+            .clone()
+            .or_else(|| match &cfg.identity.host {
+                LocatorHost::Eoa(eoa) => Some(eoa.clone()),
+                LocatorHost::Tag(_) => None,
+            })
+            .unwrap_or_default();
+
+        let mut peers = HashMap::new();
+        for peer in &cfg.peers {
+            if peers.contains_key(&peer.vip) {
+                continue;
+            }
+            let (Some(user_path), Some(route_path)) =
+                (peer.user_pgp_file.as_ref(), peer.route_pgp_file.as_ref())
+            else {
+                continue;
+            };
+            match load_peer_pgp(user_path, route_path) {
+                Ok(keys) => {
+                    peers.insert(peer.vip, keys);
+                }
+                Err(err) => tracing::warn!(
+                    dest = %peer.vip,
+                    error = %err,
+                    "P1: peer OpenPGP public files were not loaded; POST stays refused for this vIP"
+                ),
+            }
+        }
+
+        let post_tx = if cfg.l0.enabled && !cfg.l0.entries.is_empty() {
+            spawn_post_worker()
+        } else {
+            None
+        };
+
+        Self {
+            enabled: cfg.l0.enabled,
+            seq: 0,
+            noted_packets: 0,
+            frames_ready: 0,
+            posts_prepared: 0,
+            posts_queued: 0,
+            posts_dropped: 0,
+            posts_refused: 0,
+            routing_eoa,
+            entries: cfg.l0.entries.clone(),
+            peers,
+            post_tx,
+        }
+    }
+
+    pub fn note_overlay_packet(
+        &mut self,
+        dest: Ipv4Addr,
+        locator: Option<&Locator>,
+        packet: &[u8],
+    ) {
+        self.noted_packets += 1;
+        if !self.enabled {
+            match locator {
+                Some(loc) => tracing::debug!(
+                    dest = %dest,
+                    locator = %loc.display(),
+                    "L0 stub: would encrypt overlay TCP to peer user PGP; [l0].enabled is false"
+                ),
+                None => tracing::debug!(
+                    dest = %dest,
+                    "L0 stub: dest vIP is not in the static peer table"
+                ),
+            }
+            return;
+        }
+
+        let Some(loc) = locator else {
+            tracing::debug!(
+                dest = %dest,
+                "P1: dest vIP is not in the static peer table"
+            );
+            return;
+        };
+
+        self.seq = self.seq.saturating_add(1);
+        let framed = frame::encode(self.seq, packet);
+        match self.prepare_overlay_post(dest, packet, self.seq) {
+            Ok(prepared) => {
+                self.frames_ready = self.frames_ready.saturating_add(1);
+                self.posts_prepared = self.posts_prepared.saturating_add(1);
+                self.enqueue_post(prepared, dest, loc, framed.len());
+            }
+            Err(err) => {
+                self.posts_refused = self.posts_refused.saturating_add(1);
+                tracing::warn!(
+                    dest = %dest,
+                    locator = %loc.display(),
+                    seq = self.seq,
+                    frame_bytes = framed.len(),
+                    error = %err,
+                    "P1 overlay POST refused; plaintext was not sent"
+                );
+            }
+        }
+    }
+
+    fn prepare_overlay_post(
+        &self,
+        dest: Ipv4Addr,
+        packet: &[u8],
+        seq: u64,
+    ) -> Result<PreparedPost, L0dError> {
+        let keys = self.peers.get(&dest).ok_or_else(|| {
+            L0dError::L0(
+                "peer user+route PGP public files are required; refusing POST".into(),
+            )
+        })?;
+        let entry = self.entries.first().ok_or_else(|| {
+            L0dError::L0("l0.entries is empty; refusing POST".into())
+        })?;
+        let url = post::post_url(entry)?;
+        let json = envelope::encode(&self.routing_eoa, seq, packet)?;
+        let armor = pgp::wrap_overlay_for_post(&json, &keys.user.0, &keys.route.0)?;
+        Ok(PreparedPost { url, armor })
+    }
+
+    fn enqueue_post(&mut self, prepared: PreparedPost, dest: Ipv4Addr, loc: &Locator, frame_bytes: usize) {
+        let armor_bytes = prepared.armor_len();
+        let Some(tx) = &self.post_tx else {
+            tracing::info!(
+                dest = %dest,
+                locator = %loc.display(),
+                seq = self.seq,
+                armor_bytes,
+                frame_bytes,
+                "P1 overlay armor ready; POST worker not started (no tokio runtime)"
+            );
+            return;
+        };
+        match tx.try_send(PostJob {
+            url: prepared.url,
+            armor: prepared.armor,
+        }) {
+            Ok(()) => {
+                self.posts_queued = self.posts_queued.saturating_add(1);
+                tracing::info!(
+                    dest = %dest,
+                    locator = %loc.display(),
+                    seq = self.seq,
+                    armor_bytes,
+                    frame_bytes,
+                    queued = self.posts_queued,
+                    "P1 overlay queued for POST /post"
+                );
+            }
+            Err(_) => {
+                self.posts_dropped = self.posts_dropped.saturating_add(1);
+                tracing::warn!(
+                    dest = %dest,
+                    seq = self.seq,
+                    dropped = self.posts_dropped,
+                    "P1 overlay POST queue full; frame dropped (TUN not blocked)"
+                );
+            }
+        }
+    }
+}
+
+fn load_peer_pgp(
+    user_path: &std::path::Path,
+    route_path: &std::path::Path,
+) -> Result<PeerPgp, L0dError> {
+    let user = std::fs::read_to_string(user_path)?;
+    let route = std::fs::read_to_string(route_path)?;
+    if user.trim().is_empty() || route.trim().is_empty() {
+        return Err(L0dError::L0("peer OpenPGP public file is empty".into()));
+    }
+    Ok(PeerPgp {
+        user: ArmoredCert(user),
+        route: ArmoredCert(route),
+    })
+}
+
+fn spawn_post_worker() -> Option<mpsc::Sender<PostJob>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let client = post::http_client().ok()?;
+    let (tx, mut rx) = mpsc::channel::<PostJob>(POST_QUEUE);
+    handle.spawn(async move {
+        let client = Arc::new(client);
+        while let Some(job) = rx.recv().await {
+            match post::send(&client, &job.url, &job.armor).await {
+                Ok(status) => tracing::info!(
+                    status,
+                    armor_bytes = job.armor.len(),
+                    "P1 POST /post accepted"
+                ),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    armor_bytes = job.armor.len(),
+                    "P1 POST /post failed"
+                ),
+            }
+        }
+    });
+    Some(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::l0::pgp::{decrypt_utf8, generate_test_cert, public_cert_armored};
+
+    fn client_with_keys(user: &str, route: &str) -> L0Client {
+        let mut peers = HashMap::new();
+        peers.insert(
+            Ipv4Addr::new(100, 64, 0, 6),
+            PeerPgp {
+                user: ArmoredCert(user.to_string()),
+                route: ArmoredCert(route.to_string()),
+            },
+        );
+        L0Client {
+            enabled: true,
+            seq: 0,
+            noted_packets: 0,
+            frames_ready: 0,
+            posts_prepared: 0,
+            posts_queued: 0,
+            posts_dropped: 0,
+            posts_refused: 0,
+            routing_eoa: "0x1111111111111111111111111111111111111111".into(),
+            entries: vec!["https://example.conet.network".into()],
+            peers,
+            post_tx: None,
+        }
+    }
+
+    #[test]
+    fn prepare_wraps_then_refuses_plaintext() {
+        let user = generate_test_cert();
+        let route = generate_test_cert();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let client = client_with_keys(&user_pub, &route_pub);
+        let prepared = client
+            .prepare_overlay_post(Ipv4Addr::new(100, 64, 0, 6), b"\x45\x00pkt", 9)
+            .unwrap();
+        assert!(prepared.url.ends_with("/post"));
+        assert!(pgp::is_pgp_message_armor(&prepared.armor));
+        let work: serde_json::Value =
+            serde_json::from_str(&decrypt_utf8(&prepared.armor, &route).unwrap()).unwrap();
+        assert_eq!(work["NoPush"], true);
+        let inner = work["data"].as_str().unwrap();
+        let env_json = decrypt_utf8(inner, &user).unwrap();
+        let (env, pkt) = envelope::decode(&env_json).unwrap();
+        assert_eq!(env.seq, 9);
+        assert_eq!(pkt, b"\x45\x00pkt");
+        assert!(!env_json.contains("signMessage"));
+    }
+
+    #[test]
+    fn refuse_without_peer_keys() {
+        let client = L0Client {
+            enabled: true,
+            entries: vec!["https://example.conet.network".into()],
+            routing_eoa: "0x1111111111111111111111111111111111111111".into(),
+            ..L0Client::disabled()
+        };
+        let err = client
+            .prepare_overlay_post(Ipv4Addr::new(100, 64, 0, 6), b"x", 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("user+route"));
+    }
+}

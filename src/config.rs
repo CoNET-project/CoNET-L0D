@@ -19,6 +19,38 @@ pub struct DaemonConfig {
     pub identity: IdentityConfig,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub l0: L0Config,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L0Config {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_l0_rpc")]
+    pub rpc: String,
+    #[serde(default = "default_address_pgp")]
+    pub address_pgp: String,
+    #[serde(default)]
+    pub entries: Vec<String>,
+    #[serde(default)]
+    pub listen_entries: Vec<String>,
+    pub routing_eoa: Option<String>,
+    pub routing_key_file: Option<PathBuf>,
+}
+
+impl Default for L0Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rpc: default_l0_rpc(),
+            address_pgp: default_address_pgp(),
+            entries: Vec::new(),
+            listen_entries: Vec::new(),
+            routing_eoa: None,
+            routing_key_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +63,12 @@ pub struct PeerConfig {
     pub locator: String,
     pub vip: String,
     pub tcp_ports: Vec<u16>,
+    /// Optional lab override: armored user public key file. Do not log contents.
+    #[serde(default)]
+    pub user_pgp_file: Option<PathBuf>,
+    /// Optional lab override: mailbox B route public key file. Do not log contents.
+    #[serde(default)]
+    pub route_pgp_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +78,20 @@ pub struct ValidatedConfig {
     pub local_vip: Ipv4Addr,
     pub identity: Locator,
     pub peers: Vec<ValidatedPeer>,
+    pub l0: L0Settings,
+}
+
+#[derive(Debug, Clone)]
+pub struct L0Settings {
+    pub enabled: bool,
+    pub rpc: String,
+    pub address_pgp: String,
+    pub entries: Vec<String>,
+    pub listen_entries: Vec<String>,
+    pub routing_eoa: Option<String>,
+    /// Listen / decrypt private-key path. Unused until listen write-back.
+    #[allow(dead_code)]
+    pub routing_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +100,8 @@ pub struct ValidatedPeer {
     pub vip: Ipv4Addr,
     #[allow(dead_code)]
     pub tcp_ports: Vec<u16>,
+    pub user_pgp_file: Option<PathBuf>,
+    pub route_pgp_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,6 +152,59 @@ fn default_chain() -> String {
 }
 fn default_state_path() -> PathBuf {
     PathBuf::from("/run/conet-l0d/state.json")
+}
+
+fn default_l0_rpc() -> String {
+    "https://rpc1.conet.network".into()
+}
+
+fn default_address_pgp() -> String {
+    crate::l0::address_pgp::ADDRESS_PGP.into()
+}
+
+fn normalize_eoa(raw: &str) -> Result<String, L0dError> {
+    let hex = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .ok_or_else(|| L0dError::Config("routing_eoa / address_pgp must be 0x + 40 hex".into()))?;
+    if hex.len() != 40 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(L0dError::Config(
+            "routing_eoa / address_pgp must be 0x + 40 hex".into(),
+        ));
+    }
+    Ok(format!("0x{}", hex.to_ascii_lowercase()))
+}
+
+fn allow_existing_http_host(url: &str) -> Result<(), L0dError> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(|| {
+            L0dError::Config("l0 entry must be http(s) on an existing CoNET / beamio.app host".into())
+        })?;
+    if rest.contains('?') || rest.contains('#') {
+        return Err(L0dError::Config(
+            "l0 entry must not carry query or fragment mailbox instructions".into(),
+        ));
+    }
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    let host_l = host.to_ascii_lowercase();
+    if host_l == "beamio.app"
+        || host_l == "www.beamio.app"
+        || host_l.ends_with(".conet.network")
+    {
+        return Ok(());
+    }
+    Err(L0dError::Config(format!(
+        "l0 entry host {host} is not an existing CoNET / beamio.app hostname"
+    )))
 }
 
 impl DaemonConfig {
@@ -177,8 +284,36 @@ impl DaemonConfig {
                 locator,
                 vip,
                 tcp_ports: peer.tcp_ports.clone(),
+                user_pgp_file: peer.user_pgp_file.clone(),
+                route_pgp_file: peer.route_pgp_file.clone(),
             });
         }
+
+        let rpc = self.l0.rpc.trim().trim_end_matches('/').to_string();
+        if rpc != "https://rpc1.conet.network" && rpc != "https://publicrpc.conet.network" {
+            return Err(L0dError::Config(
+                "l0.rpc must be https://rpc1.conet.network or https://publicrpc.conet.network"
+                    .into(),
+            ));
+        }
+        let address_pgp = normalize_eoa(&self.l0.address_pgp)?;
+        if address_pgp != crate::l0::address_pgp::ADDRESS_PGP.to_ascii_lowercase() {
+            return Err(L0dError::Config(
+                "l0.address_pgp must be the live AddressPGP contract".into(),
+            ));
+        }
+        for entry in self
+            .l0
+            .entries
+            .iter()
+            .chain(self.l0.listen_entries.iter())
+        {
+            allow_existing_http_host(entry)?;
+        }
+        let routing_eoa = match &self.l0.routing_eoa {
+            Some(raw) => Some(normalize_eoa(raw)?),
+            None => None,
+        };
 
         Ok(ValidatedConfig {
             raw: self.clone(),
@@ -186,6 +321,15 @@ impl DaemonConfig {
             local_vip,
             identity,
             peers,
+            l0: L0Settings {
+                enabled: self.l0.enabled,
+                rpc,
+                address_pgp,
+                entries: self.l0.entries.clone(),
+                listen_entries: self.l0.listen_entries.clone(),
+                routing_eoa,
+                routing_key_file: self.l0.routing_key_file.clone(),
+            },
         })
     }
 }
@@ -213,5 +357,23 @@ mod tests {
         assert!(cidr.contains("100.127.255.255".parse().unwrap()));
         assert!(!cidr.contains("100.128.0.1".parse().unwrap()));
         assert!(!cidr.contains("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn example_toml_validates_with_l0_disabled() {
+        let raw = include_str!("../config/conet-l0d.example.toml");
+        let cfg: DaemonConfig = toml::from_str(raw).expect("parse example");
+        let validated = cfg.validate().expect("validate example");
+        assert!(!validated.l0.enabled);
+        assert_eq!(validated.l0.rpc, "https://rpc1.conet.network");
+    }
+
+    #[test]
+    fn reject_unknown_l0_entry_host() {
+        let mut cfg: DaemonConfig = toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+            .expect("parse example");
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["https://assets.conet.example/post".into()];
+        assert!(cfg.validate().is_err());
     }
 }

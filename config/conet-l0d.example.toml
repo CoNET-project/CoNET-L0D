@@ -22,3 +22,24 @@ tcp_ports = [8400]
 locator = "web3://HubTag.web3/p2p/beacon"
 vip = "100.64.0.1"
 tcp_ports = [4200]
+
+# P1 overlay /post client. Default off. When enabled and peer user+route PGP
+# files plus an entry are set, the daemon encrypts, wraps, and POSTs.
+# Listen write-back to TUN is not shipped.
+# Encrypt envelope to peer user PGP, wrap { data, NoPush: true } to B route PGP,
+# POST only { "data": outerArmor } to a healthy entry A ≠ B.
+# Do not invent a new SI command. Do not switch geth/beacon advertise to the vIP
+# until a bidirectional overlay frame is proven.
+#
+# [l0]
+# enabled = false
+# rpc = "https://rpc1.conet.network"
+# address_pgp = "0x684b0ac760cEE9c9b85de36d69746420648Cf9e2"
+# entries = ["https://<existing-guardian>.conet.network"]
+# listen_entries = ["https://<existing-guardian>.conet.network"]
+# routing_eoa = "0x<dedicated-routing-eoa>"
+# routing_key_file = "/etc/conet-l0d/routing.key"
+#
+# Per-peer public key files (lab override; do not log contents):
+# user_pgp_file = "/etc/conet-l0d/peer-user.asc"
+# route_pgp_file = "/etc/conet-l0d/peer-route.asc"

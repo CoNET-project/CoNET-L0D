@@ -17,7 +17,7 @@ It does **not** patch geth, Prysm `beacon-chain`, or `validator`.
 5. `web3://` here is a **peer locator**, not ERC-4804 content. `@beamioTag` must match exactly (`CoNET` ≠ `CONET`). No `search-users` `results[0]`.
 6. Existing L0 UDP forward is **not** raw OS UDP. Phase 1 = TCP + static peers.
 7. Do not use SilentPass / `SaaS_Sock5` as L1 P2P (that is egress to a public `host:port`).
-8. HTTP `/post` body is only `{ "data": "<armor>" }`. No hop-sig headers from this client.
+8. HTTP `/post` body is only `{ "data": "<armor>" }`. No hop-sig headers from this client. Optional `[l0]` defaults to **off**. Do not POST unless the overlay is encrypted to the peer **user PGP** **and** wrapped to mailbox **B route PGP**. Do not POST plaintext JSON as `data`. Do not invent a live SI `p2p_stream_*` command.
 9. Do not invent a new public hostname. Reuse existing CoNET / beamio.app paths.
 10. Do not restart geth / beacon / validator from this project.
 
@@ -37,7 +37,8 @@ All net objects must be tagged (`CONET_L0D` chain, comment `conet-l0d`) so teard
 | --- | --- |
 | `whitepaper/conet-l0d.md` | English whitepaper (canonical technical wording) |
 | `whitepaper/conet-l0d.zh-CN.md` | Paired Chinese whitepaper |
-| `docs/MVP.md` / `docs/MVP.zh-CN.md` | MVP scope and acceptance |
+| `docs/MVP.md` / `docs/MVP.zh-CN.md` | Accepted crate MVP |
+| `docs/P1.md` / `docs/P1.zh-CN.md` | Overlay `/post` encrypt + mailbox wrap + POST; `[l0]` default off; lab binary may be installed; listen write-back not shipped |
 | `docs/operator-flags.md` | geth/beacon advertise flags (not iptables) |
 | `config/conet-l0d.example.toml` | Example overlay table |
 | `systemd/conet-l0d.service` | start/stop only; no raw iptables |

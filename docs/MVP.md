@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **Paired:** [中文](./MVP.zh-CN.md)  
-**Revision:** 2026-08-17 (lockstep with whitepaper)
+**Revision:** 2026-08-17 (milestone eval 21:36Z: crate MVP accepted; P1 outbound in-crate; lab binary `[l0]` off — see [P1.md](./P1.md))
 
 Public how-to: [Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -19,13 +19,13 @@ Ship an independent **Linux command** `conet-l0d` that operators can start and s
 | `stop` / SIGINT / SIGTERM | Reverse of start; pid from state file |
 | `teardown` | Same reverse path if the daemon is dead |
 | Packet loop | Count IPv4 packets on the TUN; log dest vIP (no secrets) |
-| L0 | Stub only — do not claim a live SI `p2p_stream_*` command |
+| L0 | Crate stub accepted: count TUN IPv4 and log dest vIP. Do not claim a live SI `p2p_stream_*` command. Live `/post` stream is [P1](./P1.md) |
 | Docs | Whitepaper pair + these MVP pages + GitBook Applications + Developers |
 | Example + unit | `config/conet-l0d.example.toml` and `systemd/conet-l0d.service` (`start`/`stop` only) |
 
 ## Out of scope (not a failed MVP)
 
-- Live AddressPGP RPC / OpenPGP `/post` byte stream
+- Production mailbox delivery / listen write-back (P1 crate has encrypt + mailbox wrap + POST; a lab host may run that binary; `[l0]` stays **off** — not a live mailbox client; see [P1.md](./P1.md))
 - UDP discv4 / discv5 capture
 - Validator proxy or keystore access
 - New SI commands or new hostnames

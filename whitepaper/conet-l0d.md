@@ -1,7 +1,7 @@
 # conet-l0d — L1 overlay on Layer Minus
 
 **Paired translation:** [简体中文](./conet-l0d.zh-CN.md)  
-**Revision:** 2026-08-17  
+**Revision:** 2026-08-17 (milestone eval 21:36Z: crate MVP accepted; P1 outbound in-crate; lab binary `[l0]` off; listen not shipped)  
 **Public operator guide:** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **Public developer guide:** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -137,8 +137,8 @@ L0 extra latency is an **estimate** (tens to hundreds of milliseconds per hop), 
 
 | Phase | Scope |
 | --- | --- |
-| **MVP** | Linux command; TUN + iptables lifecycle; locator parse; static peer table; packet counters; L0 client stub |
-| **P1** | Wallet-to-wallet TCP byte stream on current L0 primitives; static overlay bootnodes |
+| **MVP** | **Accepted (2026-08-17).** Linux command; TUN + iptables lifecycle; locator parse; static peer table; packet counters; L0 client stub |
+| **P1** | **In crate; lab binary may be installed with `[l0]` off.** Wallet-to-wallet TCP byte stream on current L0 primitives; static overlay bootnodes. Crate encrypts the overlay envelope to the peer **user PGP**, wraps `{ data, NoPush: true }` to mailbox **B route PGP**, and POSTs only `{ "data" }` when `[l0].enabled` plus peer user+route PGP files and an entry are present (default **off**). This evaluation may install that binary on the two-host lab **without** enabling `[l0]`. Listen write-back to TUN is **not** shipped. Not a live mailbox client. Do not advertise overlay vIPs until a bidirectional frame is proven. |
 | **P2** | Datagram adapter if discv4/discv5 must ride L0 |
 | **P3** | Hybrid production (public P2P + L0 backup); measured RTT |
 
@@ -148,7 +148,8 @@ L0 extra latency is an **estimate** (tens to hundreds of milliseconds per hop), 
 | --- | --- |
 | [github.com/CoNET-project/CoNET-L0D](https://github.com/CoNET-project/CoNET-L0D) | Canonical public crate |
 | This pair + `RULES.md` | Design and engineering constraints |
-| `docs/MVP.md` | Acceptance for the current crate |
+| `docs/MVP.md` | Accepted crate MVP |
+| `docs/P1.md` | Next-phase wire and `[l0]` (not a live SI command) |
 | `config/conet-l0d.example.toml` | Example overlay table |
 | `systemd/conet-l0d.service` | Process owns TUN/iptables; unit must not run raw `iptables` |
 | GitBook Applications | Operator how-to (English public book) |

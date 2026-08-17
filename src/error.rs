@@ -6,6 +6,8 @@ pub enum L0dError {
     Locator(String),
     #[error("invalid config: {0}")]
     Config(String),
+    #[error("l0 client: {0}")]
+    L0(String),
     #[error("start/stop/teardown require Linux with CAP_NET_ADMIN, ip, and iptables")]
     NotLinux,
     #[error("net operation failed: {0}")]

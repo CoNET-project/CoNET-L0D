@@ -16,6 +16,28 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
     println!("iptables_chain {}", cfg.raw.iptables_chain);
     println!("identity       {}", cfg.identity.display());
     println!("peers          {}", cfg.peers.len());
+    println!("l0.enabled     {}", cfg.l0.enabled);
+    println!("l0.rpc         {}", cfg.l0.rpc);
+    println!("l0.address_pgp {}", cfg.l0.address_pgp);
+    println!("l0.entries     {}", cfg.l0.entries.len());
+    println!("l0.listen      {}", cfg.l0.listen_entries.len());
+    let pgp_ready = cfg
+        .peers
+        .iter()
+        .filter(|p| p.user_pgp_file.is_some() && p.route_pgp_file.is_some())
+        .count();
+    println!(
+        "l0.peer_pgp    {pgp_ready}/{} (user+route files; contents not printed)",
+        cfg.peers.len()
+    );
+    if let Some(eoa) = cfg.l0.routing_eoa.as_deref().or(match &cfg.identity.host {
+        crate::locator::LocatorHost::Eoa(e) => Some(e.as_str()),
+        crate::locator::LocatorHost::Tag(_) => None,
+    }) {
+        if let Ok(call) = crate::l0::address_pgp::encode_search_key_call(eoa) {
+            println!("l0.searchKey   {call}");
+        }
+    }
     if let Some(uid) = cfg.raw.validator_uid {
         println!("validator_uid  {uid} (never captured)");
     }

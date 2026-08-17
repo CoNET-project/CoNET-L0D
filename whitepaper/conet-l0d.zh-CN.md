@@ -1,7 +1,7 @@
 # conet-l0d — 在 Layer Minus 上的 L1 overlay
 
 **成对译本：** [English](./conet-l0d.md)  
-**Revision：** 2026-08-17  
+**Revision：** 2026-08-17（里程碑评估 21:36Z：crate MVP 已验收；P1 出站已在 crate；实验室二进制 `[l0]` 关；listen 未交付）  
 **公开操作说明：** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **公开开发说明：** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -137,8 +137,8 @@ L0 额外时延在本 Revision 中是 **估计**（每跳数十到数百毫秒�
 
 | 阶段 | 范围 |
 | --- | --- |
-| **MVP** | Linux 命令；TUN + iptables 生命周期；定位符解析；静态对等表；收包计数；L0 客户端桩 |
-| **P1** | 在现有 L0 原语上做钱包对钱包 TCP 字节流；静态 overlay bootnode |
+| **MVP** | **已验收（2026-08-17）。** Linux 命令；TUN + iptables 生命周期；定位符解析；静态对等表；收包计数；L0 客户端桩 |
+| **P1** | **已在 crate；实验室可装二进制且 `[l0]` 关。** 在现有 L0 原语上做钱包对钱包 TCP 字节流；静态 overlay bootnode。crate 把 overlay 信封加密给对端 **user PGP**，再 wrap `{ data, NoPush: true }` 给 mailbox **B route PGP**，仅在 `[l0].enabled` 且对端有 user+route PGP 文件与 entry 时 `POST { "data" }`（默认 **关**）。本评估可把该二进制装到两机实验室，**不**开 `[l0]`。Listen 写回 TUN **未**交付。不是现役 mailbox 客户端。在证明双向帧之前不要通告 overlay vIP。 |
 | **P2** | 若 discv4/discv5 必须走 L0，再做 datagram 适配器 |
 | **P3** | 混合生产（公网 P2P + L0 备份）；实测 RTT |
 
@@ -148,7 +148,8 @@ L0 额外时延在本 Revision 中是 **估计**（每跳数十到数百毫秒�
 | --- | --- |
 | [github.com/CoNET-project/CoNET-L0D](https://github.com/CoNET-project/CoNET-L0D) | 公开 crate 真相来源 |
 | 本成对白皮书 + `RULES.md` | 设计与工程约束 |
-| `docs/MVP.md` | 当前 crate 验收 |
+| `docs/MVP.md` | 已验收的 crate MVP |
+| `docs/P1.md` | 下一阶段线合同与 `[l0]`（不是现役 SI 命令） |
 | `config/conet-l0d.example.toml` | overlay 表示例 |
 | `systemd/conet-l0d.service` | 进程持有 TUN/iptables；unit 不得写裸 `iptables` |
 | GitBook Applications | 操作员 how-to（公开书英语） |

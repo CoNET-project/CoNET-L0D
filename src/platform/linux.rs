@@ -72,7 +72,7 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     let std_file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
     let mut file = tokio::fs::File::from_std(std_file);
     let mut buf = vec![0u8; 2048];
-    let mut stats = ForwardStats::default();
+    let mut stats = ForwardStats::new(cfg);
     loop {
         let n = file.read(&mut buf).await?;
         if n == 0 {

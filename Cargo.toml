@@ -17,12 +17,24 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tiny-keccak = { version = "2", features = ["keccak"] }
 thiserror = "2"
 toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "io-util", "fs", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sequoia-openpgp = { version = "1.22", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
+# rustc 1.87: newer url/idna pull icu 2.3 (needs 1.88).
+url = "=2.5.4"
+idna = "=1.0.3"
+idna_adapter = "=1.2.1"
+icu_normalizer = "=2.1.1"
+icu_properties = "=2.1.2"
+icu_provider = "=2.1.1"
+icu_locale_core = "=2.1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -31,6 +43,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "=0.6.2"
 
 [profile.release]
 lto = true

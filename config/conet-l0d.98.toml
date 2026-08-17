@@ -1,0 +1,26 @@
+# Overlay table for the 198.251.77.98 MVP lab (peer of 74.208.224.45).
+# start/stop/teardown need CAP_NET_ADMIN (sudo). This host has passwordless sudo.
+# Do not bind geth/beacon RPC to local_vip.
+# geth HTTP 127.0.0.1:8889; beacon gRPC/REST 127.0.0.1:4000/4100.
+# Remote VA / staking / voting is retired on this host. MVP is geth/beacon P2P only.
+# L0 byte-stream: crate P1 objects exist, but [l0] stays off on this lab host.
+# TUN counts overlay IPv4 only. Keep advertise on the public IP.
+
+tun_name = "conet-l0"
+overlay_cidr = "100.64.0.0/10"
+local_vip = "100.64.0.6"
+iptables_chain = "CONET_L0D"
+state_path = "/home/peter/conet-l0d-lab/run/state.json"
+
+[identity]
+locator = "web3://0x2222222222222222222222222222222222222222/p2p/geth"
+
+[[peers]]
+locator = "web3://0x1111111111111111111111111111111111111111/p2p/geth"
+vip = "100.64.0.5"
+tcp_ports = [8400]
+
+[[peers]]
+locator = "web3://0x1111111111111111111111111111111111111111/p2p/beacon"
+vip = "100.64.0.5"
+tcp_ports = [4200]

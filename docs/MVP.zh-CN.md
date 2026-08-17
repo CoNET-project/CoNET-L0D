@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **成对：** [English](./MVP.md)  
-**Revision：** 2026-08-17（与白皮书同行）
+**Revision：** 2026-08-17（里程碑评估 21:36Z：crate MVP 已验收；P1 出站已在 crate；实验室二进制 `[l0]` 关 — 见 [P1.zh-CN.md](./P1.zh-CN.md)）
 
 公开 how-to：[Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -19,13 +19,13 @@
 | `stop` / SIGINT / SIGTERM | 与 start 相反；pid 来自 state 文件 |
 | `teardown` | 守护进程已死后仍能走同一反向路径 |
 | 收包循环 | 统计 TUN 上的 IPv4；记录目的 vIP（不含密钥） |
-| L0 | 仅桩 — 不得声称现役 SI `p2p_stream_*` |
+| L0 | crate 桩已验收：统计 TUN IPv4 并记录目的 vIP。不得声称现役 SI `p2p_stream_*`。现役 `/post` 字节流见 [P1](./P1.zh-CN.md) |
 | 文档 | 成对白皮书 + 本 MVP + GitBook Applications + Developers |
 | 示例 + unit | `config/conet-l0d.example.toml` 与 `systemd/conet-l0d.service`（仅 `start`/`stop`） |
 
 ## 范围外（不算 MVP 失败）
 
-- 现役 AddressPGP RPC / OpenPGP `/post` 字节流
+- 生产 mailbox 投递 / listen 写回（[P1](./P1.zh-CN.md) crate 已有 encrypt + mailbox wrap + POST；实验室可装该二进制；`[l0]` 保持 **关** — 不是现役 mailbox 客户端）
 - 捕获 UDP discv4 / discv5
 - 代理 validator 或读取 keystore
 - 新 SI 命令或新域名
