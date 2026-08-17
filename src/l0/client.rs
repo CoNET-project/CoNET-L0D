@@ -14,9 +14,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 const POST_QUEUE: usize = 32;
+const LISTEN_QUEUE: usize = 32;
+const LISTEN_RECONNECT_SECS: u64 = 3;
 
 struct ArmoredCert(String);
 
@@ -85,6 +88,7 @@ pub struct L0Client {
     post_tx: Option<mpsc::Sender<PostJob>>,
     user_secret: Option<SecretCert>,
     tun_tx: Option<mpsc::Sender<Vec<u8>>>,
+    inbound_rx: Option<mpsc::Receiver<String>>,
 }
 
 impl fmt::Debug for L0Client {
@@ -106,6 +110,7 @@ impl fmt::Debug for L0Client {
             .field("post_worker", &self.post_tx.is_some())
             .field("inbound_secret", &self.user_secret.is_some())
             .field("tun_writer", &self.tun_tx.is_some())
+            .field("listen_worker", &self.inbound_rx.is_some())
             .finish()
     }
 }
@@ -137,6 +142,7 @@ impl L0Client {
             post_tx: None,
             user_secret: None,
             tun_tx: None,
+            inbound_rx: None,
         }
     }
 
@@ -197,6 +203,32 @@ impl L0Client {
             None
         };
 
+        let inbound_rx = if cfg.l0.enabled
+            && user_secret.is_some()
+            && !cfg.l0.listen_entries.is_empty()
+            && !routing_eoa.is_empty()
+        {
+            match cfg.l0.mailbox_route_pgp_file.as_ref() {
+                Some(path) => match pgp::load_public_cert_armored(path) {
+                    Ok(route) => spawn_listen_worker(
+                        cfg.l0.listen_entries.clone(),
+                        route,
+                        routing_eoa.clone(),
+                    ),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "P1: mailbox_route_pgp_file was not loaded; listen worker stays off"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
         Self {
             enabled: cfg.l0.enabled,
             seq: 0,
@@ -216,6 +248,7 @@ impl L0Client {
             post_tx,
             user_secret,
             tun_tx: None,
+            inbound_rx,
         }
     }
 
@@ -224,8 +257,13 @@ impl L0Client {
         self.tun_tx = Some(tx);
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn take_inbound_rx(&mut self) -> Option<mpsc::Receiver<String>> {
+        self.inbound_rx.take()
+    }
+
     /// Decrypt inbound user-PGP armor and queue raw IPv4 for TUN write-back.
-    /// Does not open a live SI SSE.
+    /// May be fed by the in-crate listen worker. Tests do not POST production SI.
     #[allow(dead_code)]
     pub fn apply_inbound_armor(&mut self, armor: &str) -> Result<usize, L0dError> {
         if !self.enabled {
@@ -401,6 +439,46 @@ fn load_peer_pgp(
     })
 }
 
+fn spawn_listen_worker(
+    entries: Vec<String>,
+    mailbox_route: String,
+    routing_eoa: String,
+) -> Option<mpsc::Receiver<String>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let client = listen::listen_http_client().ok()?;
+    let (tx, rx) = mpsc::channel::<String>(LISTEN_QUEUE);
+    handle.spawn(async move {
+        let mut last_failed: Option<String> = None;
+        loop {
+            let Some(entry) = listen::pick_listen_entry(&entries, last_failed.as_deref()) else {
+                tracing::warn!("P1 listen: listen_entries empty; worker idle");
+                tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
+                continue;
+            };
+            let ts = chrono::Utc::now().timestamp().max(0) as u64;
+            match listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, entry) {
+                Ok((url, armor)) => match listen::run_listen_once(&client, &url, &armor, &tx).await
+                {
+                    Ok(_) => {
+                        last_failed = None;
+                        tracing::info!("P1 listen SSE ended; reconnecting after idle");
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "P1 listen SSE failed");
+                        last_failed = Some(entry.to_string());
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(error = %err, "P1 listen wrap refused");
+                    last_failed = Some(entry.to_string());
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
+        }
+    });
+    Some(rx)
+}
+
 fn spawn_post_worker() -> Option<mpsc::Sender<PostJob>> {
     let handle = tokio::runtime::Handle::try_current().ok()?;
     let client = post::http_client().ok()?;
@@ -458,6 +536,7 @@ mod tests {
             post_tx: None,
             user_secret: None,
             tun_tx: None,
+            inbound_rx: None,
         }
     }
 

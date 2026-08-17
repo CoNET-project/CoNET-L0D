@@ -26,12 +26,16 @@ tcp_ports = [4200]
 # P1 overlay /post client. Default off. When enabled and peer user+route PGP
 # files plus an entry are set, the daemon encrypts, wraps, and POSTs.
 # Inbound decrypt + TUN write-back is in-crate when routing_key_file is an
-# OpenPGP secret cert. Live mailbox SSE is not opened. Do not put Securitykey
-# in a B-decryptable listen command.
+# OpenPGP secret cert. Listen HTTP+SSE is in-crate when enabled plus
+# listen_entries, mailbox_route_pgp_file (this host's B route PUBLIC key),
+# routing_eoa, and routing_key_file. The listen command is unsigned in this
+# revision (no EIP-191); production SI checkSign will reject. Lab stays off.
+# Do not put Securitykey in a B-decryptable listen command.
 # Encrypt envelope to peer user PGP, wrap { data, NoPush: true } to B route PGP,
 # POST only { "data": outerArmor } to a healthy entry A ≠ B.
-# Do not invent a new SI command. Do not switch geth/beacon advertise to the vIP
-# until a bidirectional overlay frame is proven.
+# Listen POST goes to entry C ≠ B. Do not invent a new SI command. Do not
+# switch geth/beacon advertise to the vIP until a bidirectional overlay frame
+# is proven.
 #
 # [l0]
 # enabled = false
@@ -41,6 +45,7 @@ tcp_ports = [4200]
 # listen_entries = ["https://<existing-guardian>.conet.network"]
 # routing_eoa = "0x<dedicated-routing-eoa>"
 # routing_key_file = "/etc/conet-l0d/routing.key"
+# mailbox_route_pgp_file = "/etc/conet-l0d/self-mailbox-route.asc"
 #
 # Per-peer public key files (lab override; do not log contents):
 # user_pgp_file = "/etc/conet-l0d/peer-user.asc"

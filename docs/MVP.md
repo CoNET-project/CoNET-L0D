@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **Paired:** [中文](./MVP.zh-CN.md)  
-**Revision:** 2026-08-17 (milestone eval 21:50Z: crate MVP accepted; P1 outbound + inbound decrypt/TUN write-back in-crate; live mailbox SSE not opened; lab binary `[l0]` off — see [P1.md](./P1.md))
+**Revision:** 2026-08-17 (milestone eval 22:45Z: crate MVP accepted; P1 outbound + inbound decrypt/TUN write-back + listen HTTP+SSE worker in-crate, mock-tested, unsigned mining; production SI listen not opened; lab binary `[l0]` off — see [P1.md](./P1.md))
 
 Public how-to: [Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -25,7 +25,7 @@ Ship an independent **Linux command** `conet-l0d` that operators can start and s
 
 ## Out of scope (not a failed MVP)
 
-- Production mailbox delivery / live listen SSE (P1 crate has outbound encrypt + wrap + POST **and** inbound decrypt + TUN write-back; a lab host may run that binary; `[l0]` stays **off** — not a live mailbox client; see [P1.md](./P1.md))
+- Production mailbox delivery / production SI listen (P1 crate has outbound encrypt + wrap + POST, inbound decrypt + TUN write-back, **and** a listen HTTP+SSE worker that is mock-tested and **unsigned**; production SI `checkSign` will reject; a lab host may run that binary; `[l0]` stays **off** — not a live mailbox client; see [P1.md](./P1.md))
 - UDP discv4 / discv5 capture
 - Validator proxy or keystore access
 - New SI commands or new hostnames

@@ -36,7 +36,11 @@ pub struct L0Config {
     #[serde(default)]
     pub listen_entries: Vec<String>,
     pub routing_eoa: Option<String>,
+    #[serde(default)]
     pub routing_key_file: Option<PathBuf>,
+    /// This host's mailbox **B route public** key. Not the peer route file.
+    #[serde(default)]
+    pub mailbox_route_pgp_file: Option<PathBuf>,
 }
 
 impl Default for L0Config {
@@ -49,6 +53,7 @@ impl Default for L0Config {
             listen_entries: Vec::new(),
             routing_eoa: None,
             routing_key_file: None,
+            mailbox_route_pgp_file: None,
         }
     }
 }
@@ -91,6 +96,8 @@ pub struct L0Settings {
     pub routing_eoa: Option<String>,
     /// OpenPGP secret cert for inbound user-PGP decrypt. Unused when `[l0]` is off.
     pub routing_key_file: Option<PathBuf>,
+    /// This host's mailbox B route **public** cert. Unused when `[l0]` is off.
+    pub mailbox_route_pgp_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +335,7 @@ impl DaemonConfig {
                 listen_entries: self.l0.listen_entries.clone(),
                 routing_eoa,
                 routing_key_file: self.l0.routing_key_file.clone(),
+                mailbox_route_pgp_file: self.l0.mailbox_route_pgp_file.clone(),
             },
         })
     }

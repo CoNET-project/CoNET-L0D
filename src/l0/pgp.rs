@@ -98,6 +98,17 @@ pub fn wrap_overlay_for_post(
     encrypt_utf8(&work, route_pub_armored)
 }
 
+/// Load an armored OpenPGP **public** cert (mailbox B route). Do not log contents.
+pub fn load_public_cert_armored(path: &Path) -> Result<String, L0dError> {
+    let text = std::fs::read_to_string(path)?;
+    if text.trim().is_empty() {
+        return Err(L0dError::L0("OpenPGP public cert file is empty".into()));
+    }
+    let _cert = Cert::from_bytes(text.as_bytes())
+        .map_err(|e| L0dError::L0(format!("OpenPGP public cert: {e}")))?;
+    Ok(text)
+}
+
 /// Load an armored OpenPGP **secret** cert. Do not log the file contents.
 pub fn load_secret_cert(path: &Path) -> Result<Cert, L0dError> {
     let bytes = std::fs::read(path)?;
@@ -253,6 +264,8 @@ mod tests {
         std::fs::write(&sec_path, secret_cert_armored(&cert).unwrap()).unwrap();
         assert!(load_secret_cert(&pub_path).is_err());
         assert!(load_secret_cert(&sec_path).is_ok());
+        assert!(load_public_cert_armored(&pub_path).is_ok());
+        assert!(load_public_cert_armored(&sec_path).is_ok());
     }
 
     #[test]

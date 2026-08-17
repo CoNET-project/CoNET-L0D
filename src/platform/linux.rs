@@ -2,6 +2,7 @@ use crate::config::ValidatedConfig;
 use crate::error::L0dError;
 use crate::forward::ForwardStats;
 use crate::state::RuntimeState;
+use std::future::pending;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -80,6 +81,7 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     let mut stats = ForwardStats::new(cfg);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
     stats.l0.attach_tun_writer(tx);
+    let mut inbound_rx = stats.l0.take_inbound_rx();
     tokio::spawn(async move {
         while let Some(pkt) = rx.recv().await {
             if let Err(err) = writer.write_all(&pkt).await {
@@ -88,13 +90,34 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
         }
     });
     loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
+        tokio::select! {
+            read = file.read(&mut buf) => {
+                let n = read?;
+                if n == 0 {
+                    break;
+                }
+                stats.on_tun_frame(cfg, &buf[..n]);
+            }
+            armor = recv_inbound_armor(&mut inbound_rx) => {
+                match armor {
+                    Some(armor) => {
+                        if let Err(err) = stats.l0.apply_inbound_armor(&armor) {
+                            tracing::warn!(error = %err, "P1 inbound armor from listen refused");
+                        }
+                    }
+                    None => inbound_rx = None,
+                }
+            }
         }
-        stats.on_tun_frame(cfg, &buf[..n]);
     }
     Ok(())
+}
+
+async fn recv_inbound_armor(rx: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+    match rx.as_mut() {
+        Some(inner) => inner.recv().await,
+        None => pending().await,
+    }
 }
 
 pub fn signal_stop(pid: u32) -> Result<(), L0dError> {

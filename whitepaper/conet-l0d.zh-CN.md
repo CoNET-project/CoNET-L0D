@@ -1,7 +1,7 @@
 # conet-l0d — 在 Layer Minus 上的 L1 overlay
 
 **成对译本：** [English](./conet-l0d.md)  
-**Revision：** 2026-08-17（里程碑评估 21:50Z：crate MVP 已验收；P1 出站 + 入站解密/TUN 写回已在 crate；未打开现役 mailbox SSE；实验室二进制 `[l0]` 关）  
+**Revision：** 2026-08-17（里程碑评估 22:45Z：crate MVP 已验收；P1 出站 + 入站解密/TUN 写回 + listen HTTP+SSE worker 已在 crate，mock 测过、未签 mining；未打开生产 SI listen；实验室二进制 `[l0]` 关）  
 **公开操作说明：** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **公开开发说明：** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -138,7 +138,7 @@ L0 额外时延在本 Revision 中是 **估计**（每跳数十到数百毫秒�
 | 阶段 | 范围 |
 | --- | --- |
 | **MVP** | **已验收（2026-08-17）。** Linux 命令；TUN + iptables 生命周期；定位符解析；静态对等表；收包计数；L0 客户端桩 |
-| **P1** | **已在 crate；实验室可装二进制且 `[l0]` 关。** 在现有 L0 原语上做钱包对钱包 TCP 字节流；静态 overlay bootnode。crate 把 overlay 信封加密给对端 **user PGP**，再 wrap `{ data, NoPush: true }` 给 mailbox **B route PGP**，仅在 `[l0].enabled` 且对端有 user+route PGP 文件与 entry 时 `POST { "data" }`（默认 **关**）。入站：解密 user-PGP armor → overlay 信封 → 原始 IPv4 入队写回 TUN（`routing_key_file` 须为 OpenPGP 私钥证书）**已在 crate**。Listen 命令形状为 `command: mining` + `listenKind: "chat"`，**不得**带 `Securitykey`。**未打开现役 mailbox SSE。** 本评估可把该二进制装到两机实验室，**不**开 `[l0]`。不是现役 mailbox 客户端。在证明双向帧之前不要通告 overlay vIP。 |
+| **P1** | **已在 crate；实验室可装二进制且 `[l0]` 关。** 在现有 L0 原语上做钱包对钱包 TCP 字节流；静态 overlay bootnode。crate 把 overlay 信封加密给对端 **user PGP**，再 wrap `{ data, NoPush: true }` 给 mailbox **B route PGP**，仅在 `[l0].enabled` 且对端有 user+route PGP 文件与 entry 时 `POST { "data" }`（默认 **关**）。入站：解密 user-PGP armor → overlay 信封 → 原始 IPv4 入队写回 TUN（`routing_key_file` 须为 OpenPGP 私钥证书）**已在 crate**。Listen HTTP+SSE worker **已在 crate**：enabled 加上 `listen_entries`（C ≠ B）、`mailbox_route_pgp_file`（本机 B route **公钥**）、`routing_eoa` 与 user 私钥。Listen 命令为 `command: mining` + `listenKind: "chat"`，**不得**带 `Securitykey`，本修订 **无 EIP-191**；生产 SI `checkSign` 会拒。测试只用 wiremock。**未打开生产 SI listen。** 本评估可把该二进制装到两机实验室，**不**开 `[l0]`。不是现役 mailbox 客户端。在证明双向帧之前不要通告 overlay vIP。 |
 | **P2** | 若 discv4/discv5 必须走 L0，再做 datagram 适配器 |
 | **P3** | 混合生产（公网 P2P + L0 备份）；实测 RTT |
 

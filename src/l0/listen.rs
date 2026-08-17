@@ -1,14 +1,17 @@
 //! Inbound overlay: decrypt user-PGP armor and recover raw IPv4 for TUN write-back.
-#![allow(dead_code)]
 //!
-//! Mailbox SSE would deliver armor encrypted to **this host's user PGP**.
-//! This module does not open a live SI listen (no EIP-191, no `Securitykey`
-//! in a B-decryptable command, no `p2p_stream_*`).
+//! In-crate listen worker: wrap `mining` + `listenKind: chat` to **this host's**
+//! mailbox B route PGP, `POST { "data" }` to entry **C**, read SSE, extract
+//! user-PGP armor. No `Securitykey`. No EIP-191 `signMessage` in this revision
+//! (production SI `checkSign` will reject). Tests use wiremock only.
+#![allow(dead_code)]
 
 use crate::error::L0dError;
-use crate::l0::{envelope, pgp};
+use crate::l0::{envelope, pgp, post};
 use sequoia_openpgp::Cert;
 use serde_json::Value;
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// `command: mining` + `listenKind: chat` on a dedicated routing EOA.
 /// Do not put `Securitykey` in this object (B can decrypt listen).
@@ -60,6 +63,123 @@ pub fn inbound_ipv4_from_user_armor(armor: &str, secret: &Cert) -> Result<Vec<u8
         return Err(L0dError::L0("inbound payload is not IPv4".into()));
     }
     Ok(ipv4)
+}
+
+/// Wrap a listen command and build the `/post` URL. HTTP body is still `{ data }`.
+pub fn prepare_listen_post(
+    wallet: &str,
+    timestamp: u64,
+    route_pub_armored: &str,
+    entry: &str,
+) -> Result<(String, String), L0dError> {
+    let cmd = encode_listen_command(wallet, timestamp)?;
+    let armor = wrap_listen_for_post(&cmd, route_pub_armored)?;
+    let url = post::post_url(entry)?;
+    Ok((url, armor))
+}
+
+/// Prefer an entry that is not the last failed host. One-entry lists stay usable.
+pub fn pick_listen_entry<'a>(entries: &'a [String], last_failed: Option<&str>) -> Option<&'a str> {
+    if entries.is_empty() {
+        return None;
+    }
+    entries
+        .iter()
+        .map(String::as_str)
+        .find(|entry| last_failed != Some(*entry))
+        .or_else(|| entries.first().map(String::as_str))
+}
+
+/// Long-lived SSE client. Connect timeout starts at `fetch` (12s).
+/// Do not set an overall request timeout — that would cut a live SSE.
+pub fn listen_http_client() -> Result<reqwest::Client, L0dError> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(12))
+        .user_agent("conet-l0d/0.1")
+        .build()
+        .map_err(|e| L0dError::L0(format!("listen http client: {e}")))
+}
+
+/// POST listen armor. Require HTTP 2xx. Do not treat a non-2xx as a live SSE.
+pub async fn open_listen_sse(
+    client: &reqwest::Client,
+    url: &str,
+    listen_armor: &str,
+) -> Result<reqwest::Response, L0dError> {
+    let body = post::json_body(listen_armor)?;
+    let obj = body
+        .as_object()
+        .ok_or_else(|| L0dError::L0("POST body must be a JSON object".into()))?;
+    if obj.len() != 1 || !obj.contains_key("data") {
+        return Err(L0dError::L0("POST body must be exactly { data }".into()));
+    }
+    let response = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| L0dError::L0(format!("listen POST failed: {e}")))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(L0dError::L0(format!("listen POST HTTP {status}")));
+    }
+    if response.content_length() == Some(0) {
+        return Err(L0dError::L0("listen POST returned empty body".into()));
+    }
+    Ok(response)
+}
+
+/// Extract complete armors and drop them from `buffer`. Do not log armor.
+pub fn drain_sse_armors(buffer: &mut String) -> Vec<String> {
+    let found = extract_pgp_armors_from_sse(buffer);
+    if found.is_empty() {
+        if !buffer.contains("BEGIN PGP") && buffer.len() > 64_000 {
+            buffer.clear();
+        }
+        return found;
+    }
+    if let Some(pos) = buffer.rfind("-----END PGP MESSAGE-----") {
+        let mut end = pos + "-----END PGP MESSAGE-----".len();
+        if buffer[end..].starts_with('\n') {
+            end += 1;
+        }
+        buffer.drain(..end.min(buffer.len()));
+    }
+    found
+}
+
+pub async fn pump_sse_armors(
+    mut response: reqwest::Response,
+    armor_tx: &mpsc::Sender<String>,
+) -> Result<(), L0dError> {
+    let mut buf = String::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                for armor in drain_sse_armors(&mut buf) {
+                    if armor_tx.send(armor).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => return Ok(()),
+            Err(err) => return Err(L0dError::L0(format!("listen SSE read: {err}"))),
+        }
+    }
+}
+
+/// One listen POST + SSE drain. Tests use wiremock. Do not call production SI from tests.
+pub async fn run_listen_once(
+    client: &reqwest::Client,
+    url: &str,
+    listen_armor: &str,
+    armor_tx: &mpsc::Sender<String>,
+) -> Result<u16, L0dError> {
+    let response = open_listen_sse(client, url, listen_armor).await?;
+    let status = response.status().as_u16();
+    pump_sse_armors(response, armor_tx).await?;
+    Ok(status)
 }
 
 /// Collect OpenPGP message armor from SSE `data:` lines. Do not log armor.
@@ -148,5 +268,98 @@ mod tests {
         let found = extract_pgp_armors_from_sse(chunk);
         assert_eq!(found.len(), 1);
         assert!(pgp::is_pgp_message_armor(&found[0]));
+    }
+
+    #[test]
+    fn drain_keeps_incomplete_armor() {
+        let mut buf = String::from("data: -----BEGIN PGP MESSAGE-----\ndata: partial\n");
+        assert!(drain_sse_armors(&mut buf).is_empty());
+        assert!(buf.contains("BEGIN PGP"));
+    }
+
+    #[test]
+    fn pick_listen_skips_last_failed() {
+        let entries = vec![
+            "https://a.conet.network".into(),
+            "https://b.conet.network".into(),
+        ];
+        assert_eq!(
+            pick_listen_entry(&entries, Some("https://a.conet.network")),
+            Some("https://b.conet.network")
+        );
+        assert_eq!(
+            pick_listen_entry(&entries[..1], Some("https://a.conet.network")),
+            Some("https://a.conet.network")
+        );
+        assert!(pick_listen_entry(&[], None).is_none());
+    }
+
+    fn armor_to_sse(armor: &str) -> String {
+        let mut out = String::from("event: message\n");
+        for line in armor.lines() {
+            out.push_str("data: ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+        out
+    }
+
+    #[tokio::test]
+    async fn listen_once_reads_sse_and_recovers_ipv4() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let route = generate_test_cert();
+        let user = generate_test_cert();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let pkt = b"\x45\x00listen-sse-ipv4!!!!";
+        let json = envelope::encode("0x1111111111111111111111111111111111111111", 3, pkt).unwrap();
+        let inbound = encrypt_utf8(&json, &user_pub).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .and(body_string_contains("\"data\""))
+            .and(body_string_contains("BEGIN PGP MESSAGE"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(armor_to_sse(&inbound)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (url, listen_armor) = prepare_listen_post(
+            "0x1111111111111111111111111111111111111111",
+            1_710_000_000,
+            &route_pub,
+            &server.uri(),
+        )
+        .unwrap();
+        assert!(url.ends_with("/post"));
+        assert_eq!(pgp::decrypt_utf8(&listen_armor, &route).unwrap().contains("Securitykey"), false);
+
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let client = listen_http_client().unwrap();
+        let status = run_listen_once(&client, &url, &listen_armor, &tx)
+            .await
+            .expect("mock listen");
+        assert_eq!(status, 200);
+        let got_armor = rx.recv().await.expect("sse armor");
+        assert_eq!(inbound_ipv4_from_user_armor(&got_armor, &user).unwrap(), pkt);
+    }
+
+    #[tokio::test]
+    async fn listen_does_not_post_plaintext() {
+        let client = listen_http_client().unwrap();
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let err = run_listen_once(
+            &client,
+            "https://example.conet.network/post",
+            r#"{"command":"mining"}"#,
+            &tx,
+        )
+        .await
+        .expect_err("plaintext must not POST");
+        assert!(err.to_string().contains("plaintext"));
     }
 }

@@ -29,6 +29,14 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
             "unset"
         }
     );
+    println!(
+        "l0.mailbox_rt  {}",
+        if cfg.l0.mailbox_route_pgp_file.is_some() {
+            "set"
+        } else {
+            "unset"
+        }
+    );
     let pgp_ready = cfg
         .peers
         .iter()
