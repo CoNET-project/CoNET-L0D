@@ -7,8 +7,9 @@
 
 use crate::config::ValidatedConfig;
 use crate::error::L0dError;
-use crate::l0::{envelope, frame, pgp, post};
+use crate::l0::{envelope, frame, listen, pgp, post};
 use crate::locator::{Locator, LocatorHost};
+use sequoia_openpgp::Cert;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -22,6 +23,14 @@ struct ArmoredCert(String);
 impl fmt::Debug for ArmoredCert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ArmoredCert(redacted)")
+    }
+}
+
+struct SecretCert(Cert);
+
+impl fmt::Debug for SecretCert {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretCert(redacted)")
     }
 }
 
@@ -66,10 +75,16 @@ pub struct L0Client {
     pub posts_queued: u64,
     pub posts_dropped: u64,
     pub posts_refused: u64,
+    pub inbound_ready: u64,
+    pub tun_writes: u64,
+    pub inbound_refused: u64,
+    pub inbound_dropped: u64,
     routing_eoa: String,
     entries: Vec<String>,
     peers: HashMap<Ipv4Addr, PeerPgp>,
     post_tx: Option<mpsc::Sender<PostJob>>,
+    user_secret: Option<SecretCert>,
+    tun_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl fmt::Debug for L0Client {
@@ -82,9 +97,15 @@ impl fmt::Debug for L0Client {
             .field("posts_queued", &self.posts_queued)
             .field("posts_dropped", &self.posts_dropped)
             .field("posts_refused", &self.posts_refused)
+            .field("inbound_ready", &self.inbound_ready)
+            .field("tun_writes", &self.tun_writes)
+            .field("inbound_refused", &self.inbound_refused)
+            .field("inbound_dropped", &self.inbound_dropped)
             .field("entries", &self.entries.len())
             .field("peers_with_pgp", &self.peers.len())
             .field("post_worker", &self.post_tx.is_some())
+            .field("inbound_secret", &self.user_secret.is_some())
+            .field("tun_writer", &self.tun_tx.is_some())
             .finish()
     }
 }
@@ -106,10 +127,16 @@ impl L0Client {
             posts_queued: 0,
             posts_dropped: 0,
             posts_refused: 0,
+            inbound_ready: 0,
+            tun_writes: 0,
+            inbound_refused: 0,
+            inbound_dropped: 0,
             routing_eoa: String::new(),
             entries: Vec::new(),
             peers: HashMap::new(),
             post_tx: None,
+            user_secret: None,
+            tun_tx: None,
         }
     }
 
@@ -152,6 +179,24 @@ impl L0Client {
             None
         };
 
+        let user_secret = if cfg.l0.enabled {
+            match cfg.l0.routing_key_file.as_ref() {
+                Some(path) => match pgp::load_secret_cert(path) {
+                    Ok(cert) => Some(SecretCert(cert)),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "P1: routing_key_file was not loaded; inbound write-back stays refused"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
         Self {
             enabled: cfg.l0.enabled,
             seq: 0,
@@ -161,10 +206,69 @@ impl L0Client {
             posts_queued: 0,
             posts_dropped: 0,
             posts_refused: 0,
+            inbound_ready: 0,
+            tun_writes: 0,
+            inbound_refused: 0,
+            inbound_dropped: 0,
             routing_eoa,
             entries: cfg.l0.entries.clone(),
             peers,
             post_tx,
+            user_secret,
+            tun_tx: None,
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn attach_tun_writer(&mut self, tx: mpsc::Sender<Vec<u8>>) {
+        self.tun_tx = Some(tx);
+    }
+
+    /// Decrypt inbound user-PGP armor and queue raw IPv4 for TUN write-back.
+    /// Does not open a live SI SSE.
+    #[allow(dead_code)]
+    pub fn apply_inbound_armor(&mut self, armor: &str) -> Result<usize, L0dError> {
+        if !self.enabled {
+            self.inbound_refused = self.inbound_refused.saturating_add(1);
+            return Err(L0dError::L0(
+                "[l0].enabled is false; inbound write-back refused".into(),
+            ));
+        }
+        let Some(secret) = self.user_secret.as_ref() else {
+            self.inbound_refused = self.inbound_refused.saturating_add(1);
+            return Err(L0dError::L0(
+                "routing_key_file OpenPGP secret is required for inbound write-back".into(),
+            ));
+        };
+        match listen::inbound_ipv4_from_user_armor(armor, &secret.0) {
+            Ok(ipv4) => {
+                let n = ipv4.len();
+                self.inbound_ready = self.inbound_ready.saturating_add(1);
+                match &self.tun_tx {
+                    Some(tx) => match tx.try_send(ipv4) {
+                        Ok(()) => {
+                            self.tun_writes = self.tun_writes.saturating_add(1);
+                            tracing::info!(bytes = n, "P1 inbound IPv4 queued for TUN write-back");
+                        }
+                        Err(_) => {
+                            self.inbound_dropped = self.inbound_dropped.saturating_add(1);
+                            tracing::warn!(
+                                dropped = self.inbound_dropped,
+                                "P1 inbound TUN queue full; frame dropped"
+                            );
+                        }
+                    },
+                    None => tracing::info!(
+                        bytes = n,
+                        "P1 inbound IPv4 ready; TUN writer not attached"
+                    ),
+                }
+                Ok(n)
+            }
+            Err(err) => {
+                self.inbound_refused = self.inbound_refused.saturating_add(1);
+                Err(err)
+            }
         }
     }
 
@@ -344,10 +448,16 @@ mod tests {
             posts_queued: 0,
             posts_dropped: 0,
             posts_refused: 0,
+            inbound_ready: 0,
+            tun_writes: 0,
+            inbound_refused: 0,
+            inbound_dropped: 0,
             routing_eoa: "0x1111111111111111111111111111111111111111".into(),
             entries: vec!["https://example.conet.network".into()],
             peers,
             post_tx: None,
+            user_secret: None,
+            tun_tx: None,
         }
     }
 
@@ -386,5 +496,36 @@ mod tests {
             .prepare_overlay_post(Ipv4Addr::new(100, 64, 0, 6), b"x", 1)
             .unwrap_err();
         assert!(err.to_string().contains("user+route"));
+    }
+
+    #[test]
+    fn inbound_write_back_queues_ipv4() {
+        let user = generate_test_cert();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let pkt = b"\x45\x00inbound-ipv4-ok!!!";
+        let json = envelope::encode("0x1111111111111111111111111111111111111111", 2, pkt).unwrap();
+        let armor = pgp::encrypt_utf8(&json, &user_pub).unwrap();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let mut client = L0Client {
+            enabled: true,
+            user_secret: Some(SecretCert(user)),
+            tun_tx: Some(tx),
+            routing_eoa: "0x1111111111111111111111111111111111111111".into(),
+            ..L0Client::disabled()
+        };
+        assert_eq!(client.apply_inbound_armor(&armor).unwrap(), pkt.len());
+        assert_eq!(client.inbound_ready, 1);
+        assert_eq!(client.tun_writes, 1);
+        assert_eq!(rx.try_recv().unwrap(), pkt);
+    }
+
+    #[test]
+    fn inbound_refused_when_disabled() {
+        let mut client = L0Client::disabled();
+        let err = client
+            .apply_inbound_armor("-----BEGIN PGP MESSAGE-----\n\nxxxx\n-----END PGP MESSAGE-----\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("enabled is false"));
+        assert_eq!(client.inbound_refused, 1);
     }
 }

@@ -4,8 +4,9 @@ use crate::forward::ForwardStats;
 use crate::state::RuntimeState;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 const COMMENT: &str = "conet-l0d";
 
@@ -70,9 +71,22 @@ pub async fn uninstall(cfg: &ValidatedConfig, state: Option<&RuntimeState>) -> R
 pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     let fd = open_tun(&cfg.raw.tun_name)?;
     let std_file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
+    let writer_std = std_file
+        .try_clone()
+        .map_err(|e| L0dError::Net(format!("tun clone: {e}")))?;
     let mut file = tokio::fs::File::from_std(std_file);
+    let mut writer = tokio::fs::File::from_std(writer_std);
     let mut buf = vec![0u8; 2048];
     let mut stats = ForwardStats::new(cfg);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    stats.l0.attach_tun_writer(tx);
+    tokio::spawn(async move {
+        while let Some(pkt) = rx.recv().await {
+            if let Err(err) = writer.write_all(&pkt).await {
+                tracing::warn!(error = %err, "P1 TUN write-back failed");
+            }
+        }
+    });
     loop {
         let n = file.read(&mut buf).await?;
         if n == 0 {

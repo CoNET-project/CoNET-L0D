@@ -25,7 +25,9 @@ tcp_ports = [4200]
 
 # P1 overlay /post client. Default off. When enabled and peer user+route PGP
 # files plus an entry are set, the daemon encrypts, wraps, and POSTs.
-# Listen write-back to TUN is not shipped.
+# Inbound decrypt + TUN write-back is in-crate when routing_key_file is an
+# OpenPGP secret cert. Live mailbox SSE is not opened. Do not put Securitykey
+# in a B-decryptable listen command.
 # Encrypt envelope to peer user PGP, wrap { data, NoPush: true } to B route PGP,
 # POST only { "data": outerArmor } to a healthy entry A ≠ B.
 # Do not invent a new SI command. Do not switch geth/beacon advertise to the vIP

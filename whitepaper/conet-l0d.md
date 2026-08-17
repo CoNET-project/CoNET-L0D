@@ -1,7 +1,7 @@
 # conet-l0d — L1 overlay on Layer Minus
 
 **Paired translation:** [简体中文](./conet-l0d.zh-CN.md)  
-**Revision:** 2026-08-17 (milestone eval 21:36Z: crate MVP accepted; P1 outbound in-crate; lab binary `[l0]` off; listen not shipped)  
+**Revision:** 2026-08-17 (milestone eval 21:50Z: crate MVP accepted; P1 outbound + inbound decrypt/TUN write-back in-crate; live mailbox SSE not opened; lab binary `[l0]` off)  
 **Public operator guide:** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **Public developer guide:** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -138,7 +138,7 @@ L0 extra latency is an **estimate** (tens to hundreds of milliseconds per hop), 
 | Phase | Scope |
 | --- | --- |
 | **MVP** | **Accepted (2026-08-17).** Linux command; TUN + iptables lifecycle; locator parse; static peer table; packet counters; L0 client stub |
-| **P1** | **In crate; lab binary may be installed with `[l0]` off.** Wallet-to-wallet TCP byte stream on current L0 primitives; static overlay bootnodes. Crate encrypts the overlay envelope to the peer **user PGP**, wraps `{ data, NoPush: true }` to mailbox **B route PGP**, and POSTs only `{ "data" }` when `[l0].enabled` plus peer user+route PGP files and an entry are present (default **off**). This evaluation may install that binary on the two-host lab **without** enabling `[l0]`. Listen write-back to TUN is **not** shipped. Not a live mailbox client. Do not advertise overlay vIPs until a bidirectional frame is proven. |
+| **P1** | **In crate; lab binary may be installed with `[l0]` off.** Wallet-to-wallet TCP byte stream on current L0 primitives; static overlay bootnodes. Crate encrypts the overlay envelope to the peer **user PGP**, wraps `{ data, NoPush: true }` to mailbox **B route PGP**, and POSTs only `{ "data" }` when `[l0].enabled` plus peer user+route PGP files and an entry are present (default **off**). Inbound decrypt of user-PGP armor → overlay envelope → raw IPv4 queued to TUN is **in-crate** when `routing_key_file` is an OpenPGP secret cert. Listen command shape is `command: mining` + `listenKind: "chat"` with **no** `Securitykey`. **Live mailbox SSE is not opened.** This evaluation may install that binary on the two-host lab **without** enabling `[l0]`. Not a live mailbox client. Do not advertise overlay vIPs until a bidirectional frame is proven. |
 | **P2** | Datagram adapter if discv4/discv5 must ride L0 |
 | **P3** | Hybrid production (public P2P + L0 backup); measured RTT |
 

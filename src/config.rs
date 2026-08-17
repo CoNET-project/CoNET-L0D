@@ -89,8 +89,7 @@ pub struct L0Settings {
     pub entries: Vec<String>,
     pub listen_entries: Vec<String>,
     pub routing_eoa: Option<String>,
-    /// Listen / decrypt private-key path. Unused until listen write-back.
-    #[allow(dead_code)]
+    /// OpenPGP secret cert for inbound user-PGP decrypt. Unused when `[l0]` is off.
     pub routing_key_file: Option<PathBuf>,
 }
 

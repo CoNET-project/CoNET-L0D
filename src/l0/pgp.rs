@@ -4,10 +4,18 @@ use crate::error::L0dError;
 use sequoia_openpgp::cert::prelude::*;
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::policy::StandardPolicy;
+use sequoia_openpgp::crypto::SessionKey;
+use sequoia_openpgp::packet::{PKESK, SKESK};
+use sequoia_openpgp::parse::stream::{
+    DecryptionHelper, DecryptorBuilder, MessageStructure, VerificationHelper,
+};
 use sequoia_openpgp::serialize::stream::{Armorer, Encryptor2, LiteralWriter, Message};
+use sequoia_openpgp::types::SymmetricAlgorithm;
+use sequoia_openpgp::KeyHandle;
 #[cfg(test)]
 use sequoia_openpgp::serialize::SerializeInto;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::path::Path;
 
 pub fn is_pgp_message_armor(raw: &str) -> bool {
     raw.contains("-----BEGIN PGP MESSAGE-----")
@@ -90,46 +98,28 @@ pub fn wrap_overlay_for_post(
     encrypt_utf8(&work, route_pub_armored)
 }
 
-#[cfg(test)]
-pub fn public_cert_armored(cert: &Cert) -> Result<String, L0dError> {
-    String::from_utf8(
-        cert.armored()
-            .to_vec()
-            .map_err(|e| L0dError::L0(format!("serialize cert: {e}")))?,
-    )
-    .map_err(|_| L0dError::L0("serialized cert is not UTF-8".into()))
+/// Load an armored OpenPGP **secret** cert. Do not log the file contents.
+pub fn load_secret_cert(path: &Path) -> Result<Cert, L0dError> {
+    let bytes = std::fs::read(path)?;
+    let cert = Cert::from_bytes(&bytes)
+        .map_err(|e| L0dError::L0(format!("OpenPGP secret cert: {e}")))?;
+    if cert.keys().secret().next().is_none() {
+        return Err(L0dError::L0(
+            "routing_key_file must be an OpenPGP secret cert".into(),
+        ));
+    }
+    Ok(cert)
 }
 
-#[cfg(test)]
-pub fn generate_test_cert() -> Cert {
-    CertBuilder::new()
-        .add_userid("conet-l0d-test")
-        .add_transport_encryption_subkey()
-        .generate()
-        .expect("generate test OpenPGP cert")
-        .0
-}
-
-#[cfg(test)]
+/// Decrypt UTF-8 OpenPGP message armor with a secret cert. Do not log plaintext.
+#[allow(dead_code)]
 pub fn decrypt_utf8(armor: &str, secret: &Cert) -> Result<String, L0dError> {
-    use sequoia_openpgp::crypto::SessionKey;
-    use sequoia_openpgp::packet::{PKESK, SKESK};
-    use sequoia_openpgp::parse::stream::{
-        DecryptionHelper, DecryptorBuilder, MessageStructure, VerificationHelper,
-    };
-    use sequoia_openpgp::types::SymmetricAlgorithm;
-    use sequoia_openpgp::KeyHandle;
-    use std::io::Read;
-
     struct Helper {
         cert: Cert,
     }
 
     impl VerificationHelper for Helper {
-        fn get_certs(
-            &mut self,
-            _ids: &[KeyHandle],
-        ) -> sequoia_openpgp::Result<Vec<Cert>> {
+        fn get_certs(&mut self, _ids: &[KeyHandle]) -> sequoia_openpgp::Result<Vec<Cert>> {
             Ok(Vec::new())
         }
 
@@ -172,10 +162,11 @@ pub fn decrypt_utf8(armor: &str, secret: &Cert) -> Result<String, L0dError> {
                     }
                 }
             }
-            Err(anyhow::anyhow!("no test key decrypted the message"))
+            Err(anyhow::anyhow!("no key decrypted the message"))
         }
     }
 
+    refuse_plaintext_data(armor)?;
     let policy = StandardPolicy::new();
     let helper = Helper {
         cert: secret.clone(),
@@ -189,6 +180,37 @@ pub fn decrypt_utf8(armor: &str, secret: &Cert) -> Result<String, L0dError> {
         .read_to_end(&mut out)
         .map_err(|e| L0dError::L0(format!("decrypt read: {e}")))?;
     String::from_utf8(out).map_err(|_| L0dError::L0("decrypted payload is not UTF-8".into()))
+}
+
+#[cfg(test)]
+pub fn public_cert_armored(cert: &Cert) -> Result<String, L0dError> {
+    String::from_utf8(
+        cert.armored()
+            .to_vec()
+            .map_err(|e| L0dError::L0(format!("serialize cert: {e}")))?,
+    )
+    .map_err(|_| L0dError::L0("serialized cert is not UTF-8".into()))
+}
+
+#[cfg(test)]
+pub fn generate_test_cert() -> Cert {
+    CertBuilder::new()
+        .add_userid("conet-l0d-test")
+        .add_transport_encryption_subkey()
+        .generate()
+        .expect("generate test OpenPGP cert")
+        .0
+}
+
+#[cfg(test)]
+pub fn secret_cert_armored(cert: &Cert) -> Result<String, L0dError> {
+    String::from_utf8(
+        cert.as_tsk()
+            .armored()
+            .to_vec()
+            .map_err(|e| L0dError::L0(format!("serialize secret cert: {e}")))?,
+    )
+    .map_err(|_| L0dError::L0("serialized secret cert is not UTF-8".into()))
 }
 
 #[cfg(test)]
@@ -219,6 +241,18 @@ mod tests {
         let work = mailbox_work_json(&inner).unwrap();
         assert!(work.contains("NoPush"));
         assert!(refuse_plaintext_data(&work).is_err());
+    }
+
+    #[test]
+    fn load_secret_cert_refuses_public_only() {
+        let cert = generate_test_cert();
+        let dir = tempfile::tempdir().unwrap();
+        let pub_path = dir.path().join("pub.asc");
+        let sec_path = dir.path().join("sec.asc");
+        std::fs::write(&pub_path, public_cert_armored(&cert).unwrap()).unwrap();
+        std::fs::write(&sec_path, secret_cert_armored(&cert).unwrap()).unwrap();
+        assert!(load_secret_cert(&pub_path).is_err());
+        assert!(load_secret_cert(&sec_path).is_ok());
     }
 
     #[test]
