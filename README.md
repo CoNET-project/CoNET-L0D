@@ -115,6 +115,7 @@ Phase 1 uses **static** overlay peers. The crate envelope already carries IPv4 i
 | [MVP](docs/MVP.md) · [MVP（中文）](docs/MVP.zh-CN.md) | Accepted crate MVP |
 | [P1](docs/P1.md) · [P1（中文）](docs/P1.zh-CN.md) | Overlay `/post` encrypt + mailbox wrap + POST; inbound decrypt + TUN write-back; EIP-191 listen worker; SI gossip JSON ingest; `[l0]` default off; authorized lab may enable `[l0]`; 2026-08-18: `.45` advertises overlay vIP; overlay geth + beacon TCP; CL initial-sync in progress |
 | [P2](docs/P2.md) · [P2（中文）](docs/P2.zh-CN.md) | Lab overlay UDP / DHT-port comms (echo + `:4300` + public-ENR steer + live discv5 via L0). Not a closed P2 / production product |
+| [Lab overlay QoS 2026-08-18](docs/lab-overlay-qos-2026-08-18.md) | Both-end log + TUN + TCP quality snapshot (~15 min). Mailbox path lossless; overlay RTT ~500 ms; hub TUN `tx_dropped=937`. Not a protocol change |
 | [Operator flags](docs/operator-flags.md) | geth / beacon advertise flags |
 | [RULES.md](RULES.md) | Engineering constraints |
 | [GitBook Applications](https://gitbook.conet.network/applications/conet-l0d.html) | Operator how-to |
