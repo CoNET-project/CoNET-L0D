@@ -16,9 +16,10 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
-const POST_QUEUE: usize = 32;
+const POST_QUEUE: usize = 64;
+const POST_CONCURRENCY: usize = 8;
 const LISTEN_QUEUE: usize = 32;
 const LISTEN_RECONNECT_SECS: u64 = 3;
 
@@ -45,14 +46,12 @@ struct PeerPgp {
 }
 
 struct PostJob {
-    url: String,
     armor: String,
 }
 
 impl fmt::Debug for PostJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PostJob")
-            .field("url", &self.url)
             .field("armor_bytes", &self.armor.len())
             .finish()
     }
@@ -181,7 +180,7 @@ impl L0Client {
         }
 
         let post_tx = if cfg.l0.enabled && !cfg.l0.entries.is_empty() {
-            spawn_post_worker()
+            spawn_post_worker(cfg.l0.entries.clone())
         } else {
             None
         };
@@ -427,7 +426,6 @@ impl L0Client {
             return;
         };
         match tx.try_send(PostJob {
-            url: prepared.url,
             armor: prepared.armor,
         }) {
             Ok(()) => {
@@ -436,6 +434,7 @@ impl L0Client {
                     dest = %dest,
                     locator = %loc.display(),
                     seq = self.seq,
+                    first_entry = %prepared.url,
                     armor_bytes,
                     frame_bytes,
                     queued = self.posts_queued,
@@ -511,25 +510,40 @@ fn spawn_listen_worker(
     Some(rx)
 }
 
-fn spawn_post_worker() -> Option<mpsc::Sender<PostJob>> {
+fn spawn_post_worker(entries: Vec<String>) -> Option<mpsc::Sender<PostJob>> {
     let handle = tokio::runtime::Handle::try_current().ok()?;
     let client = post::http_client().ok()?;
     let (tx, mut rx) = mpsc::channel::<PostJob>(POST_QUEUE);
     handle.spawn(async move {
         let client = Arc::new(client);
+        let entries = Arc::new(entries);
+        let sem = Arc::new(Semaphore::new(POST_CONCURRENCY));
         while let Some(job) = rx.recv().await {
-            match post::send(&client, &job.url, &job.armor).await {
-                Ok(status) => tracing::info!(
-                    status,
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                tracing::warn!(
                     armor_bytes = job.armor.len(),
-                    "P1 POST /post accepted"
-                ),
-                Err(err) => tracing::warn!(
-                    error = %err,
-                    armor_bytes = job.armor.len(),
-                    "P1 POST /post failed"
-                ),
-            }
+                    "P1 POST worker semaphore closed"
+                );
+                break;
+            };
+            let client = client.clone();
+            let entries = entries.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match post::send_via_entries(&client, &entries, &job.armor).await {
+                    Ok((status, entry)) => tracing::info!(
+                        status,
+                        entry,
+                        armor_bytes = job.armor.len(),
+                        "P1 POST /post accepted"
+                    ),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        armor_bytes = job.armor.len(),
+                        "P1 POST /post failed after trying configured entries"
+                    ),
+                }
+            });
         }
     });
     Some(tx)
@@ -638,5 +652,59 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("enabled is false"));
         assert_eq!(client.inbound_refused, 1);
+    }
+
+    #[test]
+    fn post_worker_keeps_bounded_concurrency() {
+        assert!(POST_CONCURRENCY >= 2);
+        assert!(POST_CONCURRENCY <= POST_QUEUE);
+        assert!(POST_QUEUE >= 32);
+    }
+
+    #[tokio::test]
+    async fn post_worker_sends_jobs_concurrently() {
+        use std::time::Instant;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(200))
+                    .set_body_string("ok"),
+            )
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let tx = spawn_post_worker(vec![server.uri()]).expect("worker");
+        let armor = "-----BEGIN PGP MESSAGE-----\n\nxxxx\n-----END PGP MESSAGE-----\n";
+        let started = Instant::now();
+        for _ in 0..4 {
+            tx.send(PostJob {
+                armor: armor.to_string(),
+            })
+            .await
+            .expect("queue");
+        }
+        loop {
+            let n = server.received_requests().await.unwrap().len();
+            if n >= 4 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "worker did not deliver 4 POSTs; last_seen={n}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let first_wave = started.elapsed();
+        assert!(
+            first_wave < Duration::from_millis(400),
+            "expected concurrent first wave, got {first_wave:?}"
+        );
+        drop(tx);
     }
 }

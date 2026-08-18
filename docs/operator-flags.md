@@ -5,8 +5,8 @@ These flags **advertise** an overlay IP. They do not bind RPC or Engine to that 
 Do not run `iptables` yourself. `conet-l0d start` / `stop` owns the chain.
 
 ```bash
-# Only after a bidirectional overlay frame is proven on the peer TUN.
-# Lab hosts keep --nat / --p2p-host-ip on the public IP until then.
+# Authorized L0_ONLY .45 advertises the overlay vIP.
+# .98 and production proposers keep the public IP.
 
 geth \
   --port 8400 \
@@ -19,6 +19,7 @@ geth \
 
 beacon-chain \
   --p2p-host-ip=100.64.0.5 \
+  --p2p-static-id \
   --p2p-tcp-port=4200 \
   --p2p-udp-port=4300 \
   --rpc-host=127.0.0.1 \
@@ -26,7 +27,27 @@ beacon-chain \
   --execution-endpoint=http://127.0.0.1:8551
 ```
 
-**Do not** switch `--nat=extip` or `--p2p-host-ip` to the overlay vIP until a bidirectional overlay frame is written on the peer TUN. A stub that only counts local TUN IPv4 is not enough; advertise stays on the public IP.
+`--p2p-host-ip` is **advertise only**. Prysm still listens on the host public IP. A peer that stays on the public advertise path (lab `.98`) needs overlay `:4200` DNAT/SNAT into that listen. Do **not** edit daemon-owned `CONET_L0D`.
+
+The 2026-08-18 00:17Z lab: `.45` advertises `100.64.0.5`; overlay geth and beacon TCP are ESTAB; CL initial-sync is running over overlay; EL is still `0x0`. Production proposers keep public P2P for the 6-second slot.
+
+## L0_ONLY lab (authorized `.45` only)
+
+Operator script: `scripts/start-geth-beacon-only.sh start-l0-only`. It writes `$LAB_DIR/run/l0-only.env` so the load watchdog keeps the same flags. Isolate chains are `CONET_L0D_P2P_ISOLATE` / `CONET_L0D_P2P_ISOLATE_OUT`. Do **not** edit `CONET_L0D`.
+
+```bash
+# .45 advertises overlay. Overlay boot/peer is the peer vIP.
+geth --nodiscover --netrestrict 100.64.0.0/10 --maxpeers 2 \
+  --nat extip:100.64.0.5 \
+  --bootnodes "enode://<peer-nodekey>@100.64.0.6:8400"
+
+beacon-chain --no-discovery --disable-quic \
+  --p2p-allowlist=100.64.0.0/10 --p2p-max-peers=4 --min-sync-peers=1 \
+  --p2p-host-ip=100.64.0.5 --p2p-static-id \
+  --peer /ip4/100.64.0.6/tcp/4200/p2p/<peer-id>
+```
+
+Restore public P2P: `./start-geth-beacon-only.sh stop-isolate` then a normal `restart`. Do not wipe. Do not restart `.98` unless that host is authorized.
 
 Never set `--http.addr`, `--authrpc.addr`, `--p2p-local-ip`, or `--rpc-host` to the overlay vIP. That `bind()` fails if the TUN is down and can take Engine off loopback.
 

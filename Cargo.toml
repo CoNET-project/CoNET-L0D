@@ -25,7 +25,7 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "sha256", "std"] }
 thiserror = "2"
 toml = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "io-util", "fs", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "fs", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sequoia-openpgp = { version = "1.22", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
 # rustc 1.87: newer url/idna pull icu 2.3 (needs 1.88).

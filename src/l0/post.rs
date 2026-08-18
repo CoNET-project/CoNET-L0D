@@ -20,6 +20,33 @@ pub fn http_client() -> Result<reqwest::Client, L0dError> {
         .map_err(|e| L0dError::L0(format!("http client: {e}")))
 }
 
+/// Try each configured entry once. Fail-closed if the list is empty or every POST fails.
+/// Same host list as `[l0].entries`; this is not a listen fallback onto `listen_entries`.
+pub async fn send_via_entries(
+    client: &reqwest::Client,
+    entries: &[String],
+    armor: &str,
+) -> Result<(u16, String), L0dError> {
+    if entries.is_empty() {
+        return Err(L0dError::L0("l0.entries is empty; refusing POST".into()));
+    }
+    let mut last_err = L0dError::L0("P1 POST /post failed".into());
+    for entry in entries {
+        let url = match post_url(entry) {
+            Ok(url) => url,
+            Err(err) => {
+                last_err = err;
+                continue;
+            }
+        };
+        match send(client, &url, armor).await {
+            Ok(status) => return Ok((status, entry.clone())),
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
+}
+
 /// POST `{ "data": armor }` to `url`. Logs must not include armor.
 pub async fn send(client: &reqwest::Client, url: &str, armor: &str) -> Result<u16, L0dError> {
     let body = json_body(armor)?;
@@ -100,6 +127,39 @@ mod tests {
         .await
         .expect("mock POST");
         assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn send_via_entries_tries_next_host() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dead = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&dead)
+            .await;
+
+        let live = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .expect(1)
+            .mount(&live)
+            .await;
+
+        let client = http_client().unwrap();
+        let (status, entry) = send_via_entries(
+            &client,
+            &[dead.uri(), live.uri()],
+            "-----BEGIN PGP MESSAGE-----\n\nxxxx\n-----END PGP MESSAGE-----\n",
+        )
+        .await
+        .expect("fallback POST");
+        assert_eq!(status, 200);
+        assert_eq!(entry, live.uri());
     }
 
     #[tokio::test]

@@ -2,8 +2,9 @@
 
 use crate::error::L0dError;
 use sequoia_openpgp::cert::prelude::*;
-use sequoia_openpgp::parse::Parse;
+use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
 use sequoia_openpgp::policy::StandardPolicy;
+use sequoia_openpgp::Packet;
 use sequoia_openpgp::crypto::SessionKey;
 use sequoia_openpgp::packet::{PKESK, SKESK};
 use sequoia_openpgp::parse::stream::{
@@ -85,6 +86,29 @@ pub fn encrypt_utf8(plaintext: &str, recipient_armored: &str) -> Result<String, 
         .map_err(|_| L0dError::L0("OpenPGP armor is not UTF-8".into()))?;
     refuse_plaintext_data(&armor)?;
     Ok(armor)
+}
+
+/// RFC 4880 PKESK v3 recipient key IDs (16 hex, uppercase). Empty if wildcard-only.
+/// SI `getEncryptionKeyIDs()[0].toHex().toUpperCase()` uses the same 8-byte id.
+#[allow(dead_code)]
+pub fn pkesk_recipient_key_ids(armor: &str) -> Result<Vec<String>, L0dError> {
+    refuse_plaintext_data(armor)?;
+    let mut ppr = PacketParser::from_bytes(armor.as_bytes())
+        .map_err(|e| L0dError::L0(format!("OpenPGP packet parse: {e}")))?;
+    let mut ids = Vec::new();
+    while let PacketParserResult::Some(pp) = ppr {
+        if let Packet::PKESK(ref pkesk) = pp.packet {
+            let id = pkesk.recipient();
+            if !id.is_wildcard() {
+                ids.push(id.to_hex());
+            }
+        }
+        let (_packet, next) = pp
+            .recurse()
+            .map_err(|e| L0dError::L0(format!("OpenPGP packet next: {e}")))?;
+        ppr = next;
+    }
+    Ok(ids)
 }
 
 /// User-PGP inner armor, then mailbox-work wrap encrypted to B route PGP.
@@ -242,6 +266,20 @@ mod tests {
         assert!(is_pgp_message_armor(&armor));
         assert!(!armor.contains("hello-overlay"));
         assert_eq!(decrypt_utf8(&armor, &cert).unwrap(), "hello-overlay");
+        let ids = pkesk_recipient_key_ids(&armor).unwrap();
+        assert!(!ids.is_empty(), "SI route lookup needs a non-wildcard PKESK key ID");
+        let policy = StandardPolicy::new();
+        let expected: Vec<String> = cert
+            .keys()
+            .with_policy(&policy, None)
+            .supported()
+            .alive()
+            .revoked(false)
+            .for_transport_encryption()
+            .map(|k| k.keyid().to_hex())
+            .collect();
+        assert!(ids.iter().any(|id| expected.contains(id)));
+        assert!(ids.iter().all(|id| id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit())));
     }
 
     #[test]

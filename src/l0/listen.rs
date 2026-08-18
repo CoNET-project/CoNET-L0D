@@ -2,8 +2,14 @@
 //!
 //! In-crate listen worker: EIP-191-sign `mining` + `listenKind: chat`, wrap
 //! `base64({ message, signMessage })` to **this host's** mailbox B route PGP,
-//! `POST { "data" }` to entry **C**, read SSE, extract user-PGP armor.
-//! No `Securitykey`. Tests use wiremock only. Do not POST production SI from tests.
+//! `POST { "data" }` to entry **C**, read the listen stream, extract user-PGP armor.
+//!
+//! Live SI mailbox `forWardPGPMessageToClient` writes raw JSON
+//! `{"data":"<armor>"}\r\n\r\n` (no SSE `data:` prefix). Handshake / mining
+//! heartbeats use SSE `data: {status,epoch}`. Ingest matches Chat
+//! `handleInbound`: JSON `{ data }` armor, SSE-wrapped JSON, or classic SSE
+//! armor lines. No `Securitykey`. Tests use wiremock only. Do not POST
+//! production SI from tests.
 #![allow(dead_code)]
 
 use crate::error::L0dError;
@@ -168,23 +174,90 @@ pub async fn open_listen_sse(
     Ok(response)
 }
 
-/// Extract complete armors and drop them from `buffer`. Do not log armor.
+/// Complete Chat/SI frames end with `\r\n\r\n` or `\n\n`.
+fn find_frame_end(buffer: &str) -> Option<(usize, usize)> {
+    let crlf = buffer.find("\r\n\r\n").map(|i| (i, 4));
+    let lf = buffer.find("\n\n").map(|i| (i, 2));
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Chat `handleInbound` payload: join `data:` lines, else the whole block.
+fn sse_or_raw_payload(block: &str) -> String {
+    let mut data_lines = Vec::new();
+    for raw in block.lines() {
+        if let Some(rest) = raw.strip_prefix("data:") {
+            data_lines.push(rest.trim_start().to_string());
+        }
+    }
+    if data_lines.is_empty() {
+        block.trim().to_string()
+    } else {
+        data_lines.join("\n")
+    }
+}
+
+fn clip_pgp_armor(raw: &str) -> Option<String> {
+    let start = raw.find("-----BEGIN PGP MESSAGE-----")?;
+    let rest = &raw[start..];
+    let end_mark = "-----END PGP MESSAGE-----";
+    let end = rest.find(end_mark)? + end_mark.len();
+    let mut armor = rest[..end].to_string();
+    if !armor.ends_with('\n') {
+        armor.push('\n');
+    }
+    pgp::is_pgp_message_armor(&armor).then_some(armor)
+}
+
+/// SI gossip / Chat: `{ "data": "<armor>" }`. Ignore listing/liveness JSON.
+fn armor_from_si_json(payload: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload.trim()).ok()?;
+    let data = v.get("data")?.as_str()?;
+    clip_pgp_armor(data)
+}
+
+fn extract_armors_from_frame(frame: &str) -> Vec<String> {
+    let payload = sse_or_raw_payload(frame);
+    if let Some(armor) = armor_from_si_json(&payload) {
+        return vec![armor];
+    }
+    extract_pgp_armors_from_sse(frame)
+}
+
+/// Extract user-PGP armors from SI gossip JSON and/or SSE. Do not log armor.
+pub fn extract_inbound_armors(chunk: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = chunk;
+    while let Some((end, sep)) = find_frame_end(rest) {
+        out.extend(extract_armors_from_frame(&rest[..end]));
+        rest = &rest[end + sep..];
+    }
+    if !rest.trim().is_empty() {
+        out.extend(extract_armors_from_frame(rest));
+    }
+    out
+}
+
+/// Extract complete frames and drop them from `buffer`. Do not log armor.
 pub fn drain_sse_armors(buffer: &mut String) -> Vec<String> {
-    let found = extract_pgp_armors_from_sse(buffer);
-    if found.is_empty() {
-        if !buffer.contains("BEGIN PGP") && buffer.len() > 64_000 {
-            buffer.clear();
-        }
-        return found;
+    let mut out = Vec::new();
+    while let Some((end, sep)) = find_frame_end(buffer) {
+        let frame: String = buffer.drain(..end + sep).collect();
+        let body_len = frame.len().saturating_sub(sep);
+        out.extend(extract_armors_from_frame(&frame[..body_len]));
     }
-    if let Some(pos) = buffer.rfind("-----END PGP MESSAGE-----") {
-        let mut end = pos + "-----END PGP MESSAGE-----".len();
-        if buffer[end..].starts_with('\n') {
-            end += 1;
-        }
-        buffer.drain(..end.min(buffer.len()));
+    if out.is_empty()
+        && buffer.len() > 64_000
+        && !buffer.contains("BEGIN PGP")
+        && !buffer.contains('{')
+    {
+        buffer.clear();
     }
-    found
+    out
 }
 
 pub async fn pump_sse_armors(
@@ -202,7 +275,14 @@ pub async fn pump_sse_armors(
                     }
                 }
             }
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                for armor in extract_inbound_armors(&buf) {
+                    if armor_tx.send(armor).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                return Ok(());
+            }
             Err(err) => return Err(L0dError::L0(format!("listen SSE read: {err}"))),
         }
     }
@@ -236,6 +316,13 @@ pub fn extract_pgp_armors_from_sse(chunk: &str) -> Vec<String> {
             current.clear();
             current.push_str(line);
             current.push('\n');
+            if line.contains("-----END PGP MESSAGE-----") {
+                if pgp::is_pgp_message_armor(&current) {
+                    out.push(current.clone());
+                }
+                current.clear();
+                in_armor = false;
+            }
             continue;
         }
         if in_armor {
@@ -335,6 +422,7 @@ mod tests {
         let found = extract_pgp_armors_from_sse(chunk);
         assert_eq!(found.len(), 1);
         assert!(pgp::is_pgp_message_armor(&found[0]));
+        assert_eq!(extract_inbound_armors(chunk).len(), 1);
     }
 
     #[test]
@@ -342,6 +430,40 @@ mod tests {
         let mut buf = String::from("data: -----BEGIN PGP MESSAGE-----\ndata: partial\n");
         assert!(drain_sse_armors(&mut buf).is_empty());
         assert!(buf.contains("BEGIN PGP"));
+    }
+
+    #[test]
+    fn si_gossip_json_recovers_ipv4() {
+        let user = generate_test_cert();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let pkt = b"\x45\x00si-gossip-ipv4!!!!";
+        let json = envelope::encode("0x1111111111111111111111111111111111111111", 5, pkt).unwrap();
+        let inbound = encrypt_utf8(&json, &user_pub).unwrap();
+        let frame = format!("{}\r\n\r\n", serde_json::json!({ "data": inbound }));
+        let found = extract_inbound_armors(&frame);
+        assert_eq!(found.len(), 1);
+        assert_eq!(inbound_ipv4_from_user_armor(&found[0], &user).unwrap(), pkt);
+
+        let mut buf = frame;
+        let drained = drain_sse_armors(&mut buf);
+        assert_eq!(drained.len(), 1);
+        assert!(buf.is_empty());
+        assert_eq!(inbound_ipv4_from_user_armor(&drained[0], &user).unwrap(), pkt);
+    }
+
+    #[test]
+    fn sse_wrapped_si_json_and_liveness_are_ignored_or_extracted() {
+        let user = generate_test_cert();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let pkt = b"\x45\x00sse-json-ipv4!!!!!";
+        let json = envelope::encode("0x1111111111111111111111111111111111111111", 6, pkt).unwrap();
+        let inbound = encrypt_utf8(&json, &user_pub).unwrap();
+        let heartbeat = "data: {\"status\":200,\"epoch\":1}\r\n\r\n";
+        let gossip = format!("data: {}\r\n\r\n", serde_json::json!({ "data": inbound }));
+        let chunk = format!("{heartbeat}{gossip}");
+        let found = extract_inbound_armors(&chunk);
+        assert_eq!(found.len(), 1);
+        assert_eq!(inbound_ipv4_from_user_armor(&found[0], &user).unwrap(), pkt);
     }
 
     #[test]
@@ -414,6 +536,53 @@ mod tests {
             .expect("mock listen");
         assert_eq!(status, 200);
         let got_armor = rx.recv().await.expect("sse armor");
+        assert_eq!(inbound_ipv4_from_user_armor(&got_armor, &user).unwrap(), pkt);
+    }
+
+    fn armor_to_si_gossip(armor: &str) -> String {
+        format!("{}\r\n\r\n", serde_json::json!({ "data": armor }))
+    }
+
+    #[tokio::test]
+    async fn listen_once_reads_si_gossip_json_and_recovers_ipv4() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let route = generate_test_cert();
+        let user = generate_test_cert();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let pkt = b"\x45\x00listen-json-ipv4!!!";
+        let json = envelope::encode("0x1111111111111111111111111111111111111111", 7, pkt).unwrap();
+        let inbound = encrypt_utf8(&json, &user_pub).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .and(body_string_contains("\"data\""))
+            .and(body_string_contains("BEGIN PGP MESSAGE"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let eth = test_eth();
+        let (url, listen_armor) = prepare_listen_post(
+            eth.address(),
+            1_710_000_000,
+            &route_pub,
+            &server.uri(),
+            &eth,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let client = listen_http_client().unwrap();
+        let status = run_listen_once(&client, &url, &listen_armor, &tx)
+            .await
+            .expect("mock listen");
+        assert_eq!(status, 200);
+        let got_armor = rx.recv().await.expect("si gossip armor");
         assert_eq!(inbound_ipv4_from_user_armor(&got_armor, &user).unwrap(), pkt);
     }
 

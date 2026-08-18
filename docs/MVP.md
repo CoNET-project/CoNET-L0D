@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **Paired:** [中文](./MVP.zh-CN.md)  
-**Revision:** 2026-08-17 (milestone eval 23:30Z: crate MVP accepted; P1 outbound + inbound decrypt/TUN write-back + EIP-191 listen wrap in-crate, mock-tested; production SI listen not opened; lab binary `[l0]` off — see [P1.md](./P1.md))
+**Revision:** 2026-08-18 (crate MVP still accepted; authorized L0_ONLY `.45` advertises overlay vIP; overlay geth + beacon TCP proven; CL initial-sync in progress — see [P1.md](./P1.md))
 
 Public how-to: [Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -25,11 +25,11 @@ Ship an independent **Linux command** `conet-l0d` that operators can start and s
 
 ## Out of scope (not a failed MVP)
 
-- Production mailbox delivery / production SI listen (P1 crate has outbound encrypt + wrap + POST, inbound decrypt + TUN write-back, **and** an EIP-191 listen HTTP+SSE worker that is mock-tested; in-crate wire matches SI `checkSign`; a lab host may run that binary; `[l0]` stays **off** — not a live mailbox client; see [P1.md](./P1.md))
+- Production mailbox delivery (P1 crate can POST existing `/post` and ingest SI gossip JSON `{ "data": "<armor>" }`; an authorized lab may enable `[l0]`; 2026-08-18 lab advertises overlay vIP on `.45`, completed overlay geth + beacon TCP, and is running CL initial-sync; EL still `0x0` — see [P1.md](./P1.md))
 - UDP discv4 / discv5 capture
 - Validator proxy or keystore access
 - New SI commands or new hostnames
-- Restarting geth / beacon / validator
+- The crate restarting geth / beacon / validator (an authorized **operator** script may restart **only** `.45` for L0_ONLY; never `.98` unless that host is authorized; never wipe)
 
 ## Commands
 

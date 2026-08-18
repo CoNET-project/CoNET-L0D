@@ -35,8 +35,9 @@ tcp_ports = [4200]
 # Encrypt envelope to peer user PGP, wrap { data, NoPush: true } to B route PGP,
 # POST only { "data": outerArmor } to a healthy entry A ≠ B.
 # Listen POST goes to entry C ≠ B. Do not invent a new SI command. Do not
-# switch geth/beacon advertise to the vIP until a bidirectional overlay frame
-# is proven.
+# L0_ONLY lab may advertise the overlay vIP. Do not bind RPC/Engine to it.
+# Outbound POST tries each [l0].entries host once; it does not fall back
+# onto listen_entries.
 #
 # [l0]
 # enabled = false

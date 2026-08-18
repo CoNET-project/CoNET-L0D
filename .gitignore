@@ -2,6 +2,7 @@
 **/*.rs.bk
 .conet-l0d.state.json
 /run-local
+/lab-secrets
 .idea
 .vscode
 *.swp

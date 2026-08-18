@@ -2,10 +2,16 @@
 # geth + beacon ONLY for the conet-l0d MVP lab on 74.208.224.45.
 # Does NOT start validator. Does NOT wipe datadir. Does NOT geth init.
 # Do not run leftover 06_restart_node22445.sh start (that script starts validator).
+#
+# L0_ONLY=1 (or $LAB_DIR/run/l0-only.env): no DHT bootstrap, no public bootnodes,
+# --nodiscover / beacon --no-discovery, overlay bootnode/peer to .98 only,
+# INPUT+OUTPUT isolate chain CONET_L0D_P2P_ISOLATE* (never touch CONET_L0D).
+# L0_ONLY advertises the overlay vIP (100.64.0.5). Do not bind RPC to it.
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/peter/ethereum-pos-mainnet}"
 NODE_DIR="${NODE_DIR:-$PROJECT_DIR/network/node-0}"
+LAB_DIR="${LAB_DIR:-/home/peter/conet-l0d-lab}"
 PUBLIC_IP="${PUBLIC_IP:-74.208.224.45}"
 CHAIN_ID="${CHAIN_ID:-224422}"
 
@@ -26,8 +32,9 @@ PRYSM_BEACON_GRPC_GATEWAY_PORT="${PRYSM_BEACON_GRPC_GATEWAY_PORT:-4100}"
 PRYSM_BEACON_P2P_TCP_PORT="${PRYSM_BEACON_P2P_TCP_PORT:-4200}"
 PRYSM_BEACON_P2P_UDP_PORT="${PRYSM_BEACON_P2P_UDP_PORT:-4300}"
 
-# Public advertise until conet-l0d owns TUN. Overlay vIP is 100.64.0.5.
-ADVERTISE_IP="${ADVERTISE_IP:-$PUBLIC_IP}"
+# L0_ONLY defaults advertise to the overlay vIP. Public P2P keeps PUBLIC_IP.
+# Operator may export ADVERTISE_IP to override. Do not bind RPC to the vIP.
+L0_OVERLAY_VIP="${L0_OVERLAY_VIP:-100.64.0.5}"
 FEE_RECIPIENT="${FEE_RECIPIENT:-0x0981275553A41E00ec1006fe074971285E00c2A3}"
 DEPOSIT_CONTRACT_ADDRESS="${DEPOSIT_CONTRACT_ADDRESS:-0x4242424242424242424242424242424242424242}"
 
@@ -39,6 +46,31 @@ EXECUTION_BOOTNODES="${EXECUTION_BOOTNODES:-${HUB_BOOTNODES},${LAB_98_ENODE}}"
 
 # Static beacon peer to the .98 lab (public IP). Applied at next beacon start only.
 EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-/ip4/198.251.77.98/tcp/4200/p2p/16Uiu2HAmDb9FNGMYhC7p7rrLEBGA9HujPZda1KHWKvJfox9YRwDA}"
+
+L0_OVERLAY_ENODE="${L0_OVERLAY_ENODE:-enode://006561987aaeea06a6f2c54d37656a4acccd0c1e16c9025700be1cfc45c6b79596293426694f0cf5eccacc1f92392628a93adb52c607b86b78f8601e5247459b@100.64.0.6:8400}"
+L0_OVERLAY_BEACON_PEER="${L0_OVERLAY_BEACON_PEER:-/ip4/100.64.0.6/tcp/4200/p2p/16Uiu2HAmDb9FNGMYhC7p7rrLEBGA9HujPZda1KHWKvJfox9YRwDA}"
+L0_NETRESTRICT="${L0_NETRESTRICT:-100.64.0.0/10}"
+L0_ONLY_ENV="${L0_ONLY_ENV:-$LAB_DIR/run/l0-only.env}"
+ISOLATE_CHAIN="${ISOLATE_CHAIN:-CONET_L0D_P2P_ISOLATE}"
+ISOLATE_OUT_CHAIN="${ISOLATE_OUT_CHAIN:-CONET_L0D_P2P_ISOLATE_OUT}"
+TUN_IFACE="${TUN_IFACE:-conet-l0}"
+
+if [[ -f "$L0_ONLY_ENV" ]]; then
+	# shellcheck disable=SC1090
+	source "$L0_ONLY_ENV"
+fi
+L0_ONLY="${L0_ONLY:-0}"
+
+resolve_advertise_ip() {
+	if [[ -n "${ADVERTISE_IP:-}" ]]; then
+		return 0
+	fi
+	if l0_only_on; then
+		ADVERTISE_IP="$L0_OVERLAY_VIP"
+	else
+		ADVERTISE_IP="$PUBLIC_IP"
+	fi
+}
 
 DHT_ENDPOINTS=(
 	38.102.126.30:4110
@@ -58,6 +90,7 @@ COLOCATION_WHITELIST=(
 	216.225.202.82/32
 	74.208.224.45/32
 	198.251.77.98/32
+	100.64.0.0/10
 )
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -69,6 +102,76 @@ require_exec() { [[ -x "$1" ]] || die "Missing exec: $1"; }
 pid_alive() {
 	local pid="$1"
 	[[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+l0_only_on() {
+	[[ "${L0_ONLY}" == "1" || "${L0_ONLY}" == "true" || "${L0_ONLY}" == "yes" ]]
+}
+
+require_overlay_tun() {
+	ip -4 addr show dev "$TUN_IFACE" 2>/dev/null | grep -q '100.64.0.5' \
+		|| die "TUN $TUN_IFACE is not up with 100.64.0.5; start conet-l0d first"
+	ip route show | grep -q "100.64.0.0/10 dev $TUN_IFACE" \
+		|| die "overlay route 100.64.0.0/10 via $TUN_IFACE is missing"
+}
+
+write_l0_only_env() {
+	mkdir -p "$(dirname "$L0_ONLY_ENV")"
+	cat > "$L0_ONLY_ENV" <<'EOF'
+L0_ONLY=1
+EOF
+	L0_ONLY=1
+	unset ADVERTISE_IP
+	resolve_advertise_ip
+	echo "Wrote $L0_ONLY_ENV (watchdog start-geth will stay isolated; advertise=$ADVERTISE_IP)"
+}
+
+# Dedicated isolate chains. Never flush or jump CONET_L0D (owned by conet-l0d).
+apply_p2p_isolate() {
+	[[ "$ISOLATE_CHAIN" != "CONET_L0D" ]] || die "refuse to hijack CONET_L0D"
+	[[ "$ISOLATE_OUT_CHAIN" != "CONET_L0D" ]] || die "refuse to hijack CONET_L0D"
+	require_overlay_tun
+	sudo -n iptables -N "$ISOLATE_CHAIN" 2>/dev/null || true
+	sudo -n iptables -F "$ISOLATE_CHAIN"
+	sudo -n iptables -A "$ISOLATE_CHAIN" -i lo -j RETURN
+	sudo -n iptables -A "$ISOLATE_CHAIN" -i "$TUN_IFACE" -j RETURN
+	local port
+	for port in 8400 4200 4300 13000; do
+		sudo -n iptables -A "$ISOLATE_CHAIN" -p tcp --dport "$port" -j DROP
+		sudo -n iptables -A "$ISOLATE_CHAIN" -p udp --dport "$port" -j DROP
+	done
+	if ! sudo -n iptables -C INPUT -j "$ISOLATE_CHAIN" 2>/dev/null; then
+		sudo -n iptables -I INPUT 1 -j "$ISOLATE_CHAIN"
+	fi
+
+	sudo -n iptables -N "$ISOLATE_OUT_CHAIN" 2>/dev/null || true
+	sudo -n iptables -F "$ISOLATE_OUT_CHAIN"
+	sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -o lo -j RETURN
+	sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -o "$TUN_IFACE" -j RETURN
+	for port in 8400 4200 4300 13000; do
+		sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -p tcp --dport "$port" -j DROP
+		sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -p udp --dport "$port" -j DROP
+	done
+	if ! sudo -n iptables -C OUTPUT -j "$ISOLATE_OUT_CHAIN" 2>/dev/null; then
+		sudo -n iptables -I OUTPUT 1 -j "$ISOLATE_OUT_CHAIN"
+	fi
+	echo "P2P isolate on ($ISOLATE_CHAIN / $ISOLATE_OUT_CHAIN); CONET_L0D untouched"
+}
+
+remove_p2p_isolate() {
+	sudo -n iptables -D INPUT -j "$ISOLATE_CHAIN" 2>/dev/null || true
+	sudo -n iptables -D OUTPUT -j "$ISOLATE_OUT_CHAIN" 2>/dev/null || true
+	sudo -n iptables -F "$ISOLATE_CHAIN" 2>/dev/null || true
+	sudo -n iptables -X "$ISOLATE_CHAIN" 2>/dev/null || true
+	sudo -n iptables -F "$ISOLATE_OUT_CHAIN" 2>/dev/null || true
+	sudo -n iptables -X "$ISOLATE_OUT_CHAIN" 2>/dev/null || true
+	rm -f "$L0_ONLY_ENV"
+	L0_ONLY=0
+	if [[ "${ADVERTISE_IP:-}" == "$L0_OVERLAY_VIP" ]]; then
+		unset ADVERTISE_IP
+	fi
+	resolve_advertise_ip
+	echo "P2P isolate off; removed $L0_ONLY_ENV; advertise=$ADVERTISE_IP"
 }
 
 stop_pid_file() {
@@ -146,17 +249,37 @@ load_extra_beacon_peers() {
 	done
 }
 
+write_l0_static_nodes() {
+	local static_file="$NODE_DIR/execution/geth/static-nodes.json"
+	mkdir -p "$(dirname "$static_file")"
+	printf '["%s"]\n' "$L0_OVERLAY_ENODE" > "$static_file"
+	echo "Wrote $static_file"
+}
+
 start_geth() {
-	echo "Starting geth advertise=$ADVERTISE_IP cache=$GETH_CACHE (no wipe)"
+	local bootnodes extra=()
+	if l0_only_on; then
+		require_overlay_tun
+		apply_p2p_isolate
+		write_l0_static_nodes
+		# --nodiscover does not dial --bootnodes; persist the overlay peer as static.
+		bootnodes="$L0_OVERLAY_ENODE"
+		extra+=(--nodiscover --netrestrict "$L0_NETRESTRICT" --maxpeers 2)
+		echo "Starting geth L0_ONLY advertise=$ADVERTISE_IP overlay-static=$bootnodes"
+	else
+		bootnodes="$EXECUTION_BOOTNODES"
+		echo "Starting geth advertise=$ADVERTISE_IP cache=$GETH_CACHE (no wipe)"
+	fi
 	nohup "$GETH_BINARY" \
 		--datadir "$NODE_DIR/execution" \
 		--state.scheme=hash \
 		--networkid "$CHAIN_ID" \
 		--port "$GETH_P2P_PORT" \
 		--discovery.port "$GETH_P2P_PORT" \
-		--bootnodes "$EXECUTION_BOOTNODES" \
+		--bootnodes "$bootnodes" \
 		--nat "extip:$ADVERTISE_IP" \
 		--cache "$GETH_CACHE" \
+		"${extra[@]}" \
 		--http \
 		--http.addr 127.0.0.1 \
 		--http.port "$GETH_HTTP_PORT" \
@@ -172,12 +295,29 @@ start_geth() {
 	echo $! > "$NODE_DIR/geth.pid"
 	wait_for_port 127.0.0.1 "$GETH_AUTH_RPC_PORT" geth-authrpc 120 || true
 	wait_for_port 127.0.0.1 "$GETH_HTTP_PORT" geth-http 30 || true
+	if l0_only_on; then
+		curl -s "http://127.0.0.1:${GETH_HTTP_PORT}" -H 'content-type: application/json' \
+			-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_addPeer\",\"params\":[\"$L0_OVERLAY_ENODE\"]}" \
+			>/dev/null || true
+	fi
 }
 
 start_beacon() {
-	echo "Starting beacon advertise=$ADVERTISE_IP (no validator)"
-	load_bootstrap_args
-	load_extra_beacon_peers
+	local extra=()
+	if l0_only_on; then
+		require_overlay_tun
+		apply_p2p_isolate
+		BOOTSTRAP_ARGS=()
+		EXTRA_BEACON_PEERS="$L0_OVERLAY_BEACON_PEER"
+		load_extra_beacon_peers
+		extra+=(--no-discovery --disable-quic --p2p-allowlist="$L0_NETRESTRICT" --p2p-max-peers=4 --min-sync-peers=1)
+		echo "Starting beacon L0_ONLY advertise=$ADVERTISE_IP overlay-peer=$L0_OVERLAY_BEACON_PEER"
+	else
+		echo "Starting beacon advertise=$ADVERTISE_IP (no validator)"
+		load_bootstrap_args
+		load_extra_beacon_peers
+		extra+=(--p2p-max-peers=40 --min-sync-peers=1)
+	fi
 	local wl=()
 	local cidr
 	for cidr in "${COLOCATION_WHITELIST[@]}"; do
@@ -194,6 +334,7 @@ start_beacon() {
 		"${BOOTSTRAP_ARGS[@]}" \
 		"${wl[@]}" \
 		"${PEER_ARGS[@]}" \
+		"${extra[@]}" \
 		--rpc-host=127.0.0.1 \
 		--rpc-port="$PRYSM_BEACON_RPC_PORT" \
 		--grpc-gateway-host=127.0.0.1 \
@@ -201,9 +342,8 @@ start_beacon() {
 		--p2p-tcp-port="$PRYSM_BEACON_P2P_TCP_PORT" \
 		--p2p-udp-port="$PRYSM_BEACON_P2P_UDP_PORT" \
 		--p2p-host-ip="$ADVERTISE_IP" \
-		--p2p-max-peers=40 \
+		--p2p-static-id \
 		--disable-staking-contract-check \
-		--min-sync-peers=1 \
 		--suggested-fee-recipient="$FEE_RECIPIENT" \
 		--contract-deployment-block=0 \
 		--deposit-contract="$DEPOSIT_CONTRACT_ADDRESS" \
@@ -221,6 +361,11 @@ stop_clients() {
 }
 
 show_status() {
+	if l0_only_on; then
+		echo "mode: L0_ONLY isolate=$ISOLATE_CHAIN advertise=$ADVERTISE_IP"
+	else
+		echo "mode: public-p2p advertise=$ADVERTISE_IP"
+	fi
 	for name in geth beacon; do
 		local pid_file="$NODE_DIR/${name}.pid"
 		if [[ -f "$pid_file" ]]; then
@@ -263,7 +408,8 @@ show_status() {
 }
 
 ACTION="${1:-start}"
-mkdir -p "$NODE_DIR/logs"
+resolve_advertise_ip
+mkdir -p "$NODE_DIR/logs" "$LAB_DIR/run"
 require_exec "$GETH_BINARY"
 require_exec "$PRYSM_BEACON_BINARY"
 require_dir "$NODE_DIR/execution/geth/chaindata"
@@ -277,7 +423,7 @@ start)
 	start_geth
 	start_beacon
 	show_status
-	echo "Started geth+beacon only. Overlay advertise needs: sudo conet-l0d start && ADVERTISE_IP=100.64.0.5 $0 restart"
+	echo "Started geth+beacon only. L0_ONLY advertises $ADVERTISE_IP (RPC stays on 127.0.0.1)."
 	;;
 stop)
 	stop_clients
@@ -297,11 +443,29 @@ stop-geth)
 	stop_geth
 	show_status
 	;;
+restart-beacon)
+	stop_pid_file beacon "$NODE_DIR/beacon.pid"
+	start_beacon
+	show_status
+	;;
+start-l0-only|restart-l0-only)
+	write_l0_only_env
+	require_overlay_tun
+	apply_p2p_isolate
+	stop_clients
+	start_geth
+	start_beacon
+	show_status
+	;;
+stop-isolate)
+	remove_p2p_isolate
+	echo "Isolate removed. Clients were not restarted; run $0 restart for public P2P."
+	;;
 status)
 	show_status
 	;;
 *)
-	echo "Usage: $0 {start|stop|restart|status|start-geth|stop-geth}"
+	echo "Usage: $0 {start|stop|restart|status|start-geth|stop-geth|restart-beacon|start-l0-only|restart-l0-only|stop-isolate}"
 	exit 1
 	;;
 esac
