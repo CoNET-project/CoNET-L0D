@@ -9,7 +9,7 @@ description: conet-l0d 白皮书 / RULES / MVP 改动必须同任务同步 GitBo
 凡改动本 crate 的 **白皮书**、**`RULES.md`**、**MVP**，或面向操作员 / 开发者的命令与生命周期语义，**必须在同一任务内**更新公开书：
 
 1. **Applications** — `src/docs/gitbook/applications/conet-l0d.md`（操作员 how-to）
-2. **Developers** — `src/docs/gitbook/developers/conet-l0d.md`（CLI、config、owned TUN/iptables、现有 `/post` 合同）
+2. **Developers** — `src/docs/gitbook/developers/conet-l0d.md`（CLI、config、owned TUN/iptables、应用层 duplex + P1 gossip `/post` 合同）
 
 不得只改 crate 文档、只改 Cursor 守则、或只改其中一面。公开正文 **英语**。
 
@@ -36,7 +36,8 @@ description: conet-l0d 白皮书 / RULES / MVP 改动必须同任务同步 GitBo
 | 改动 | 还须写 L0 协议页？ |
 | --- | --- |
 | 仅 crate / TUN / 操作员文档 | ❌ 不要扩写 `mailbox-routing` / SI 命令表冒充已上线 |
-| 新增 SI 命令（如 `p2p_stream_*`、`listenKind: l1p2p`） | ✅ 同任务：`using-l0`、mailbox routing、SI developer guide **以及** 两页 conet-l0d |
+| 改动应用层 duplex JSON（`duplex_offer` / `duplex_accept` / `duplex_frame`） | ✅ 同任务：`duplex-forward`、`using-l0` 组合表 **以及** 两页 conet-l0d。**不要**往 SI 命令表加 `duplex_*` |
+| 新增或改动现役 SI 命令（**禁止**把 `duplex_*` / `p2p_stream_*` / `listenKind: l1p2p` 写成 current SI） | ✅ 同任务：`using-l0`、mailbox routing、SI developer guide **以及** 两页 conet-l0d |
 
 全局协议守则：仓库 `.cursor/rules/conet-depin-gitbook-sync.mdc`。不要把「crate 文档更新」误写成必须改 SI。
 
@@ -44,6 +45,7 @@ description: conet-l0d 白皮书 / RULES / MVP 改动必须同任务同步 GitBo
 
 - ❌ 只更新白皮书或只更新 Applications / 只更新 Developers
 - ❌ 把未上线的 `p2p_stream_*` / `listenKind: l1p2p` 写成 current SI
+- ❌ 把 SI `duplex_*` / `duplexForward.ts` 独立池写成现役 overlay
 - ❌ 把 SilentPass / `SaaS_Sock5` 写成 L1 overlay
 - ❌ 未获用户要求就跑 `deployGitbook.sh`
 - ❌ 为文档新建域名

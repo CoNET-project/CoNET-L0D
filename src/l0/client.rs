@@ -1,21 +1,23 @@
 //! Overlay L0 client. Default is the MVP stub.
 //!
-//! When `[l0].enabled = true` and a peer has **user + route** public key files,
-//! the daemon encrypts `conet_l0d_overlay_v1` to the peer user PGP, wraps
-//! mailbox work `{ data, NoPush: true }` to B route PGP, then POSTs `{ "data" }`.
-//! Do not POST plaintext JSON. Do not claim a live SI `p2p_stream_*` command.
+//! Data plane prefers **application duplex** (AES-256-GCM on two owned Chat
+//! SSEs). Offer rides the long-lived channel SSE; accept / reject / frames
+//! ride the session listen SSE. Until `duplex_accept`, fallback is
+//! `conet_l0d_overlay_v1` user-PGP gossip. HTTP `/post` is still `{ "data" }`
+//! only. SI does not implement `duplex_*`. Do not claim live `p2p_stream_*`.
 
 use crate::config::ValidatedConfig;
 use crate::error::L0dError;
+use crate::l0::aes;
 use crate::l0::eip191::EthSecret;
-use crate::l0::{eip191, envelope, frame, listen, pgp, post};
+use crate::l0::{duplex, eip191, envelope, frame, listen, pgp, post};
 use crate::locator::{Locator, LocatorHost};
 use crate::packet::overlay_channel_port;
 use sequoia_openpgp::Cert;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 
@@ -62,6 +64,36 @@ struct PostJob {
     armor: String,
 }
 
+#[derive(Clone)]
+struct ChannelWire {
+    eoa: String,
+    #[allow(dead_code)]
+    route_pgp: String,
+    eth: EthSecret,
+    #[allow(dead_code)]
+    listen_entries: Vec<String>,
+    /// Own session-listen user PGP (channel EOA in crate MVP).
+    user_pub: String,
+}
+
+#[derive(Clone)]
+struct DuplexSession {
+    session_id: String,
+    key: Option<[u8; aes::KEY_LEN]>,
+    dest: Ipv4Addr,
+    port: u16,
+    /// Own channel Chat listen is the session listen SSE (crate MVP).
+    #[allow(dead_code)]
+    guest_up: bool,
+    /// Peer app sent `duplex_accept` with matching key.
+    peer_attached: bool,
+    rejected: bool,
+    #[allow(dead_code)]
+    host_eoa: String,
+    /// Peer's session-listen user PGP (from accept, or offer for the initiator).
+    peer_listen_user_pgp: Option<String>,
+}
+
 impl fmt::Debug for PostJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PostJob")
@@ -105,6 +137,8 @@ pub struct L0Client {
     tun_tx: Option<mpsc::Sender<Vec<u8>>>,
     inbound_rx: Option<mpsc::Receiver<String>>,
     pending: Option<PendingOverlay>,
+    channel_wire: HashMap<u16, ChannelWire>,
+    duplex: Arc<Mutex<HashMap<(Ipv4Addr, u16), DuplexSession>>>,
 }
 
 impl fmt::Debug for L0Client {
@@ -167,6 +201,8 @@ impl L0Client {
             tun_tx: None,
             inbound_rx: None,
             pending: None,
+            channel_wire: HashMap::new(),
+            duplex: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -224,22 +260,41 @@ impl L0Client {
             None
         };
 
+        let (inbound_tx, inbound_rx_ch) = mpsc::channel::<String>(LISTEN_QUEUE);
         let mut user_secrets = Vec::new();
-        let inbound_rx = if !cfg.l0.enabled {
-            None
-        } else if cfg.l0.channels.is_empty() {
-            if let Some(path) = cfg.l0.routing_key_file.as_ref() {
-                match pgp::load_secret_cert(path) {
-                    Ok(cert) => user_secrets.push(SecretCert(cert)),
-                    Err(err) => tracing::warn!(
-                        error = %err,
-                        "P1: routing_key_file was not loaded; inbound write-back stays refused"
-                    ),
+        let mut listen_spawned = false;
+        if cfg.l0.enabled {
+            listen_spawned = if cfg.l0.channels.is_empty() {
+                if let Some(path) = cfg.l0.routing_key_file.as_ref() {
+                    match pgp::load_secret_cert(path) {
+                        Ok(cert) => user_secrets.push(SecretCert(cert)),
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "P1: routing_key_file was not loaded; inbound decrypt for that wallet stays off"
+                        ),
+                    }
                 }
-            }
-            spawn_legacy_listen(cfg, &routing_eoa, !user_secrets.is_empty())
+                spawn_legacy_listen_into(cfg, &routing_eoa, !user_secrets.is_empty(), inbound_tx.clone())
+            } else {
+                spawn_channel_listens_into(cfg, &mut user_secrets, inbound_tx.clone())
+            };
+        }
+
+        let channel_wire = load_channel_wires(cfg);
+        let duplex = Arc::new(Mutex::new(HashMap::new()));
+        if cfg.l0.enabled {
+            spawn_duplex_runtime(
+                cfg,
+                &channel_wire,
+                &peers,
+                duplex.clone(),
+                post_tx.clone(),
+            );
+        }
+        let inbound_rx = if listen_spawned {
+            Some(inbound_rx_ch)
         } else {
-            spawn_channel_listens(cfg, &mut user_secrets)
+            None
         };
 
         Self {
@@ -265,6 +320,8 @@ impl L0Client {
             tun_tx: None,
             inbound_rx,
             pending: None,
+            channel_wire,
+            duplex,
         }
     }
 
@@ -278,15 +335,27 @@ impl L0Client {
         self.inbound_rx.take()
     }
 
-    /// Decrypt inbound user-PGP armor and queue raw IPv4 for TUN write-back.
+    /// Decrypt inbound user-PGP armor, ingest a duplex frame, or queue raw IPv4.
     /// May be fed by the in-crate listen worker. Tests do not POST production SI.
     #[allow(dead_code)]
-    pub fn apply_inbound_armor(&mut self, armor: &str) -> Result<usize, L0dError> {
+    pub fn apply_inbound_armor(&mut self, chunk: &str) -> Result<usize, L0dError> {
         if !self.enabled {
             self.inbound_refused = self.inbound_refused.saturating_add(1);
             return Err(L0dError::L0(
                 "[l0].enabled is false; inbound write-back refused".into(),
             ));
+        }
+        let trimmed = chunk.trim();
+        if let Some((session_id, payload)) = duplex::parse_duplex_frame_json(trimmed) {
+            return self.apply_duplex_frame(&session_id, &payload);
+        }
+        if let Some(accept) = duplex::parse_accept(trimmed) {
+            self.apply_duplex_accept(accept);
+            return Ok(0);
+        }
+        if let Some(session_id) = duplex::parse_reject(trimmed) {
+            self.mark_duplex_rejected(&session_id);
+            return Ok(0);
         }
         if self.user_secrets.is_empty() {
             self.inbound_refused = self.inbound_refused.saturating_add(1);
@@ -296,15 +365,182 @@ impl L0Client {
         }
         let mut last_err = L0dError::L0("inbound decrypt failed for every listen wallet".into());
         for secret in &self.user_secrets {
-            match listen::inbound_ipv4_from_user_armor(armor, &secret.0) {
-                Ok(blob) => {
-                    return self.queue_inbound_ipv4(blob);
+            match listen::inbound_plain_from_user_armor(chunk, &secret.0) {
+                Ok(plain) => {
+                    if let Ok(offer) = duplex::parse_offer_from_inbound_plain(&plain) {
+                        self.apply_duplex_offer(offer);
+                        return Ok(0);
+                    }
+                    if let Some(accept) = duplex::parse_accept(&plain) {
+                        self.apply_duplex_accept(accept);
+                        return Ok(0);
+                    }
+                    if let Some(session_id) = duplex::parse_reject(&plain) {
+                        self.mark_duplex_rejected(&session_id);
+                        return Ok(0);
+                    }
+                    if let Some((session_id, payload)) = duplex::parse_duplex_frame_json(&plain) {
+                        return self.apply_duplex_frame(&session_id, &payload);
+                    }
+                    match envelope::decode(&plain) {
+                        Ok((_env, ipv4)) if listen::looks_like_ipv4(&ipv4) => {
+                            return self.queue_inbound_ipv4(ipv4);
+                        }
+                        Ok(_) => {
+                            last_err = L0dError::L0("inbound payload is not IPv4".into());
+                        }
+                        Err(err) => last_err = err,
+                    }
                 }
                 Err(err) => last_err = err,
             }
         }
         self.inbound_refused = self.inbound_refused.saturating_add(1);
         Err(last_err)
+    }
+
+    fn apply_duplex_frame(&mut self, session_id: &str, payload_b64: &str) -> Result<usize, L0dError> {
+        let key = {
+            let guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .values()
+                .find(|s| s.session_id == session_id)
+                .and_then(|s| s.key)
+        };
+        let Some(key) = key else {
+            self.inbound_refused = self.inbound_refused.saturating_add(1);
+            return Err(L0dError::L0(
+                "duplex_frame has no overlay key yet; waiting for duplex_offer".into(),
+            ));
+        };
+        let opened = aes::open(&key, payload_b64)?;
+        let (_seq, ipv4) = frame::decode(&opened)?;
+        if !listen::looks_like_ipv4(ipv4) {
+            self.inbound_refused = self.inbound_refused.saturating_add(1);
+            return Err(L0dError::L0("duplex plaintext is not IPv4".into()));
+        }
+        self.queue_inbound_ipv4(ipv4.to_vec())
+    }
+
+    fn apply_duplex_offer(&mut self, offer: duplex::DuplexOffer) {
+        let mut send_accept: Option<(ChannelWire, String, DuplexSession)> = None;
+        let mut send_reject: Option<(ChannelWire, String)> = None;
+        {
+            let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+            for sess in guard.values_mut() {
+                if sess.session_id != offer.session_id {
+                    continue;
+                }
+                let waiting = sess.key.is_none();
+                sess.key = Some(offer.key);
+                if !offer.listen_user_pgp.trim().is_empty() {
+                    sess.peer_listen_user_pgp = Some(offer.listen_user_pgp.clone());
+                }
+                tracing::info!(
+                    session = %offer.session_id,
+                    from = %offer.from,
+                    listen = %offer.listen_wallet,
+                    "duplex_offer accepted; overlay AES key stored in memory only"
+                );
+                if waiting {
+                    sess.peer_attached = true;
+                    sess.rejected = false;
+                    if let Some(wire) = self.channel_wire.get(&sess.port) {
+                        let target = if offer.listen_user_pgp.trim().is_empty() {
+                            self.peers
+                                .get(&(sess.dest, sess.port))
+                                .map(|k| k.user.0.clone())
+                        } else {
+                            Some(offer.listen_user_pgp.clone())
+                        };
+                        if let Some(user_pgp) = target {
+                            send_accept = Some((wire.clone(), user_pgp, sess.clone()));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        if let Some((wire, user_pgp, sess)) = send_accept {
+            if let Some(tx) = &self.post_tx {
+                spawn_duplex_accept(wire, user_pgp, sess, tx.clone());
+            }
+            return;
+        }
+        tracing::warn!(
+            session = %offer.session_id,
+            "duplex_offer did not match a local session; sending duplex_reject"
+        );
+        if let Some(wire) = self.channel_wire.values().next() {
+            let target = if offer.listen_user_pgp.trim().is_empty() {
+                None
+            } else {
+                Some(offer.listen_user_pgp.clone())
+            };
+            if let Some(user_pgp) = target {
+                send_reject = Some((wire.clone(), user_pgp));
+            }
+        }
+        if let Some((wire, user_pgp)) = send_reject {
+            if let Some(tx) = &self.post_tx {
+                spawn_duplex_reject(wire, user_pgp, offer.session_id, tx.clone());
+            }
+        }
+    }
+
+    fn apply_duplex_accept(&mut self, accept: duplex::DuplexAccept) {
+        let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+        for sess in guard.values_mut() {
+            if sess.session_id != accept.session_id {
+                continue;
+            }
+            if let Some(own) = sess.key {
+                if own != accept.key {
+                    tracing::warn!(
+                        session = %accept.session_id,
+                        "duplex_accept Securitykey mismatch; keeping P1 gossip"
+                    );
+                    sess.rejected = true;
+                    sess.peer_attached = false;
+                    return;
+                }
+            } else {
+                sess.key = Some(accept.key);
+            }
+            if !accept.listen_user_pgp.trim().is_empty() {
+                sess.peer_listen_user_pgp = Some(accept.listen_user_pgp);
+            }
+            sess.peer_attached = true;
+            sess.rejected = false;
+            tracing::info!(
+                session = %accept.session_id,
+                peer_listen = %accept.listen_wallet,
+                "duplex_accept on session listen SSE"
+            );
+            return;
+        }
+    }
+
+    fn mark_duplex_rejected(&mut self, session_id: &str) {
+        let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+        for sess in guard.values_mut() {
+            if sess.session_id == session_id {
+                sess.rejected = true;
+                sess.peer_attached = false;
+                tracing::info!(session = %session_id, "duplex_reject on session listen SSE; P1 gossip");
+                return;
+            }
+        }
+    }
+
+    fn duplex_ready(&self, dest: Ipv4Addr, port: u16) -> Option<DuplexSession> {
+        let guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+        let sess = guard.get(&(dest, port))?;
+        if sess.key.is_some() && sess.peer_attached && !sess.rejected {
+            Some(sess.clone())
+        } else {
+            None
+        }
     }
 
     fn queue_inbound_ipv4(&mut self, blob: Vec<u8>) -> Result<usize, L0dError> {
@@ -471,6 +707,20 @@ impl L0Client {
             L0dError::L0("l0.entries is empty; refusing POST".into())
         })?;
         let url = post::post_url(entry)?;
+        if let Some(sess) = self.duplex_ready(dest, port) {
+            if let Some(key) = sess.key {
+                let framed = frame::encode(seq, packet);
+                let payload = aes::seal(&key, &framed)?;
+                let json = duplex::encode_frame_json(&sess.session_id, &payload)?;
+                let user_pgp = sess
+                    .peer_listen_user_pgp
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(keys.user.0.as_str());
+                let armor = pgp::wrap_overlay_for_post(&json, user_pgp, &keys.route.0)?;
+                return Ok(PreparedPost { url, armor });
+            }
+        }
         let from = self
             .channel_eoa
             .get(&port)
@@ -549,15 +799,18 @@ fn load_peer_pgp(
     })
 }
 
-fn spawn_legacy_listen(
+fn spawn_legacy_listen_into(
     cfg: &ValidatedConfig,
     routing_eoa: &str,
     has_secret: bool,
-) -> Option<mpsc::Receiver<String>> {
+    tx: mpsc::Sender<String>,
+) -> bool {
     if !has_secret || routing_eoa.is_empty() || cfg.l0.listen_entries.is_empty() {
-        return None;
+        return false;
     }
-    let path = cfg.l0.mailbox_route_pgp_file.as_ref()?;
+    let Some(path) = cfg.l0.mailbox_route_pgp_file.as_ref() else {
+        return false;
+    };
     let eth = match cfg.l0.routing_eth_key_file.as_ref() {
         Some(eth_path) => match eip191::load_eth_secret(eth_path) {
             Ok(secret) => {
@@ -565,7 +818,7 @@ fn spawn_legacy_listen(
                     tracing::warn!(
                         "P1: routing_eth_key_file does not match routing_eoa; listen worker stays off"
                     );
-                    return None;
+                    return false;
                 }
                 secret
             }
@@ -574,10 +827,10 @@ fn spawn_legacy_listen(
                     error = %err,
                     "P1: routing_eth_key_file was not loaded; listen worker stays off"
                 );
-                return None;
+                return false;
             }
         },
-        None => return None,
+        None => return false,
     };
     let route = match pgp::load_public_cert_armored(path) {
         Ok(route) => route,
@@ -586,28 +839,23 @@ fn spawn_legacy_listen(
                 error = %err,
                 "P1: mailbox_route_pgp_file was not loaded; listen worker stays off"
             );
-            return None;
+            return false;
         }
     };
-    let (tx, rx) = mpsc::channel::<String>(LISTEN_QUEUE);
-    if spawn_listen_worker(
+    spawn_listen_worker(
         cfg.l0.listen_entries.clone(),
         route,
         routing_eoa.to_string(),
         eth,
         tx,
-    ) {
-        Some(rx)
-    } else {
-        None
-    }
+    )
 }
 
-fn spawn_channel_listens(
+fn spawn_channel_listens_into(
     cfg: &ValidatedConfig,
     user_secrets: &mut Vec<SecretCert>,
-) -> Option<mpsc::Receiver<String>> {
-    let (tx, rx) = mpsc::channel::<String>(LISTEN_QUEUE);
+    tx: mpsc::Sender<String>,
+) -> bool {
     let mut spawned = 0u32;
     for ch in &cfg.l0.channels {
         match pgp::load_secret_cert(&ch.routing_key_file) {
@@ -666,11 +914,7 @@ fn spawn_channel_listens(
             spawned += 1;
         }
     }
-    if spawned == 0 {
-        None
-    } else {
-        Some(rx)
-    }
+    spawned > 0
 }
 
 fn spawn_listen_worker(
@@ -722,6 +966,274 @@ fn spawn_listen_worker(
         }
     });
     true
+}
+
+fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
+    let mut out = HashMap::new();
+    if !cfg.l0.channels.is_empty() {
+        for ch in &cfg.l0.channels {
+            let eth = match eip191::load_eth_secret(&ch.routing_eth_key_file) {
+                Ok(secret) if eip191::eoa_eq(secret.address(), &ch.routing_eoa) => secret,
+                _ => continue,
+            };
+            let route = match pgp::load_public_cert_armored(&ch.mailbox_route_pgp_file) {
+                Ok(route) => route,
+                Err(_) => continue,
+            };
+            let listen_entries = if ch.listen_entries.is_empty() {
+                cfg.l0.listen_entries.clone()
+            } else {
+                ch.listen_entries.clone()
+            };
+            let user_pub = match pgp::load_secret_cert(&ch.routing_key_file)
+                .and_then(|cert| pgp::public_cert_armored(&cert))
+            {
+                Ok(armor) => armor,
+                Err(_) => continue,
+            };
+            for port in &ch.ports {
+                out.insert(
+                    *port,
+                    ChannelWire {
+                        eoa: ch.routing_eoa.clone(),
+                        route_pgp: route.clone(),
+                        eth: eth.clone(),
+                        listen_entries: listen_entries.clone(),
+                        user_pub: user_pub.clone(),
+                    },
+                );
+            }
+        }
+        return out;
+    }
+    let Some(eoa) = cfg.l0.routing_eoa.as_ref() else {
+        return out;
+    };
+    let Some(eth_path) = cfg.l0.routing_eth_key_file.as_ref() else {
+        return out;
+    };
+    let Some(route_path) = cfg.l0.mailbox_route_pgp_file.as_ref() else {
+        return out;
+    };
+    let Ok(eth) = eip191::load_eth_secret(eth_path) else {
+        return out;
+    };
+    if !eip191::eoa_eq(eth.address(), eoa) {
+        return out;
+    }
+    let Ok(route) = pgp::load_public_cert_armored(route_path) else {
+        return out;
+    };
+    let user_pub = match cfg
+        .l0
+        .routing_key_file
+        .as_ref()
+        .and_then(|path| pgp::load_secret_cert(path).ok())
+        .and_then(|cert| pgp::public_cert_armored(&cert).ok())
+    {
+        Some(armor) => armor,
+        None => return out,
+    };
+    for port in cfg.overlay_ports() {
+        out.insert(
+            port,
+            ChannelWire {
+                eoa: eoa.clone(),
+                route_pgp: route.clone(),
+                eth: eth.clone(),
+                listen_entries: cfg.l0.listen_entries.clone(),
+                user_pub: user_pub.clone(),
+            },
+        );
+    }
+    out
+}
+
+fn spawn_duplex_runtime(
+    cfg: &ValidatedConfig,
+    wires: &HashMap<u16, ChannelWire>,
+    peers: &HashMap<(Ipv4Addr, u16), PeerPgp>,
+    duplex: Arc<Mutex<HashMap<(Ipv4Addr, u16), DuplexSession>>>,
+    post_tx: Option<mpsc::Sender<PostJob>>,
+) {
+    if wires.is_empty() {
+        return;
+    }
+    {
+        let mut map = duplex.lock().unwrap_or_else(|p| p.into_inner());
+        for peer in &cfg.peers {
+            let LocatorHost::Eoa(peer_eoa) = &peer.locator.host else {
+                continue;
+            };
+            for port in peer.tcp_ports.iter().chain(peer.udp_ports.iter()) {
+                let Some(wire) = wires.get(port) else {
+                    continue;
+                };
+                if !peers.contains_key(&(peer.vip, *port)) {
+                    continue;
+                }
+                let Ok(session_id) = duplex::session_id(&wire.eoa, peer_eoa, *port) else {
+                    continue;
+                };
+                let initiator = duplex::we_are_initiator(&wire.eoa, peer_eoa).unwrap_or(false);
+                let key = if initiator {
+                    Some(aes::generate_key())
+                } else {
+                    None
+                };
+                map.insert(
+                    (peer.vip, *port),
+                    DuplexSession {
+                        session_id,
+                        key,
+                        dest: peer.vip,
+                        port: *port,
+                        guest_up: true,
+                        peer_attached: false,
+                        rejected: false,
+                        host_eoa: wire.eoa.clone(),
+                        peer_listen_user_pgp: None,
+                    },
+                );
+            }
+        }
+    }
+
+    let snapshot: Vec<DuplexSession> = {
+        let guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+        guard.values().cloned().collect()
+    };
+    for sess in snapshot {
+        let Some(wire) = wires.get(&sess.port) else {
+            continue;
+        };
+        let Some(keys) = peers.get(&(sess.dest, sess.port)) else {
+            continue;
+        };
+        let Some(peer) = cfg.peers.iter().find(|p| p.vip == sess.dest) else {
+            continue;
+        };
+        let LocatorHost::Eoa(peer_eoa) = &peer.locator.host else {
+            continue;
+        };
+        if sess.key.is_some() {
+            if let Some(tx) = &post_tx {
+                spawn_duplex_offer(
+                    wire.clone(),
+                    keys.user.0.clone(),
+                    peer_eoa.clone(),
+                    sess,
+                    tx.clone(),
+                );
+            }
+        }
+    }
+}
+
+fn spawn_duplex_offer(
+    wire: ChannelWire,
+    peer_user_pgp: String,
+    peer_eoa: String,
+    sess: DuplexSession,
+    post_tx: mpsc::Sender<PostJob>,
+) {
+    let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+        return;
+    };
+    let Some(key) = sess.key else {
+        return;
+    };
+    handle.spawn(async move {
+        loop {
+            let ts = chrono::Utc::now().timestamp().max(0) as u64;
+            match duplex::encode_offer_command(
+                &wire.eoa,
+                &peer_eoa,
+                &wire.eoa,
+                &wire.user_pub,
+                &sess.session_id,
+                &key,
+                ts,
+            )
+            .and_then(|cmd| duplex::wrap_offer_for_user_pgp(&cmd, &peer_user_pgp, &wire.eth))
+            {
+                Ok(armor) => {
+                    if post_tx.send(PostJob { armor }).await.is_ok() {
+                        tracing::info!(session = %sess.session_id, "duplex_offer queued for POST");
+                        return;
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "duplex_offer wrap refused"),
+            }
+            tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
+        }
+    });
+}
+
+fn spawn_duplex_accept(
+    wire: ChannelWire,
+    peer_user_pgp: String,
+    sess: DuplexSession,
+    post_tx: mpsc::Sender<PostJob>,
+) {
+    let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+        return;
+    };
+    let Some(key) = sess.key else {
+        return;
+    };
+    handle.spawn(async move {
+        loop {
+            let ts = chrono::Utc::now().timestamp().max(0) as u64;
+            match duplex::encode_accept_command(
+                &wire.eoa,
+                &wire.eoa,
+                &wire.user_pub,
+                &sess.session_id,
+                &key,
+                ts,
+            )
+            .and_then(|cmd| duplex::wrap_app_for_user_pgp(&cmd, &peer_user_pgp, &wire.eth))
+            {
+                Ok(armor) => {
+                    if post_tx.send(PostJob { armor }).await.is_ok() {
+                        tracing::info!(session = %sess.session_id, "duplex_accept queued for POST");
+                        return;
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "duplex_accept wrap refused"),
+            }
+            tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
+        }
+    });
+}
+
+fn spawn_duplex_reject(
+    wire: ChannelWire,
+    initiator_listen_user_pgp: String,
+    session_id: String,
+    post_tx: mpsc::Sender<PostJob>,
+) {
+    let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+        return;
+    };
+    handle.spawn(async move {
+        loop {
+            let ts = chrono::Utc::now().timestamp().max(0) as u64;
+            match duplex::encode_reject_command(&wire.eoa, &session_id, ts)
+                .and_then(|cmd| duplex::wrap_app_for_user_pgp(&cmd, &initiator_listen_user_pgp, &wire.eth))
+            {
+                Ok(armor) => {
+                    if post_tx.send(PostJob { armor }).await.is_ok() {
+                        tracing::info!(session = %session_id, "duplex_reject queued for POST");
+                        return;
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "duplex_reject wrap refused"),
+            }
+            tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
+        }
+    });
 }
 
 fn spawn_post_worker(entries: Vec<String>) -> Option<mpsc::Sender<PostJob>> {
@@ -810,6 +1322,8 @@ mod tests {
             tun_tx: None,
             inbound_rx: None,
             pending: None,
+            channel_wire: HashMap::new(),
+            duplex: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -834,6 +1348,80 @@ mod tests {
         assert_eq!(env.seq, 9);
         assert_eq!(pkt, b"\x45\x00pkt");
         assert!(!env_json.contains("signMessage"));
+    }
+
+    #[test]
+    fn duplex_ready_posts_frame_mailbox_work_not_p1_envelope() {
+        let user = generate_test_cert();
+        let route = generate_test_cert();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let client = client_with_keys(&user_pub, &route_pub);
+        let dest = Ipv4Addr::new(100, 64, 0, 6);
+        let key = aes::generate_key();
+        let sid = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+        client.duplex.lock().unwrap().insert(
+            (dest, 8400),
+            DuplexSession {
+                session_id: sid.clone(),
+                key: Some(key),
+                dest,
+                port: 8400,
+                guest_up: true,
+                peer_attached: true,
+                rejected: false,
+                host_eoa: "0x1111111111111111111111111111111111111111".into(),
+                peer_listen_user_pgp: None,
+            },
+        );
+        let prepared = client
+            .prepare_overlay_post(dest, 8400, b"\x45\x00pkt", 3)
+            .unwrap();
+        let work: serde_json::Value =
+            serde_json::from_str(&decrypt_utf8(&prepared.armor, &route).unwrap()).unwrap();
+        assert_eq!(work["NoPush"], true);
+        let inner = work["data"].as_str().unwrap();
+        let frame_json = decrypt_utf8(inner, &user).unwrap();
+        assert!(frame_json.contains("duplex_frame"));
+        assert!(!frame_json.contains("duplex_relay"));
+        assert!(!frame_json.contains("Securitykey"));
+        assert!(!frame_json.contains("conet_l0d_overlay_v1"));
+    }
+
+    #[test]
+    fn inbound_duplex_frame_writes_ipv4() {
+        let dest = Ipv4Addr::new(100, 64, 0, 6);
+        let key = aes::generate_key();
+        let pkt = b"\x45\x00fake-ipv4-header!!";
+        let framed = frame::encode(1, pkt);
+        let payload = aes::seal(&key, &framed).unwrap();
+        let sid = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let mut client = L0Client {
+            enabled: true,
+            ..L0Client::disabled()
+        };
+        client.duplex.lock().unwrap().insert(
+            (dest, 8400),
+            DuplexSession {
+                session_id: sid.to_string(),
+                key: Some(key),
+                dest,
+                port: 8400,
+                guest_up: true,
+                peer_attached: true,
+                rejected: false,
+                host_eoa: "0x1111111111111111111111111111111111111111".into(),
+                peer_listen_user_pgp: None,
+            },
+        );
+        let json = serde_json::json!({
+            "type": "duplex_frame",
+            "sessionId": sid,
+            "payload": payload,
+        })
+        .to_string();
+        assert_eq!(client.apply_inbound_armor(&json).unwrap(), pkt.len());
+        assert_eq!(client.inbound_ready, 1);
     }
 
     #[test]

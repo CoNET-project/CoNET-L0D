@@ -109,6 +109,22 @@ pub fn inbound_ipv4_from_user_armor(armor: &str, secret: &Cert) -> Result<Vec<u8
     Ok(ipv4)
 }
 
+/// Decrypt user-PGP armor to UTF-8. Caller decides overlay vs duplex_offer.
+pub fn inbound_plain_from_user_armor(armor: &str, secret: &Cert) -> Result<String, L0dError> {
+    let plain = pgp::decrypt_utf8(armor, secret)?;
+    let trimmed = plain.trim_start();
+    if trimmed.starts_with('{') {
+        let v: Value = serde_json::from_str(trimmed)
+            .map_err(|e| L0dError::L0(format!("inbound JSON: {e}")))?;
+        if v.get("NoPush").is_some() {
+            return Err(L0dError::L0(
+                "inbound decrypt produced mailbox work; expected user-PGP envelope".into(),
+            ));
+        }
+    }
+    Ok(plain)
+}
+
 /// Wrap a listen command and build the `/post` URL. HTTP body is still `{ data }`.
 pub fn prepare_listen_post(
     wallet: &str,
@@ -227,6 +243,15 @@ fn extract_armors_from_frame(frame: &str) -> Vec<String> {
     let payload = sse_or_raw_payload(frame);
     if let Some(armor) = armor_from_si_json(&payload) {
         return vec![armor];
+    }
+    let trimmed = payload.trim();
+    if trimmed.starts_with('{')
+        && (crate::l0::duplex::parse_duplex_frame_json(trimmed).is_some()
+            || crate::l0::duplex::parse_accept(trimmed).is_some()
+            || crate::l0::duplex::parse_reject(trimmed).is_some()
+            || trimmed.contains("\"duplex_offer\""))
+    {
+        return vec![trimmed.to_string()];
     }
     extract_pgp_armors_from_sse(frame)
 }
@@ -426,6 +451,17 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(pgp::is_pgp_message_armor(&found[0]));
         assert_eq!(extract_inbound_armors(chunk).len(), 1);
+    }
+
+    #[test]
+    fn sse_extracts_duplex_frame_json() {
+        let frame = concat!(
+            "data: {\"type\":\"duplex_frame\",\"sessionId\":\"aa\",\"payload\":\"YmFzZQ==\"}\r\n\r\n"
+        );
+        let found = extract_inbound_armors(frame);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("duplex_frame"));
+        assert!(!found[0].contains("BEGIN PGP"));
     }
 
     #[test]
@@ -685,5 +721,31 @@ mod tests {
         .await
         .expect_err("plaintext must not POST");
         assert!(err.to_string().contains("plaintext"));
+    }
+
+    #[tokio::test]
+    async fn listen_http_404_is_not_listening() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no duplex"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let route = generate_test_cert();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let eth = test_eth();
+        let (url, armor) = prepare_listen_post(eth.address(), 1, &route_pub, &server.uri(), &eth)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let client = listen_http_client().unwrap();
+        let err = run_listen_once(&client, &url, &armor, &tx)
+            .await
+            .expect_err("404 must not be treated as SSE");
+        assert!(err.to_string().contains("HTTP 404"));
     }
 }

@@ -1,7 +1,7 @@
 # conet-l0d — 在 Layer Minus 上的 L1 overlay
 
 **成对译本：** [English](./conet-l0d.md)  
-**Revision：** 2026-08-18（可选按端口 `[[l0.channels]]` listen SSE；overlay IPv4 合批 + POST 32/512；追链受 Prysm 限速；实验室 overlay UDP + 经 L0 的现役 discv5 已通过；DHT 掉线先清幽灵 conntrack；授权 `.45` `restart-beacon` 仅用于拨号 backoff；`ss` 公网 `:4200` 是 DNAT 原目的、不是漏公网；不是生产 discv5 产品）  
+**Revision：** 2026-08-18（应用层 duplex：要约走长期 Chat SSE；接受 / 拒绝 / 帧走会话 listen SSE；拒绝或无 accept 则 P1 gossip；可选按端口 `[[l0.channels]]` listen SSE；overlay IPv4 合批 + POST 32/512；追链受 Prysm 限速；实验室 overlay UDP + 经 L0 的现役 discv5 已通过；DHT 掉线先清幽灵 conntrack；授权 `.45` `restart-beacon` 仅用于拨号 backoff；`ss` 公网 `:4200` 是 DNAT 原目的、不是漏公网；不是生产 discv5 产品）  
 **公开操作说明：** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **公开开发说明：** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -111,14 +111,17 @@ SIGINT / SIGTERM / `stop` / `teardown`：
 
 | 方向 | 加密目标 | HTTP |
 | --- | --- | --- |
-| Overlay TCP 字节 | 对端 **user PGP** | 入口 **A ≠ B** |
-| Listen / 控制 | mailbox **B route PGP** | 入口 **C ≠ B** |
+| `duplex_offer` | 对端 **长期 user PGP** | 入口 **A ≠ B**。Chat gossip 到现有通道 SSE。SI **不解析** `duplex_*` |
+| `duplex_accept` / `duplex_reject` | 发起方 **会话 listen user PGP** | 入口 **A ≠ B**。落到发起方会话 Chat SSE |
+| 会话 / 通道 listen | mailbox **B route PGP** | 现有 `mining` + `listenKind: "chat"`，经 **C ≠ B**。两套自有 SSE；禁止在对端 B 上 guest listen |
+| Overlay IPv4（duplex 数据面） | AES-256-GCM（`L0D1` \|\| IPv4）放进 user-PGP `duplex_frame`，加密给对端 **会话 listen user PGP**，再 mailbox wrap | 入口 **A ≠ B**。与 P1 gossip 同一 `{ "data" }` |
+| P1 gossip 回退（`duplex_reject` 或无 accept） | 对端 **user PGP**，再 wrap 给 **B route PGP** | 入口 **A ≠ B** |
 
 HTTP 体只有 `{ "data": "<armor>" }`。本客户端不带 hop-sig 头。HTTP JSON 上不放 `NoPush`。
 
-独立 SI 命令（`p2p_stream_*`、`listenKind: "l1p2p"`）**尚未决定**。在落地前不得写成现役 SI。一旦新增，同一任务必须更新 GitBook L0 协议页 **以及** 两份公开 `conet-l0d` 页。
+Duplex 是 Chat gossip 上的 **应用 JSON**：`duplex_offer`、`duplex_accept`、`duplex_reject`、`duplex_frame`。发起方附 overlay AES 钥与 **会话 listen 钱包**；接收方拒绝则打到该 SSE，同意则回钥并附自己的会话 listen 钱包。规范：[Duplex overlay](https://gitbook.conet.network/l0/duplex-forward.html)。crate MVP 用已登记的按端口通道 EOA 作为会话 listen 身份。**禁止**发 `command: "mining"` + `listenKind: "duplex"`。**禁止**把 SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` 写成现役 SI。
 
-现有 UDP forward 不是这条路径。
+现有 UDP forward 是另一条组合（idle 更短；不是 overlay TCP）。
 
 ## 8. 生产姿态
 
@@ -138,7 +141,7 @@ L0 额外时延在本 Revision 中是 **估计**（每跳数十到数百毫秒�
 | 阶段 | 范围 |
 | --- | --- |
 | **MVP** | **已验收（2026-08-17）。** Linux 命令；TUN + iptables 生命周期；定位符解析；静态对等表；收包计数；L0 客户端桩 |
-| **P1** | **已在 crate；`[l0]` 默认关。** 在现有 L0 原语上做钱包对钱包 TCP 字节流；静态 overlay bootnode。crate 把 overlay 信封加密给对端 **user PGP**，再 wrap `{ data, NoPush: true }` 给 mailbox **B route PGP**，仅在 `[l0].enabled` 且对端有 user+route PGP 文件与 entry 时 `POST { "data" }`。入站：解密 user-PGP armor → overlay 信封 → 原始 IPv4 入队写回 TUN（`routing_key_file` 须为 OpenPGP 私钥证书）**已在 crate**。Listen HTTP+SSE worker **已在 crate**：enabled 加上 `listen_entries`（C ≠ B）、`mailbox_route_pgp_file`（本机 B route **公钥**）、`routing_eoa`、`routing_key_file` 与 `routing_eth_key_file`（hex secp256k1；recovered 地址须等于 `routing_eoa`；不是 OpenPGP）。可选 `[[l0.channels]]` 为 overlay 端口 8400 / 4200 / 4300 各用一个 EOA + SSE（出站加密给该端口的对端 user PGP；按知名源或目的端口分类）。未配 channels 时仍是一个 EOA。`:4300` 是 overlay IPv4，不是 `udp_relay`。Listen 命令为 `command: mining` + `listenKind: "chat"`，**不得**带 `Securitykey`，EIP-191 签成 SI `{ message, signMessage }` base64。Listen 入站对齐 SI `forWardPGPMessageToClient` 的原始 JSON `{ "data": "<armor>" }`（与 Chat `handleInbound` 相同），不再只认 SSE armor 行。测试只用 wiremock。**经授权**的实验室可开 `[l0]`，并向入口 C POST 该现役 listen — 不是新 SI 命令。**2026-08-17 23:12Z L0-only：** 出站 HTTP 200，无入站 TUN 写回（当时只扫 SSE）。**23:30Z**（只重启 `conet-l0d`）：两机 TUN 均有入站 IPv4，且 overlay geth TCP 已通（`.45` `100.64.0.5` ↔ `.98` `100.64.0.6:8400`）。**2026-08-18：** 授权 L0_ONLY `.45` 通告 overlay vIP `100.64.0.5`；overlay geth + beacon TCP 已 ESTAB；IPv4 合批 + POST 并发 32 / 队列 512（两机必须同升二进制）。该二进制之后 overlay queue-full 为 0；追链剩余限速是 Prysm initial-sync（约 3.2 块/秒、约 15 小时）。EL 仍为 `0x0`。只读抽检：`scripts/watch-l0-follow.sh`。追链门仍开。`.98` 与生产 proposer 仍通告公网 IP。HTTP 200 ≠ 投递。 |
+| **P1** | **已在 crate；`[l0]` 默认关。** 钱包对钱包 TCP 字节流。对端应用回 `duplex_accept` 时优先 **应用层 duplex**（现有 Chat gossip）；否则保持 **P1 gossip**（user-PGP 信封 + mailbox wrap）。静态 overlay bootnode。crate 把 overlay 信封加密给对端 **user PGP**，再 wrap `{ data, NoPush: true }` 给 mailbox **B route PGP**，仅在 `[l0].enabled` 且对端有 user+route PGP 文件与 entry 时 `POST { "data" }`。入站：解密 user-PGP armor → overlay 信封 → 原始 IPv4 入队写回 TUN（`routing_key_file` 须为 OpenPGP 私钥证书）**已在 crate**。Listen HTTP+SSE worker **已在 crate**：enabled 加上 `listen_entries`（C ≠ B）、`mailbox_route_pgp_file`（本机 B route **公钥**）、`routing_eoa`、`routing_key_file` 与 `routing_eth_key_file`（hex secp256k1；recovered 地址须等于 `routing_eoa`；不是 OpenPGP）。可选 `[[l0.channels]]` 为 overlay 端口 8400 / 4200 / 4300 各用一个 EOA + SSE（出站加密给该端口的对端 user PGP；按知名源或目的端口分类）。未配 channels 时仍是一个 EOA。`:4300` 是 overlay IPv4，不是 `udp_relay`。应用层 host listen **就是**现有 Chat SSE（`mining` + `listenKind: "chat"`，listen **不得**带 overlay AES）。对端不回 `duplex_accept` 则保持 P1 gossip。EIP-191 签成 SI `{ message, signMessage }` base64。Listen 入站对齐 SI `forWardPGPMessageToClient` 的原始 JSON `{ "data": "<armor>" }`（与 Chat `handleInbound` 相同），不再只认 SSE armor 行。测试只用 wiremock。**经授权**的实验室可开 `[l0]`。**禁止**把 SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` 写成现役 SI。**2026-08-17 23:12Z L0-only：** 出站 HTTP 200，无入站 TUN 写回（当时只扫 SSE）。**23:30Z**（只重启 `conet-l0d`）：两机 TUN 均有入站 IPv4，且 overlay geth TCP 已通（`.45` `100.64.0.5` ↔ `.98` `100.64.0.6:8400`）。**2026-08-18：** 授权 L0_ONLY `.45` 通告 overlay vIP `100.64.0.5`；overlay geth + beacon TCP 已 ESTAB；IPv4 合批 + POST 并发 32 / 队列 512（两机必须同升二进制）。该二进制之后 overlay queue-full 为 0；追链剩余限速是 Prysm initial-sync（约 3.2 块/秒、约 15 小时）。EL 仍为 `0x0`。只读抽检：`scripts/watch-l0-follow.sh`。追链门仍开。`.98` 与生产 proposer 仍通告公网 IP。HTTP 200 ≠ 投递。 |
 | **P2** | **实验室通讯已验收；不是产品。** crate 已运 IPv4/UDP — 不必再做 datagram 适配器。2026-08-18 实验室：overlay UDP 回声与 `:4300`（直发 + 公网 ENR steer）已到对端 TUN。随后 L0_ONLY `.45` 放弃静态 `--peer`，经 L0 连上 `.98` DHT 服务器（`.98` 用 `--p2p-static-id`；bootstrap ENR；allowlist = overlay + 枢纽公网 `/32`；TCP/UDP steer DNAT；隔离链仍丢未 steer 的公网 P2P）。DNAT 之后 `.45` `ss` 可能显示枢纽公网 `:4200`（原目的，不是漏公网）；overlay 证明是 TUN VIP + 隔离 DROP=0。若后来 `connected` 掉线，先重打 `overlay-dht-steer.sh`（清幽灵 conntrack；**不要**为此重启 EL/CL）。仅当 Prysm 仍停在拨号 backoff 时才 `restart-beacon`（**2026-08-18 约 17:28Z** `.45` 恢复 `connected=1` 与 `Processing blocks`；启动后不要立刻再打 steer）。第一分钟 `suitable=0` 属预期。EL 仍为 `0x0` 而 `head_slot` 在涨 = CL 滞后。见 `docs/P2.zh-CN.md`。 |
 | **P3** | 混合生产（公网 P2P + L0 备份）；实测 RTT |
 
@@ -149,7 +152,7 @@ L0 额外时延在本 Revision 中是 **估计**（每跳数十到数百毫秒�
 | [github.com/CoNET-project/CoNET-L0D](https://github.com/CoNET-project/CoNET-L0D) | 公开 crate 真相来源 |
 | 本成对白皮书 + `RULES.md` | 设计与工程约束 |
 | `docs/MVP.md` | 已验收的 crate MVP |
-| `docs/P1.md` | 下一阶段线合同与 `[l0]`（不是现役 SI 命令） |
+| `docs/P1.md` | Overlay 线合同：应用层 duplex + P1 gossip 回退；`[l0]` |
 | `docs/P2.md` | 实验室 overlay UDP / DHT 口通讯 + 经 L0 的现役 discv5（不是已关闭的 P2 / 生产产品） |
 | `config/conet-l0d.example.toml` | overlay 表示例 |
 | `systemd/conet-l0d.service` | 进程持有 TUN/iptables；unit 不得写裸 `iptables` |

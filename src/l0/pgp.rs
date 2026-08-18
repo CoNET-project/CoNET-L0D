@@ -11,10 +11,9 @@ use sequoia_openpgp::parse::stream::{
     DecryptionHelper, DecryptorBuilder, MessageStructure, VerificationHelper,
 };
 use sequoia_openpgp::serialize::stream::{Armorer, Encryptor2, LiteralWriter, Message};
+use sequoia_openpgp::serialize::SerializeInto;
 use sequoia_openpgp::types::SymmetricAlgorithm;
 use sequoia_openpgp::KeyHandle;
-#[cfg(test)]
-use sequoia_openpgp::serialize::SerializeInto;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -217,7 +216,6 @@ pub fn decrypt_utf8(armor: &str, secret: &Cert) -> Result<String, L0dError> {
     String::from_utf8(out).map_err(|_| L0dError::L0("decrypted payload is not UTF-8".into()))
 }
 
-#[cfg(test)]
 pub fn public_cert_armored(cert: &Cert) -> Result<String, L0dError> {
     String::from_utf8(
         cert.armored()

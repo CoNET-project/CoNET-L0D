@@ -19,7 +19,7 @@
 | `stop` / SIGINT / SIGTERM | 与 start 相反；pid 来自 state 文件 |
 | `teardown` | 守护进程已死后仍能走同一反向路径 |
 | 收包循环 | 统计 TUN 上的 IPv4；记录目的 vIP（不含密钥） |
-| L0 | crate 桩已验收：统计 TUN IPv4 并记录目的 vIP。不得声称现役 SI `p2p_stream_*`。现役 `/post` 字节流见 [P1](./P1.zh-CN.md) |
+| L0 | crate 桩已验收：统计 TUN IPv4 并记录目的 vIP。现役 overlay `/post` 优先 **应用层 duplex**（要约走长期 Chat SSE；接受 / 拒绝 / 帧走会话 listen SSE）；`duplex_reject` 或无 accept 则 P1 gossip — [P1](./P1.zh-CN.md)。不得声称 SI `duplex_*` 或 `p2p_stream_*` |
 | 文档 | 成对白皮书 + 本 MVP + GitBook Applications + Developers |
 | 示例 + unit | `config/conet-l0d.example.toml` 与 `systemd/conet-l0d.service`（仅 `start`/`stop`） |
 
@@ -28,7 +28,7 @@
 - 生产 mailbox 投递（P1 crate 可 POST 现役 `/post`，并解析 SI gossip JSON `{ "data": "<armor>" }`；经授权实验室可开 `[l0]`；2026-08-18 实验室 `.45` 通告 overlay vIP，overlay geth + beacon TCP 已通；合批二进制之后限速是 Prysm initial-sync 约 3.2 块/秒；EL 仍为 `0x0`；只读抽检 `scripts/watch-l0-follow.sh` — 见 [P1.zh-CN.md](./P1.zh-CN.md)）
 - 生产 discv4 / discv5（实验室 overlay UDP + 经 L0 的现役 discv5 见 [P2.zh-CN.md](./P2.zh-CN.md)；掉线先 `overlay-dht-steer.sh apply` 清幽灵 conntrack；授权 `.45` `restart-beacon` 仅用于拨号 backoff；DNAT 后 `.45` `ss` 可能显示枢纽公网 `:4200`（原目的，不是漏公网）；不是已关闭的 P2 / 生产产品）
 - 代理 validator 或读取 keystore
-- 新 SI 命令或新域名
+- 新域名。overlay duplex 是 Chat gossip 上的应用 JSON；不得发明 SI `duplex_*` 或 `p2p_stream_*`
 - crate 自己重启 geth / beacon / validator（经授权的**操作员**脚本可以只重启 **`.45`** 做 L0_ONLY；未授权不要动 `.98`；禁止 wipe）
 
 ## 命令

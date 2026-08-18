@@ -394,6 +394,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 name = "conet-l0d"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64",
  "chrono",
@@ -407,6 +408,7 @@ dependencies = [
  "idna_adapter",
  "k256",
  "libc",
+ "rand 0.8.7",
  "reqwest",
  "sequoia-openpgp",
  "serde",
@@ -1801,6 +1803,7 @@ version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
+ "libc",
  "rand_chacha",
  "rand_core 0.6.4",
 ]
