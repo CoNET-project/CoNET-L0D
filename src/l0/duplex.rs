@@ -206,6 +206,22 @@ pub fn wrap_offer_for_user_pgp(
     wrap_app_for_user_pgp(command_json, user_pub_armored, eth)
 }
 
+/// Chat-path delivery of `duplex_accept` (control plane). The occupied L0 pipe
+/// still carries the same accept as the first AES blob when possible; Chat is
+/// the reliable return-path trigger when SSE occupancy data is not ingested.
+pub fn wrap_accept_for_user_pgp(
+    command_json: &str,
+    user_pub_armored: &str,
+    eth: &EthSecret,
+) -> Result<String, L0dError> {
+    if !command_json.contains("\"duplex_accept\"") {
+        return Err(L0dError::L0(
+            "wrap_accept_for_user_pgp is only for duplex_accept".into(),
+        ));
+    }
+    wrap_app_for_user_pgp(command_json, user_pub_armored, eth)
+}
+
 pub fn parse_offer_plain(plain: &str) -> Result<DuplexOffer, L0dError> {
     let v: Value = serde_json::from_str(plain.trim())
         .map_err(|e| L0dError::L0(format!("duplex_offer plaintext: {e}")))?;

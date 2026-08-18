@@ -28,7 +28,10 @@ pub async fn run_occupied_pipe(
         match open_pipe(entry, connect_armor).await {
             Ok(mut stream) => {
                 if let Some(blob) = first.take() {
-                    write_blob_line(&mut stream, &blob).await?;
+                    if let Err(err) = write_blob_line(&mut stream, &blob).await {
+                        last = err;
+                        continue;
+                    }
                 }
                 while let Some(blob) = rx.recv().await {
                     write_blob_line(&mut stream, &blob).await?;
@@ -78,6 +81,15 @@ enum PipeReader {
     Tls(tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
+impl PipeReader {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf).await,
+            Self::Tls(s) => s.read(buf).await,
+        }
+    }
+}
+
 enum PipeWriter {
     Plain(tokio::net::tcp::OwnedWriteHalf),
     Tls(tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>),
@@ -110,6 +122,43 @@ impl SplitPipe {
 
     async fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush().await
+    }
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+async fn read_http_ok(reader: &mut PipeReader) -> Result<(), L0dError> {
+    let mut buf = Vec::with_capacity(512);
+    let mut tmp = [0u8; 256];
+    loop {
+        let n = reader
+            .read(&mut tmp)
+            .await
+            .map_err(|e| L0dError::L0(format!("l0 pipe read status: {e}")))?;
+        if n == 0 {
+            return Err(L0dError::L0("l0 pipe closed before HTTP status".into()));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(end) = find_header_end(&buf) {
+            let head = String::from_utf8_lossy(&buf[..end]);
+            let status_line = head.lines().next().unwrap_or("");
+            let code = status_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u16>().ok());
+            if code.map(|c| (200..300).contains(&c)) != Some(true) {
+                return Err(L0dError::L0(format!(
+                    "l0 pipe HTTP not 2xx: {}",
+                    status_line.trim()
+                )));
+            }
+            return Ok(());
+        }
+        if buf.len() > 16_384 {
+            return Err(L0dError::L0("l0 pipe HTTP headers too large".into()));
+        }
     }
 }
 
@@ -170,14 +219,13 @@ async fn open_pipe(entry: &str, armor: &str) -> Result<SplitPipe, L0dError> {
         .flush()
         .await
         .map_err(|e| L0dError::L0(format!("l0 pipe body flush: {e}")))?;
+    // Wait until SI has answered (and attached the occupy data handler) before
+    // writing AES blobs; racing Content-Length parsing drops the accept line.
+    read_http_ok(&mut reader).await?;
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         loop {
-            let n = match &mut reader {
-                PipeReader::Plain(r) => r.read(&mut buf).await,
-                PipeReader::Tls(r) => r.read(&mut buf).await,
-            };
-            match n {
+            match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -209,5 +257,10 @@ mod tests {
         let obj = v.as_object().unwrap();
         assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("data"));
+    }
+
+    #[test]
+    fn find_header_end_crlf() {
+        assert_eq!(find_header_end(b"HTTP/1.1 200 OK\r\n\r\nbody"), Some(19));
     }
 }

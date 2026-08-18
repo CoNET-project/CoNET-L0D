@@ -452,7 +452,8 @@ impl L0Client {
     }
 
     fn apply_duplex_offer(&mut self, offer: duplex::DuplexOffer) {
-        let mut send_accept: Option<(ChannelWire, String, String, DuplexSession)> = None;
+        // (wire, initiator_listen, mailbox_route, sess, initiator_user_pgp)
+        let mut send_accept: Option<(ChannelWire, String, String, DuplexSession, String)> = None;
         let mut send_reject: Option<(ChannelWire, String, String, [u8; aes::KEY_LEN], String)> =
             None;
         {
@@ -483,6 +484,7 @@ impl L0Client {
                                 offer.listen_wallet.clone(),
                                 keys.route.0.clone(),
                                 sess.clone(),
+                                keys.user.0.clone(),
                             ));
                         }
                     }
@@ -490,24 +492,35 @@ impl L0Client {
                 break;
             }
         }
-        if let Some((wire, target, route, sess)) = send_accept {
+        if let Some((wire, target, route, sess, initiator_user_pgp)) = send_accept {
+            // Reliable control plane: Chat gossip duplex_accept so the initiator
+            // can open the return l0_connect even when occupied-SSE AES is lost.
+            if let Some(post_tx) = self.post_tx.clone() {
+                spawn_duplex_accept_chat(
+                    wire.clone(),
+                    initiator_user_pgp,
+                    sess.clone(),
+                    post_tx,
+                );
+            }
+            let accept_blob = sess.key.and_then(|k| {
+                let ts = chrono::Utc::now().timestamp().max(0) as u64;
+                duplex::encode_accept_command(
+                    &sess.host_eoa,
+                    &sess.host_eoa,
+                    &wire.user_pub,
+                    &sess.session_id,
+                    &k,
+                    ts,
+                )
+                .ok()
+                .and_then(|json| aes::seal(&k, json.as_bytes()).ok())
+            });
             spawn_l0_pipe(
                 wire,
                 route,
                 target,
-                sess.key.and_then(|k| {
-                    let ts = chrono::Utc::now().timestamp().max(0) as u64;
-                    duplex::encode_accept_command(
-                        &sess.host_eoa,
-                        &sess.host_eoa,
-                        "",
-                        &sess.session_id,
-                        &k,
-                        ts,
-                    )
-                    .ok()
-                    .and_then(|json| aes::seal(&k, json.as_bytes()).ok())
-                }),
+                accept_blob,
                 sess,
                 self.duplex.clone(),
             );
@@ -582,6 +595,11 @@ impl L0Client {
                     peer_listen = %accept.listen_wallet,
                     "duplex_accept on occupied L0 SSE"
                 );
+                // Chat may deliver accept before/after the L0 first-blob path;
+                // only open one return pipe.
+                if sess.pipe_tx.is_some() {
+                    break;
+                }
                 if let Some(wire) = self.channel_wire.get(&sess.port) {
                     if let Some(keys) = self.peers.get(&(sess.dest, sess.port)) {
                         launch = Some((
@@ -1289,6 +1307,43 @@ fn spawn_duplex_offer(
                 Err(err) => tracing::warn!(error = %err, "duplex_offer wrap refused"),
             }
             tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
+        }
+    });
+}
+
+fn spawn_duplex_accept_chat(
+    wire: ChannelWire,
+    initiator_user_pgp: String,
+    sess: DuplexSession,
+    post_tx: mpsc::Sender<PostJob>,
+) {
+    let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+        return;
+    };
+    let Some(key) = sess.key else {
+        return;
+    };
+    handle.spawn(async move {
+        let ts = chrono::Utc::now().timestamp().max(0) as u64;
+        match duplex::encode_accept_command(
+            &wire.eoa,
+            &wire.eoa,
+            &wire.user_pub,
+            &sess.session_id,
+            &key,
+            ts,
+        )
+        .and_then(|cmd| duplex::wrap_accept_for_user_pgp(&cmd, &initiator_user_pgp, &wire.eth))
+        {
+            Ok(armor) => {
+                if post_tx.send(PostJob { armor }).await.is_ok() {
+                    tracing::info!(
+                        session = %sess.session_id,
+                        "duplex_accept queued for Chat POST (return-path control)"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "duplex_accept Chat wrap refused"),
         }
     });
 }
