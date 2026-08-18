@@ -589,6 +589,89 @@ mod tests {
         assert_eq!(inbound_ipv4_from_user_armor(&got_armor, &user).unwrap(), pkt);
     }
 
+    fn test_eth_b() -> EthSecret {
+        let mut bytes = [0u8; 32];
+        bytes[31] = 2;
+        EthSecret::from_bytes(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_listen_streams_share_one_queue() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let route = generate_test_cert();
+        let user_a = generate_test_cert();
+        let user_b = generate_test_cert();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let pkt_a = b"\x45\x00listen-chan-a-ipv4";
+        let pkt_b = b"\x45\x00listen-chan-b-ipv4";
+        let json_a = envelope::encode("0x1111111111111111111111111111111111111111", 1, pkt_a).unwrap();
+        let json_b = envelope::encode("0x2222222222222222222222222222222222222222", 2, pkt_b).unwrap();
+        let inbound_a = encrypt_utf8(&json_a, &public_cert_armored(&user_a).unwrap()).unwrap();
+        let inbound_b = encrypt_utf8(&json_b, &public_cert_armored(&user_b).unwrap()).unwrap();
+
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .and(body_string_contains("BEGIN PGP MESSAGE"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound_a)))
+            .expect(1)
+            .mount(&server_a)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .and(body_string_contains("BEGIN PGP MESSAGE"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound_b)))
+            .expect(1)
+            .mount(&server_b)
+            .await;
+
+        let eth_a = test_eth();
+        let eth_b = test_eth_b();
+        let (url_a, armor_a) = prepare_listen_post(
+            eth_a.address(),
+            1_710_000_000,
+            &route_pub,
+            &server_a.uri(),
+            &eth_a,
+        )
+        .unwrap();
+        let (url_b, armor_b) = prepare_listen_post(
+            eth_b.address(),
+            1_710_000_000,
+            &route_pub,
+            &server_b.uri(),
+            &eth_b,
+        )
+        .unwrap();
+        assert_ne!(eth_a.address(), eth_b.address());
+
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let client = listen_http_client().unwrap();
+        let (status_a, status_b) = tokio::join!(
+            run_listen_once(&client, &url_a, &armor_a, &tx),
+            run_listen_once(&client, &url_b, &armor_b, &tx),
+        );
+        assert_eq!(status_a.unwrap(), 200);
+        assert_eq!(status_b.unwrap(), 200);
+        let first = rx.recv().await.expect("first armor");
+        let second = rx.recv().await.expect("second armor");
+        let mut recovered = vec![
+            inbound_ipv4_from_user_armor(&first, &user_a)
+                .or_else(|_| inbound_ipv4_from_user_armor(&first, &user_b))
+                .unwrap(),
+            inbound_ipv4_from_user_armor(&second, &user_a)
+                .or_else(|_| inbound_ipv4_from_user_armor(&second, &user_b))
+                .unwrap(),
+        ];
+        recovered.sort();
+        let mut expected = vec![pkt_a.to_vec(), pkt_b.to_vec()];
+        expected.sort();
+        assert_eq!(recovered, expected);
+    }
+
     #[tokio::test]
     async fn listen_does_not_post_plaintext() {
         let client = listen_http_client().unwrap();

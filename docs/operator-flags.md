@@ -51,6 +51,8 @@ Lab DHT-port comms (`L0_DHT=1`): drop `--no-discovery`, keep `--disable-quic`, d
 
 Restore public P2P: `./start-geth-beacon-only.sh stop-isolate` then a normal `restart`. Do not wipe. Do not restart `.98` unless that host is authorized.
 
+Optional crate `[[l0.channels]]`: one routing EOA + listen SSE per overlay port (`8400` / `4200` / `4300`). Outbound encrypts to the peer user PGP for that port. Classify return-path TCP by **source** port. `:4300` is overlay IPv4, not SI `udp_relay`. Do not bind two SSEs to the same EOA. Each channel wallet must already `regiestChatRoute`.
+
 Never set `--http.addr`, `--authrpc.addr`, `--p2p-local-ip`, or `--rpc-host` to the overlay vIP. That `bind()` fails if the TUN is down and can take Engine off loopback.
 
 Public how-to: [Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html) · [Run an L1 node](https://gitbook.conet.network/developers/l1-node.html)

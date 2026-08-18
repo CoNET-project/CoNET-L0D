@@ -1,8 +1,6 @@
 use crate::config::ValidatedConfig;
 use crate::l0::L0Client;
-use crate::locator::Locator;
-use crate::packet::ipv4_dest;
-use std::net::Ipv4Addr;
+use crate::packet::{ipv4_dest, overlay_channel_port};
 
 #[derive(Debug, Default)]
 #[allow(dead_code)]
@@ -26,7 +24,12 @@ impl ForwardStats {
             return;
         };
         self.ipv4_packets += 1;
-        let locator = lookup_dest(cfg, dest);
+        let known = cfg.overlay_ports();
+        let locator = match overlay_channel_port(frame, &known) {
+            Some(_port) if dest == cfg.local_vip => Some(cfg.identity.clone()),
+            Some(port) => cfg.lookup_peer(dest, port).map(|p| p.locator.clone()),
+            None => None,
+        };
         tracing::debug!(
             dest = %dest,
             packets = self.ipv4_packets,
@@ -35,15 +38,4 @@ impl ForwardStats {
         self.l0
             .note_overlay_packet(dest, locator.as_ref(), frame);
     }
-}
-
-#[allow(dead_code)]
-fn lookup_dest(cfg: &ValidatedConfig, dest: Ipv4Addr) -> Option<Locator> {
-    if dest == cfg.local_vip {
-        return Some(cfg.identity.clone());
-    }
-    cfg.peers
-        .iter()
-        .find(|p| p.vip == dest)
-        .map(|p| p.locator.clone())
 }

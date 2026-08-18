@@ -1,6 +1,7 @@
 use crate::error::L0dError;
 use crate::locator::Locator;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,21 @@ pub struct L0Config {
     /// This host's mailbox **B route public** key. Not the peer route file.
     #[serde(default)]
     pub mailbox_route_pgp_file: Option<PathBuf>,
+    /// Per-port listen identities. Empty = one legacy routing EOA for all overlay ports.
+    #[serde(default)]
+    pub channels: Vec<L0ChannelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L0ChannelConfig {
+    pub ports: Vec<u16>,
+    pub routing_eoa: String,
+    pub routing_key_file: PathBuf,
+    pub routing_eth_key_file: PathBuf,
+    pub mailbox_route_pgp_file: PathBuf,
+    /// Listen entry C. Empty inherits `[l0].listen_entries`.
+    #[serde(default)]
+    pub listen_entries: Vec<String>,
 }
 
 impl Default for L0Config {
@@ -58,6 +74,7 @@ impl Default for L0Config {
             routing_key_file: None,
             routing_eth_key_file: None,
             mailbox_route_pgp_file: None,
+            channels: Vec::new(),
         }
     }
 }
@@ -71,7 +88,10 @@ pub struct IdentityConfig {
 pub struct PeerConfig {
     pub locator: String,
     pub vip: String,
+    #[serde(default)]
     pub tcp_ports: Vec<u16>,
+    #[serde(default)]
+    pub udp_ports: Vec<u16>,
     /// Optional lab override: armored user public key file. Do not log contents.
     #[serde(default)]
     pub user_pgp_file: Option<PathBuf>,
@@ -104,6 +124,17 @@ pub struct L0Settings {
     pub routing_eth_key_file: Option<PathBuf>,
     /// This host's mailbox B route **public** cert. Unused when `[l0]` is off.
     pub mailbox_route_pgp_file: Option<PathBuf>,
+    pub channels: Vec<ValidatedL0Channel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedL0Channel {
+    pub ports: Vec<u16>,
+    pub routing_eoa: String,
+    pub routing_key_file: PathBuf,
+    pub routing_eth_key_file: PathBuf,
+    pub mailbox_route_pgp_file: PathBuf,
+    pub listen_entries: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +143,8 @@ pub struct ValidatedPeer {
     pub vip: Ipv4Addr,
     #[allow(dead_code)]
     pub tcp_ports: Vec<u16>,
+    #[allow(dead_code)]
+    pub udp_ports: Vec<u16>,
     pub user_pgp_file: Option<PathBuf>,
     pub route_pgp_file: Option<PathBuf>,
 }
@@ -256,7 +289,8 @@ impl DaemonConfig {
 
         let identity = Locator::parse(&self.identity.locator)?;
         let mut peers = Vec::new();
-        let mut seen_vips = vec![local_vip];
+        let mut ports_by_vip: std::collections::HashMap<Ipv4Addr, HashSet<u16>> =
+            std::collections::HashMap::new();
         for peer in &self.peers {
             let locator = Locator::parse(&peer.locator)?;
             let vip: Ipv4Addr = peer
@@ -268,19 +302,24 @@ impl DaemonConfig {
                     "peer vip {vip} is outside overlay_cidr"
                 )));
             }
-            if peer.tcp_ports.is_empty() {
+            if peer.tcp_ports.is_empty() && peer.udp_ports.is_empty() {
                 return Err(L0dError::Config(format!(
-                    "peer {} needs at least one tcp port",
+                    "peer {} needs at least one tcp or udp port",
                     peer.locator
                 )));
             }
-            for port in &peer.tcp_ports {
+            for port in peer.tcp_ports.iter().chain(peer.udp_ports.iter()) {
                 if *port == 0 {
-                    return Err(L0dError::Config("tcp port 0 is not allowed".into()));
+                    return Err(L0dError::Config("overlay port 0 is not allowed".into()));
                 }
             }
-            if seen_vips.contains(&vip) && vip != local_vip {
-                // same vip may host geth+beacon; only reject if identical locator+vip duplicated
+            let used = ports_by_vip.entry(vip).or_default();
+            for port in peer.tcp_ports.iter().chain(peer.udp_ports.iter()) {
+                if !used.insert(*port) {
+                    return Err(L0dError::Config(format!(
+                        "duplicate overlay port {port} on peer vip {vip}"
+                    )));
+                }
             }
             if peers
                 .iter()
@@ -291,11 +330,11 @@ impl DaemonConfig {
                     locator.display()
                 )));
             }
-            seen_vips.push(vip);
             peers.push(ValidatedPeer {
                 locator,
                 vip,
                 tcp_ports: peer.tcp_ports.clone(),
+                udp_ports: peer.udp_ports.clone(),
                 user_pgp_file: peer.user_pgp_file.clone(),
                 route_pgp_file: peer.route_pgp_file.clone(),
             });
@@ -319,6 +358,7 @@ impl DaemonConfig {
             .entries
             .iter()
             .chain(self.l0.listen_entries.iter())
+            .chain(self.l0.channels.iter().flat_map(|c| c.listen_entries.iter()))
         {
             allow_existing_http_host(entry)?;
         }
@@ -326,6 +366,46 @@ impl DaemonConfig {
             Some(raw) => Some(normalize_eoa(raw)?),
             None => None,
         };
+        let mut channels = Vec::new();
+        let mut channel_ports = HashSet::new();
+        let mut channel_eoas = HashSet::new();
+        for ch in &self.l0.channels {
+            if ch.ports.is_empty() {
+                return Err(L0dError::Config(
+                    "l0.channels entry needs at least one overlay port".into(),
+                ));
+            }
+            for port in &ch.ports {
+                if *port == 0 {
+                    return Err(L0dError::Config("l0.channels port 0 is not allowed".into()));
+                }
+                if !channel_ports.insert(*port) {
+                    return Err(L0dError::Config(format!(
+                        "l0.channels overlay port {port} is assigned twice"
+                    )));
+                }
+            }
+            let eoa = normalize_eoa(&ch.routing_eoa)?;
+            if !channel_eoas.insert(eoa.clone()) {
+                return Err(L0dError::Config(
+                    "l0.channels routing_eoa must be unique per listen SSE".into(),
+                ));
+            }
+            let mut listen_entries = if ch.listen_entries.is_empty() {
+                self.l0.listen_entries.clone()
+            } else {
+                ch.listen_entries.clone()
+            };
+            listen_entries.retain(|e| !e.trim().is_empty());
+            channels.push(ValidatedL0Channel {
+                ports: ch.ports.clone(),
+                routing_eoa: eoa,
+                routing_key_file: ch.routing_key_file.clone(),
+                routing_eth_key_file: ch.routing_eth_key_file.clone(),
+                mailbox_route_pgp_file: ch.mailbox_route_pgp_file.clone(),
+                listen_entries,
+            });
+        }
 
         Ok(ValidatedConfig {
             raw: self.clone(),
@@ -343,6 +423,7 @@ impl DaemonConfig {
                 routing_key_file: self.l0.routing_key_file.clone(),
                 routing_eth_key_file: self.l0.routing_eth_key_file.clone(),
                 mailbox_route_pgp_file: self.l0.mailbox_route_pgp_file.clone(),
+                channels,
             },
         })
     }
@@ -357,6 +438,35 @@ impl ValidatedConfig {
             .iter()
             .find(|p| &p.locator == locator)
             .map(|p| p.vip)
+    }
+
+    pub fn lookup_peer(&self, dest: Ipv4Addr, port: u16) -> Option<&ValidatedPeer> {
+        if dest == self.local_vip {
+            return None;
+        }
+        self.peers.iter().find(|p| {
+            p.vip == dest && (p.tcp_ports.contains(&port) || p.udp_ports.contains(&port))
+        })
+    }
+
+    pub fn overlay_ports(&self) -> HashSet<u16> {
+        if !self.l0.channels.is_empty() {
+            return self
+                .l0
+                .channels
+                .iter()
+                .flat_map(|c| c.ports.iter().copied())
+                .collect();
+        }
+        let mut ports: HashSet<u16> = self
+            .peers
+            .iter()
+            .flat_map(|p| p.tcp_ports.iter().chain(p.udp_ports.iter()).copied())
+            .collect();
+        if ports.is_empty() {
+            ports = crate::packet::default_overlay_port_set();
+        }
+        ports
     }
 }
 
@@ -381,7 +491,54 @@ mod tests {
         assert!(!validated.l0.enabled);
         assert_eq!(validated.l0.rpc, "https://rpc1.conet.network");
         assert!(validated.l0.routing_eth_key_file.is_none());
+        assert!(validated.l0.channels.is_empty());
         assert!(raw.contains("routing_eth_key_file"));
+        assert!(raw.contains("l0.channels"));
+    }
+
+    #[test]
+    fn same_vip_two_ports_is_ok() {
+        let mut cfg: DaemonConfig = toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+            .expect("parse example");
+        cfg.peers[1].udp_ports = vec![4300];
+        let validated = cfg.validate().expect("same vip geth+beacon");
+        assert_eq!(validated.peers.len(), 2);
+        assert!(validated.lookup_peer("100.64.0.1".parse().unwrap(), 8400).is_some());
+        assert!(validated.lookup_peer("100.64.0.1".parse().unwrap(), 4200).is_some());
+        assert!(validated.lookup_peer("100.64.0.1".parse().unwrap(), 4300).is_some());
+    }
+
+    #[test]
+    fn reject_duplicate_port_on_same_vip() {
+        let mut cfg: DaemonConfig = toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+            .expect("parse example");
+        cfg.peers[1].tcp_ports = vec![8400];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_duplicate_channel_eoa() {
+        let mut cfg: DaemonConfig = toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+            .expect("parse example");
+        cfg.l0.channels = vec![
+            L0ChannelConfig {
+                ports: vec![8400],
+                routing_eoa: "0x1111111111111111111111111111111111111111".into(),
+                routing_key_file: "/tmp/a.key".into(),
+                routing_eth_key_file: "/tmp/a.eth".into(),
+                mailbox_route_pgp_file: "/tmp/a.asc".into(),
+                listen_entries: vec!["https://node.conet.network".into()],
+            },
+            L0ChannelConfig {
+                ports: vec![4200],
+                routing_eoa: "0x1111111111111111111111111111111111111111".into(),
+                routing_key_file: "/tmp/b.key".into(),
+                routing_eth_key_file: "/tmp/b.eth".into(),
+                mailbox_route_pgp_file: "/tmp/b.asc".into(),
+                listen_entries: vec!["https://node.conet.network".into()],
+            },
+        ];
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

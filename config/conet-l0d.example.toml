@@ -22,6 +22,7 @@ tcp_ports = [8400]
 locator = "web3://HubTag.web3/p2p/beacon"
 vip = "100.64.0.1"
 tcp_ports = [4200]
+# udp_ports = [4300]
 
 # P1 overlay /post client. Default off. When enabled and peer user+route PGP
 # files plus an entry are set, the daemon encrypts, wraps, and POSTs.
@@ -38,6 +39,21 @@ tcp_ports = [4200]
 # L0_ONLY lab may advertise the overlay vIP. Do not bind RPC/Engine to it.
 # Outbound POST tries each [l0].entries host once; it does not fall back
 # onto listen_entries.
+#
+# Optional per-port listen wallets (geth :8400, beacon TCP :4200, discv5 :4300).
+# Each channel is a dedicated routing EOA + OpenPGP secret + EIP-191 key +
+# mailbox B route public key + listen SSE. Outbound encrypts to the peer
+# user PGP for that overlay port. Same VIP may have several [[peers]] rows.
+# Empty [[l0.channels]] keeps one routing EOA for all overlay ports.
+# :4300 is still overlay IPv4 (not SI udp_relay). listenKind stays "chat".
+#
+# [[l0.channels]]
+# ports = [8400]
+# routing_eoa = "0x<geth-routing-eoa>"
+# routing_key_file = "/etc/conet-l0d/geth.key"
+# routing_eth_key_file = "/etc/conet-l0d/geth.eth"
+# mailbox_route_pgp_file = "/etc/conet-l0d/geth-mailbox-route.asc"
+# listen_entries = ["https://<existing-guardian>.conet.network"]
 #
 # [l0]
 # enabled = false
