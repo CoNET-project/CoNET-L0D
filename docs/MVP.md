@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **Paired:** [中文](./MVP.zh-CN.md)  
-**Revision:** 2026-08-18 (crate MVP still accepted; authorized L0_ONLY `.45` advertises overlay vIP; overlay geth + beacon TCP proven; CL initial-sync in progress — see [P1.md](./P1.md))
+**Revision:** 2026-08-18 (crate MVP still accepted; authorized L0_ONLY `.45` advertises overlay vIP; overlay geth + beacon TCP proven; follow-the-chain Prysm-bound — see [P1.md](./P1.md); DHT drop recovery and ~17:28Z `restart-beacon` in [P2.md](./P2.md))
 
 Public how-to: [Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -25,8 +25,8 @@ Ship an independent **Linux command** `conet-l0d` that operators can start and s
 
 ## Out of scope (not a failed MVP)
 
-- Production mailbox delivery (P1 crate can POST existing `/post` and ingest SI gossip JSON `{ "data": "<armor>" }`; an authorized lab may enable `[l0]`; 2026-08-18 lab advertises overlay vIP on `.45`, completed overlay geth + beacon TCP, and is running CL initial-sync; EL still `0x0` — see [P1.md](./P1.md))
-- UDP discv4 / discv5 capture
+- Production mailbox delivery (P1 crate can POST existing `/post` and ingest SI gossip JSON `{ "data": "<armor>" }`; an authorized lab may enable `[l0]`; 2026-08-18 lab advertises overlay vIP on `.45`, completed overlay geth + beacon TCP; after the batching binary the limiter is Prysm initial-sync at ~3.2 blocks/s; EL still `0x0`; watch `scripts/watch-l0-follow.sh` — see [P1.md](./P1.md))
+- Production discv4 / discv5 (lab overlay UDP + live discv5 via L0: [P2.md](./P2.md); drop recovery is `overlay-dht-steer.sh apply` first; authorized `.45` `restart-beacon` only after dial backoff; after DNAT, `.45` `ss` may show hub public `:4200` — original dest, not a leak; not a closed P2 / production product)
 - Validator proxy or keystore access
 - New SI commands or new hostnames
 - The crate restarting geth / beacon / validator (an authorized **operator** script may restart **only** `.45` for L0_ONLY; never `.98` unless that host is authorized; never wipe)

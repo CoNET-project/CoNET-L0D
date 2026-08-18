@@ -43,8 +43,9 @@ LAB_45_ENODE="${LAB_45_ENODE:-enode://0c0a77bc4cd67ae806bc4e020ff7c39fbebfabb3fc
 HUB_BOOTNODES="${HUB_BOOTNODES:-enode://e5fe89d9ad924db6e4699480242a12fccba2c00e35772db706e46190c0ded9bb2b7e0d996826f5e46d369e01336213ef263c5038f94552e5f5e6e8ec76573a3f@38.102.126.30:8400,enode://d9243095bca94720f88d38c93ae4ccefc8b67651c66b4c93c915f845f6abfd39a091465db02db32b1a5b8061566c1558d2e6842f75620bf533480bab8a180168@38.102.126.50:8400,enode://5cf9a159e641318cda27e6bc1b4185667c0cdb1b54c3df5b8626eacbacea93af64c243dbdd09b40c62ba24792d0afc571cf17cbc47a5ed5a6207f27054c01d65@216.225.202.23:8400,enode://8e09d44bb4c29543a172e53dd8a74677a2a63d3d98a3d530f9d8b6f6bd6802a542f5b79d509ff737a9a764a66ab44a81403597cb50e350178ddd91f487e28f2d@216.225.202.22:8400,enode://dc0624c81896cdec036af7096886b1629a288b4824a467038df645c5c6b0f7fe75e13758ea80c0c37ba6245b221680db1fb553d564e54b55410eb6063bb64ca0@216.225.197.3:8400,enode://f1e249c97ce861441b3bd4832213cc634dd5c23d1a8722cd9c1aea28492779f6b64e012e8d97d56006d69be5224903ea5a787d8af68e9542db82ac1f76491dd5@216.225.202.82:8400}"
 EXECUTION_BOOTNODES="${EXECUTION_BOOTNODES:-${HUB_BOOTNODES},${LAB_45_ENODE}}"
 
-# Static beacon peer to the .45 lab (public IP). Not a validator endpoint.
-EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-/ip4/74.208.224.45/tcp/4200/p2p/16Uiu2HAmQ44qLDvJHzdsqwP1BrytjoGaav6jw6trSZhXLaU5pQFg}"
+# Lab DHT server: do not dial the .45 public :4200 (isolate drops it; old peer id is stale).
+# Leave empty so this host stays a public discv5 hub. Overlay .45 finds it via ENR + L0 steer.
+EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 require_file() { [[ -f "$1" ]] || die "Missing file: $1"; }
@@ -83,6 +84,11 @@ stop_geth() {
 	stop_pid_file geth "$NODE_DIR/geth.pid" 90
 }
 
+stop_beacon() {
+	echo "Stopping beacon only (geth/validator untouched, data preserved)"
+	stop_pid_file beacon "$NODE_DIR/beacon.pid" 30
+}
+
 wait_for_port() {
 	local host="$1" port="$2" name="$3" retries="${4:-120}"
 	echo "Waiting for $name at $host:$port ..."
@@ -106,6 +112,15 @@ load_colo_args() {
 		if declare -F p2p_colocation_whitelist_args >/dev/null 2>&1; then
 			mapfile -t COLO_ARGS < <(p2p_colocation_whitelist_args || true)
 		fi
+	fi
+	# Overlay vIPs share one public host; allow 100.64.0.0/10 so L0 DHT clients are not coloc-kicked.
+	local overlay_wl=0
+	local arg
+	for arg in "${COLO_ARGS[@]+"${COLO_ARGS[@]}"}"; do
+		[[ "$arg" == *100.64.0.0/10* ]] && overlay_wl=1
+	done
+	if ((overlay_wl == 0)); then
+		COLO_ARGS+=(--p2p-colocation-whitelist=100.64.0.0/10)
 	fi
 }
 
@@ -190,6 +205,7 @@ start_beacon() {
 		--p2p-tcp-port="$PRYSM_BEACON_P2P_TCP_PORT" \
 		--p2p-udp-port="$PRYSM_BEACON_P2P_UDP_PORT" \
 		--p2p-host-ip="$ADVERTISE_IP" \
+		--p2p-static-id \
 		--p2p-max-peers=40 \
 		--disable-staking-contract-check \
 		--min-sync-peers="$MIN_SYNC_PEERS" \
@@ -288,11 +304,17 @@ stop-geth)
 	stop_geth
 	show_status
 	;;
+restart-beacon)
+	stop_beacon
+	start_beacon
+	show_status
+	echo "Beacon restarted with --p2p-static-id. geth untouched. Re-apply overlay-beacon-listen-dnat.sh."
+	;;
 status)
 	show_status
 	;;
 *)
-	echo "Usage: $0 {start|stop|restart|status|start-geth|stop-geth}"
+	echo "Usage: $0 {start|stop|restart|status|start-geth|stop-geth|restart-beacon}"
 	exit 1
 	;;
 esac

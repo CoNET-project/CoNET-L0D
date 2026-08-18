@@ -27,7 +27,7 @@ impl ForwardStats {
         };
         self.ipv4_packets += 1;
         let locator = lookup_dest(cfg, dest);
-        tracing::info!(
+        tracing::debug!(
             dest = %dest,
             packets = self.ipv4_packets,
             "overlay IPv4 on TUN"

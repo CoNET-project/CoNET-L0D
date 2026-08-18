@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **成对：** [English](./MVP.md)  
-**Revision：** 2026-08-18（crate MVP 仍验收；授权 L0_ONLY `.45` 通告 overlay vIP；overlay geth + beacon TCP 已证明；CL initial-sync 进行中 — 见 [P1.zh-CN.md](./P1.zh-CN.md)）
+**Revision：** 2026-08-18（crate MVP 仍验收；授权 L0_ONLY `.45` 通告 overlay vIP；overlay geth + beacon TCP 已证明；追链受 Prysm 限速 — 见 [P1.zh-CN.md](./P1.zh-CN.md)；DHT 掉线恢复与约 17:28Z `restart-beacon` 见 [P2.zh-CN.md](./P2.zh-CN.md)）
 
 公开 how-to：[Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -25,8 +25,8 @@
 
 ## 范围外（不算 MVP 失败）
 
-- 生产 mailbox 投递（P1 crate 可 POST 现役 `/post`，并解析 SI gossip JSON `{ "data": "<armor>" }`；经授权实验室可开 `[l0]`；2026-08-18 实验室 `.45` 通告 overlay vIP，overlay geth + beacon TCP 已通，CL initial-sync 进行中；EL 仍为 `0x0` — 见 [P1.zh-CN.md](./P1.zh-CN.md)）
-- 捕获 UDP discv4 / discv5
+- 生产 mailbox 投递（P1 crate 可 POST 现役 `/post`，并解析 SI gossip JSON `{ "data": "<armor>" }`；经授权实验室可开 `[l0]`；2026-08-18 实验室 `.45` 通告 overlay vIP，overlay geth + beacon TCP 已通；合批二进制之后限速是 Prysm initial-sync 约 3.2 块/秒；EL 仍为 `0x0`；只读抽检 `scripts/watch-l0-follow.sh` — 见 [P1.zh-CN.md](./P1.zh-CN.md)）
+- 生产 discv4 / discv5（实验室 overlay UDP + 经 L0 的现役 discv5 见 [P2.zh-CN.md](./P2.zh-CN.md)；掉线先 `overlay-dht-steer.sh apply` 清幽灵 conntrack；授权 `.45` `restart-beacon` 仅用于拨号 backoff；DNAT 后 `.45` `ss` 可能显示枢纽公网 `:4200`（原目的，不是漏公网）；不是已关闭的 P2 / 生产产品）
 - 代理 validator 或读取 keystore
 - 新 SI 命令或新域名
 - crate 自己重启 geth / beacon / validator（经授权的**操作员**脚本可以只重启 **`.45`** 做 L0_ONLY；未授权不要动 `.98`；禁止 wipe）

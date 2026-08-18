@@ -8,6 +8,10 @@ use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
+
+const TUN_WRITE_QUEUE: usize = 1024;
+const OVERLAY_FLUSH_IDLE_MS: u64 = 5;
 
 const COMMENT: &str = "conet-l0d";
 
@@ -79,7 +83,7 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     let mut writer = tokio::fs::File::from_std(writer_std);
     let mut buf = vec![0u8; 2048];
     let mut stats = ForwardStats::new(cfg);
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(TUN_WRITE_QUEUE);
     stats.l0.attach_tun_writer(tx);
     let mut inbound_rx = stats.l0.take_inbound_rx();
     tokio::spawn(async move {
@@ -91,12 +95,13 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     });
     loop {
         tokio::select! {
-            read = file.read(&mut buf) => {
-                let n = read?;
-                if n == 0 {
-                    break;
+            read = timeout(Duration::from_millis(OVERLAY_FLUSH_IDLE_MS), file.read(&mut buf)) => {
+                match read {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => stats.on_tun_frame(cfg, &buf[..n]),
+                    Ok(Err(err)) => return Err(err.into()),
+                    Err(_) => stats.l0.flush_pending_overlay(),
                 }
-                stats.on_tun_frame(cfg, &buf[..n]);
             }
             armor = recv_inbound_armor(&mut inbound_rx) => {
                 match armor {

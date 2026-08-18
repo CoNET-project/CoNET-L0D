@@ -27,9 +27,9 @@ beacon-chain \
   --execution-endpoint=http://127.0.0.1:8551
 ```
 
-`--p2p-host-ip` is **advertise only**. Prysm still listens on the host public IP. A peer that stays on the public advertise path (lab `.98`) needs overlay `:4200` DNAT/SNAT into that listen. Do **not** edit daemon-owned `CONET_L0D`.
+`--p2p-host-ip` is **advertise only**. Prysm still listens on the host public IP. A peer that stays on the public advertise path (lab `.98`) needs overlay-VIP tcp/udp DNAT/SNAT into that listen (`overlay-beacon-listen-dnat.sh`; any port except geth `:8400`). The TUN needs `accept_local` / `route_localnet` / `rp_filter=0` so DNAT to that local public listen reaches the socket. Do **not** edit daemon-owned `CONET_L0D`.
 
-The 2026-08-18 00:17Z lab: `.45` advertises `100.64.0.5`; overlay geth and beacon TCP are ESTAB; CL initial-sync is running over overlay; EL is still `0x0`. Production proposers keep public P2P for the 6-second slot.
+The 2026-08-18 00:17Z lab: `.45` advertises `100.64.0.5`; overlay geth and beacon TCP are ESTAB; CL initial-sync is running over overlay; EL is still `0x0`. Later crate builds dest-aggregate IPv4 and POST with concurrency 32 / queue 2048; upgrade both lab `conet-l0d` binaries together. After that binary, overlay is not the limiter; Prysm initial-sync is ~3.2 blocks/s (~15 h). Read-only watch: `scripts/watch-l0-follow.sh`. Follow-the-chain is not complete. Lab overlay UDP / DHT-port comms: `scripts/probe-l0-udp.sh`, `overlay-dht-steer.sh` (TCP `:4200` + UDP `:4300`), `L0_DHT=1` via `enable-l0-dht`. After authorized `restart-beacon` on `.45` (geth untouched; **2026-08-18 ~17:28Z**), live discv5 + libp2p TCP from `.45` to the `.98` DHT server rides L0. If `connected` later drops, `overlay-dht-steer.sh apply` first (no EL/CL restart). See [P2.md](./P2.md). Production proposers keep public P2P for the 6-second slot.
 
 ## L0_ONLY lab (authorized `.45` only)
 
@@ -46,6 +46,8 @@ beacon-chain --no-discovery --disable-quic \
   --p2p-host-ip=100.64.0.5 --p2p-static-id \
   --peer /ip4/100.64.0.6/tcp/4200/p2p/<peer-id>
 ```
+
+Lab DHT-port comms (`L0_DHT=1`): drop `--no-discovery`, keep `--disable-quic`, do **not** pull public `:4110` ENRs. When `L0_DHT_BOOTSTRAP_ENR` is set (`.98` localhost identity after `--p2p-static-id`), the default also drops the static overlay `--peer` so discv5 is the only beacon path. Set `L0_DHT_NO_STATIC_PEER=0` to keep overlay `--peer` **and** discv5 (P1 recovery when listen/SSE was down; not the accepted DHT path). Allowlist is `--p2p-allowlist=100.64.0.0/10` then `--p2p-allowlist=198.251.77.98/32` (Prysm v7.1.4: one CIDR per flag, last wins) so Prysm can dial the public ENR; `overlay-dht-steer.sh` must DNAT hub `:4300`/`:4200` onto `100.64.0.6` (fail-closed if missing). Isolate still DROPs unsteered public P2P. Write env with `enable-l0-dht` (no restart), then authorized `restart-beacon`. Apply steer on `.45` and `overlay-beacon-listen-dnat.sh` on **both** hosts (VIP-wide tcp/udp except `:8400`). If beacon `connected` later drops while overlay geth stays ESTAB, **re-apply `overlay-dht-steer.sh` first** (flushes ghost hub `:4200/:4300` conntrack; **do not** restart geth or beacon for that). Only if `connected` stays 0 is an authorized `.45` `restart-beacon` needed (Prysm dial backoff). After that restart, do **not** re-apply steer immediately (flushes SYN_SENT). `.45` `ss` may show ESTAB to hub public `:4200` (DNAT original dest); overlay proof is TUN `100.64.0.5` ↔ `100.64.0.6:4200` plus isolate `tcp dpt:4200` DROP = 0. First-minute `suitable=0` then `Processing blocks` is expected. EL `0x0` while `head_slot` climbs is CL lag. This is **not** `FOLLOW_OK`. The 2026-08-18 ~17:28Z lab: `.45` `connected=1` after authorized `restart-beacon`; geth pid unchanged. See [P2.md](./P2.md).
 
 Restore public P2P: `./start-geth-beacon-only.sh stop-isolate` then a normal `restart`. Do not wipe. Do not restart `.98` unless that host is authorized.
 

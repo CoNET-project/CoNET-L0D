@@ -17,7 +17,7 @@ Linux userspace daemon that lets CoNET L1 `geth` and Prysm `beacon-chain` use **
 
 Operators do **not** run `iptables` by hand.
 
-**Maturity: under development.** Crate MVP is accepted (CLI, locator, TUN / iptables lifecycle, packet counters). P1 outbound encrypt + mailbox wrap + `POST { data }`, inbound decrypt + TUN write-back, and an EIP-191 listen HTTP+SSE worker exist in-crate and default **off**. Listen ingest matches SI `forWardPGPMessageToClient` raw JSON `{ "data": "<armor>" }` (Chat `handleInbound`), not only SSE armor lines. In-crate listen matches SI `checkSign`. An authorized lab may enable `[l0]`. The 2026-08-18 lab on authorized L0_ONLY `.45` advertises overlay vIP `100.64.0.5`, completed overlay geth + beacon TCP, and is running CL initial-sync over overlay; EL is still `0x0`. Production mailbox delivery is **not** shipped. Production proposers keep public P2P (geth `8400`, beacon `4200` / `4300`) for the 6-second slot.
+**Maturity: under development.** Crate MVP is accepted (CLI, locator, TUN / iptables lifecycle, packet counters). P1 outbound encrypt + mailbox wrap + `POST { data }`, inbound decrypt + TUN write-back, and an EIP-191 listen HTTP+SSE worker exist in-crate and default **off**. Listen ingest matches SI `forWardPGPMessageToClient` raw JSON `{ "data": "<armor>" }` (Chat `handleInbound`), not only SSE armor lines. In-crate listen matches SI `checkSign`. An authorized lab may enable `[l0]`. The 2026-08-18 lab on authorized L0_ONLY `.45` advertises overlay vIP `100.64.0.5`, completed overlay geth + beacon TCP, and is running CL initial-sync over overlay; after the batching binary the limiter is Prysm (~3.2 blocks/s); EL is still `0x0`. Lab overlay UDP echo and `:4300` (direct + public-ENR steer) arrived on the peer TUN; live discv5 from L0_ONLY `.45` to the `.98` DHT server over L0 is **accepted** (not a production product). Production mailbox delivery is **not** shipped. Production proposers keep public P2P (geth `8400`, beacon `4200` / `4300`) for the 6-second slot.
 
 ## What it is not
 
@@ -96,7 +96,7 @@ beacon-chain --p2p-host-ip=100.64.0.5 --p2p-tcp-port=4200 --p2p-udp-port=4300 \
 
 Advertise-only flags do **not** stop the clients when the TUN is down. Binding `--http.addr`, `--authrpc.addr`, `--p2p-local-ip`, or `--rpc-host` to the overlay vIP can fail startup. Details: [docs/operator-flags.md](docs/operator-flags.md).
 
-Phase 1 uses **static** overlay peers. Do not expect discv4 / discv5 to ride L0.
+Phase 1 uses **static** overlay peers. The crate envelope already carries IPv4 including UDP. A lab may prove overlay UDP / DHT-port comms and live discv5 via L0 ([docs/P2.md](docs/P2.md)); that is not a production discv5 product.
 
 ## Safety
 
@@ -114,6 +114,7 @@ Phase 1 uses **static** overlay peers. Do not expect discv4 / discv5 to ride L0.
 | [白皮书（简体中文）](whitepaper/conet-l0d.zh-CN.md) | Paired translation |
 | [MVP](docs/MVP.md) · [MVP（中文）](docs/MVP.zh-CN.md) | Accepted crate MVP |
 | [P1](docs/P1.md) · [P1（中文）](docs/P1.zh-CN.md) | Overlay `/post` encrypt + mailbox wrap + POST; inbound decrypt + TUN write-back; EIP-191 listen worker; SI gossip JSON ingest; `[l0]` default off; authorized lab may enable `[l0]`; 2026-08-18: `.45` advertises overlay vIP; overlay geth + beacon TCP; CL initial-sync in progress |
+| [P2](docs/P2.md) · [P2（中文）](docs/P2.zh-CN.md) | Lab overlay UDP / DHT-port comms (echo + `:4300` + public-ENR steer + live discv5 via L0). Not a closed P2 / production product |
 | [Operator flags](docs/operator-flags.md) | geth / beacon advertise flags |
 | [RULES.md](RULES.md) | Engineering constraints |
 | [GitBook Applications](https://gitbook.conet.network/applications/conet-l0d.html) | Operator how-to |
@@ -125,9 +126,9 @@ A change to the whitepaper, `RULES.md`, or MVP must update **both** GitBook page
 
 ## What this revision does / does not
 
-**Does:** overlay vIP table, `web3://` locator parse, TUN + iptables lifecycle, packet counters, P1 encrypt + mailbox wrap + `POST { data }` when `[l0]` is on and peer user+route PGP files plus an entry exist (default **off**), inbound user-PGP decrypt + TUN write queue when `routing_key_file` is set, EIP-191 listen HTTP+SSE worker when enabled plus `listen_entries`, `mailbox_route_pgp_file`, `routing_eoa`, `routing_key_file`, and `routing_eth_key_file`. Listen ingest accepts SI gossip JSON `{ "data": "<armor>" }`. An authorized lab may enable `[l0]`.
+**Does:** overlay vIP table, `web3://` locator parse, TUN + iptables lifecycle, packet counters, P1 encrypt + mailbox wrap + `POST { data }` when `[l0]` is on and peer user+route PGP files plus an entry exist (default **off**), dest-aggregated IPv4 batch in `ipv4` (POST concurrency 32 / queue 2048; inbound TUN write queue 1024), inbound user-PGP decrypt + TUN write queue when `routing_key_file` is set, EIP-191 listen HTTP+SSE worker when enabled plus `listen_entries`, `mailbox_route_pgp_file`, `routing_eoa`, `routing_key_file`, and `routing_eth_key_file`. Listen ingest accepts SI gossip JSON `{ "data": "<armor>" }`. An authorized lab may enable `[l0]`.
 
-**Does not (yet):** finish L0-only follow-the-chain (2026-08-18: overlay geth + beacon TCP proven; CL initial-sync in progress; `.45` EL still `0x0`), production mailbox delivery, UDP discv4 / discv5 capture, validator proxying, a live SI `p2p_stream_*` command. The crate never restarts geth/beacon; an authorized operator script may restart only `.45` for L0_ONLY.
+**Does not (yet):** finish L0-only follow-the-chain (2026-08-18: overlay TCP proven; after the batching binary the limiter is Prysm initial-sync at ~3.2 blocks/s, ~15 h; `.45` EL still `0x0`; watch with `scripts/watch-l0-follow.sh`), production mailbox delivery, production discv4 / discv5 (lab discv5 via L0 is accepted — [docs/P2.md](docs/P2.md); if `connected` drops, `overlay-dht-steer.sh apply` first; authorized `.45` `restart-beacon` only after dial backoff; after DNAT, `.45` `ss` may show hub public `:4200` — original dest, not a leak), validator proxying, a live SI `p2p_stream_*` command. The crate never restarts geth/beacon; an authorized operator script may restart only the named lab host.
 
 ## License
 

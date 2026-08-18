@@ -3,10 +3,17 @@
 # Does NOT start validator. Does NOT wipe datadir. Does NOT geth init.
 # Do not run leftover 06_restart_node22445.sh start (that script starts validator).
 #
-# L0_ONLY=1 (or $LAB_DIR/run/l0-only.env): no DHT bootstrap, no public bootnodes,
-# --nodiscover / beacon --no-discovery, overlay bootnode/peer to .98 only,
+# L0_ONLY=1 (or $LAB_DIR/run/l0-only.env): no public bootnodes,
+# --nodiscover / beacon --no-discovery (unless L0_DHT=1), overlay bootnode/peer to .98 only,
 # INPUT+OUTPUT isolate chain CONET_L0D_P2P_ISOLATE* (never touch CONET_L0D).
 # L0_ONLY advertises the overlay vIP (100.64.0.5). Do not bind RPC to it.
+# L0_DHT=1 (lab comms test): drop beacon --no-discovery; do NOT pull public :4110 ENRs.
+# With L0_DHT_BOOTSTRAP_ENR set, drop the static overlay --peer so discv5 is the
+# only beacon path. Allowlist is overlay plus the DHT hub public /32 so Prysm can
+# dial the public ENR; overlay-dht-steer.sh must DNAT that IP :4300/:4200 onto
+# 100.64.0.6 (fail-closed if missing). Isolate still DROPs unsteered public P2P.
+# Requires overlay listen DNAT/SNAT on the public-advertise peer. Does not close
+# the P1 follow-the-chain gate. Crate already carries IPv4/UDP.
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/peter/ethereum-pos-mainnet}"
@@ -44,12 +51,18 @@ LAB_98_ENODE="${LAB_98_ENODE:-enode://006561987aaeea06a6f2c54d37656a4acccd0c1e16
 HUB_BOOTNODES="${HUB_BOOTNODES:-enode://e5fe89d9ad924db6e4699480242a12fccba2c00e35772db706e46190c0ded9bb2b7e0d996826f5e46d369e01336213ef263c5038f94552e5f5e6e8ec76573a3f@38.102.126.30:8400,enode://d9243095bca94720f88d38c93ae4ccefc8b67651c66b4c93c915f845f6abfd39a091465db02db32b1a5b8061566c1558d2e6842f75620bf533480bab8a180168@38.102.126.50:8400,enode://5cf9a159e641318cda27e6bc1b4185667c0cdb1b54c3df5b8626eacbacea93af64c243dbdd09b40c62ba24792d0afc571cf17cbc47a5ed5a6207f27054c01d65@216.225.202.23:8400,enode://8e09d44bb4c29543a172e53dd8a74677a2a63d3d98a3d530f9d8b6f6bd6802a542f5b79d509ff737a9a764a66ab44a81403597cb50e350178ddd91f487e28f2d@216.225.202.22:8400,enode://dc0624c81896cdec036af7096886b1629a288b4824a467038df645c5c6b0f7fe75e13758ea80c0c37ba6245b221680db1fb553d564e54b55410eb6063bb64ca0@216.225.197.3:8400,enode://f1e249c97ce861441b3bd4832213cc634dd5c23d1a8722cd9c1aea28492779f6b64e012e8d97d56006d69be5224903ea5a787d8af68e9542db82ac1f76491dd5@216.225.202.82:8400}"
 EXECUTION_BOOTNODES="${EXECUTION_BOOTNODES:-${HUB_BOOTNODES},${LAB_98_ENODE}}"
 
-# Static beacon peer to the .98 lab (public IP). Applied at next beacon start only.
-EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-/ip4/198.251.77.98/tcp/4200/p2p/16Uiu2HAmDb9FNGMYhC7p7rrLEBGA9HujPZda1KHWKvJfox9YRwDA}"
+# Static beacon peer (non-DHT L0_ONLY). Live .98 --p2p-static-id (2026-08-18).
+# L0_DHT with a bootstrap ENR does not use --peer.
+EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-/ip4/198.251.77.98/tcp/4200/p2p/16Uiu2HAmF1SXGHnne9DQTHGfgGQgje3cBV8pdSLJF25ajYKr2hvS}"
 
 L0_OVERLAY_ENODE="${L0_OVERLAY_ENODE:-enode://006561987aaeea06a6f2c54d37656a4acccd0c1e16c9025700be1cfc45c6b79596293426694f0cf5eccacc1f92392628a93adb52c607b86b78f8601e5247459b@100.64.0.6:8400}"
-L0_OVERLAY_BEACON_PEER="${L0_OVERLAY_BEACON_PEER:-/ip4/100.64.0.6/tcp/4200/p2p/16Uiu2HAmDb9FNGMYhC7p7rrLEBGA9HujPZda1KHWKvJfox9YRwDA}"
+L0_OVERLAY_BEACON_PEER="${L0_OVERLAY_BEACON_PEER:-/ip4/100.64.0.6/tcp/4200/p2p/16Uiu2HAmF1SXGHnne9DQTHGfgGQgje3cBV8pdSLJF25ajYKr2hvS}"
+# Combined /tcp/4200/udp/4300 is one multiaddr; libp2p reports "no transport for protocol"
+# and falls back to the hub public IP, which isolate then times out. discv5 uses ENR+steer.
 L0_NETRESTRICT="${L0_NETRESTRICT:-100.64.0.0/10}"
+L0_DHT_HUB_PUBLIC_IP="${L0_DHT_HUB_PUBLIC_IP:-198.251.77.98}"
+L0_DHT_HUB_OVERLAY_VIP="${L0_DHT_HUB_OVERLAY_VIP:-100.64.0.6}"
+L0_DHT_STEER_CHAIN="${L0_DHT_STEER_CHAIN:-CONET_L0D_DHT_STEER}"
 L0_ONLY_ENV="${L0_ONLY_ENV:-$LAB_DIR/run/l0-only.env}"
 ISOLATE_CHAIN="${ISOLATE_CHAIN:-CONET_L0D_P2P_ISOLATE}"
 ISOLATE_OUT_CHAIN="${ISOLATE_OUT_CHAIN:-CONET_L0D_P2P_ISOLATE_OUT}"
@@ -60,6 +73,15 @@ if [[ -f "$L0_ONLY_ENV" ]]; then
 	source "$L0_ONLY_ENV"
 fi
 L0_ONLY="${L0_ONLY:-0}"
+L0_DHT="${L0_DHT:-0}"
+# Optional discv5 bootstrap. .98 gateway is loopback-only; write the ENR taken
+# from that host's localhost identity after its --p2p-static-id restart.
+# When this ENR is set, L0_DHT drops the static overlay --peer (discv5 only).
+# That is not a ban on dialing the hub public IP in the ENR: allowlist includes
+# the hub /32 so libp2p can connect(); packets must still ride L0 via steer.
+L0_DHT_BOOTSTRAP_ENR="${L0_DHT_BOOTSTRAP_ENR:-}"
+L0_DHT_IDENTITY_URL="${L0_DHT_IDENTITY_URL:-}"
+L0_DHT_NO_STATIC_PEER="${L0_DHT_NO_STATIC_PEER:-}"
 
 resolve_advertise_ip() {
 	if [[ -n "${ADVERTISE_IP:-}" ]]; then
@@ -108,6 +130,23 @@ l0_only_on() {
 	[[ "${L0_ONLY}" == "1" || "${L0_ONLY}" == "true" || "${L0_ONLY}" == "yes" ]]
 }
 
+l0_dht_on() {
+	[[ "${L0_DHT}" == "1" || "${L0_DHT}" == "true" || "${L0_DHT}" == "yes" ]]
+}
+
+l0_dht_no_static_peer() {
+	# Explicit 0 keeps overlay --peer even when a bootstrap ENR is set.
+	# Needed to recover P1 follow-the-chain if discv5-only cannot ESTAB.
+	if [[ "${L0_DHT_NO_STATIC_PEER}" == "0" || "${L0_DHT_NO_STATIC_PEER}" == "false" || "${L0_DHT_NO_STATIC_PEER}" == "no" ]]; then
+		return 1
+	fi
+	if [[ "${L0_DHT_NO_STATIC_PEER}" == "1" || "${L0_DHT_NO_STATIC_PEER}" == "true" || "${L0_DHT_NO_STATIC_PEER}" == "yes" ]]; then
+		return 0
+	fi
+	# Default: if we have a bootstrap ENR, abandon static --peer and use discv5.
+	[[ -n "${L0_DHT_BOOTSTRAP_ENR:-}" && "${L0_DHT_BOOTSTRAP_ENR}" == enr:* ]]
+}
+
 require_overlay_tun() {
 	ip -4 addr show dev "$TUN_IFACE" 2>/dev/null | grep -q '100.64.0.5' \
 		|| die "TUN $TUN_IFACE is not up with 100.64.0.5; start conet-l0d first"
@@ -115,15 +154,78 @@ require_overlay_tun() {
 		|| die "overlay route 100.64.0.0/10 via $TUN_IFACE is missing"
 }
 
+# L0_DHT allowlists the hub public IP so Prysm can dial the ENR. Without steer,
+# isolate DROPs that public :4200/:4300 and sync stalls. Fail closed.
+require_l0_dht_steer() {
+	local rules
+	rules="$(sudo -n iptables -t nat -S "$L0_DHT_STEER_CHAIN" 2>/dev/null || true)"
+	[[ -n "$rules" ]] || die "L0_DHT: missing $L0_DHT_STEER_CHAIN; run overlay-dht-steer.sh first"
+	[[ "$rules" == *"-d ${L0_DHT_HUB_PUBLIC_IP}"* ]] \
+		|| die "L0_DHT: $L0_DHT_STEER_CHAIN does not match hub $L0_DHT_HUB_PUBLIC_IP; run overlay-dht-steer.sh"
+	[[ "$rules" == *"-p udp"* && "$rules" == *"--dport ${PRYSM_BEACON_P2P_UDP_PORT}"* && "$rules" == *"--to-destination ${L0_DHT_HUB_OVERLAY_VIP}:${PRYSM_BEACON_P2P_UDP_PORT}"* ]] \
+		|| die "L0_DHT: $L0_DHT_STEER_CHAIN has no UDP :${PRYSM_BEACON_P2P_UDP_PORT} DNAT -> ${L0_DHT_HUB_OVERLAY_VIP}; run overlay-dht-steer.sh"
+	[[ "$rules" == *"-p tcp"* && "$rules" == *"--dport ${PRYSM_BEACON_P2P_TCP_PORT}"* && "$rules" == *"--to-destination ${L0_DHT_HUB_OVERLAY_VIP}:${PRYSM_BEACON_P2P_TCP_PORT}"* ]] \
+		|| die "L0_DHT: $L0_DHT_STEER_CHAIN has no TCP :${PRYSM_BEACON_P2P_TCP_PORT} DNAT -> ${L0_DHT_HUB_OVERLAY_VIP}; run overlay-dht-steer.sh"
+	echo "OK  L0_DHT steer $L0_DHT_HUB_PUBLIC_IP :${PRYSM_BEACON_P2P_UDP_PORT}/udp :${PRYSM_BEACON_P2P_TCP_PORT}/tcp -> $L0_DHT_HUB_OVERLAY_VIP"
+}
+
 write_l0_only_env() {
 	mkdir -p "$(dirname "$L0_ONLY_ENV")"
-	cat > "$L0_ONLY_ENV" <<'EOF'
-L0_ONLY=1
-EOF
+	{
+		echo "L0_ONLY=1"
+		if l0_dht_on; then
+			echo "L0_DHT=1"
+			if [[ -n "${L0_DHT_BOOTSTRAP_ENR:-}" ]]; then
+				printf "L0_DHT_BOOTSTRAP_ENR='%s'\n" "${L0_DHT_BOOTSTRAP_ENR//\'/}"
+			fi
+			if l0_dht_no_static_peer; then
+				echo "L0_DHT_NO_STATIC_PEER=1"
+			else
+				# Recovery only: keep overlay --peer + discv5. Not the accepted DHT path.
+				echo "L0_DHT_NO_STATIC_PEER=0"
+				printf "L0_OVERLAY_BEACON_PEER='%s'\n" "${L0_OVERLAY_BEACON_PEER//\'/}"
+			fi
+		fi
+	} > "$L0_ONLY_ENV"
 	L0_ONLY=1
 	unset ADVERTISE_IP
 	resolve_advertise_ip
-	echo "Wrote $L0_ONLY_ENV (watchdog start-geth will stay isolated; advertise=$ADVERTISE_IP)"
+	echo "Wrote $L0_ONLY_ENV (watchdog start-geth will stay isolated; advertise=$ADVERTISE_IP l0_dht=$(l0_dht_on && echo 1 || echo 0))"
+}
+
+write_l0_dht_env() {
+	L0_DHT=1
+	write_l0_only_env
+}
+
+load_l0_dht_bootstrap() {
+	BOOTSTRAP_ARGS=()
+	local json enr
+	if [[ -n "${L0_DHT_BOOTSTRAP_ENR:-}" ]]; then
+		enr="$L0_DHT_BOOTSTRAP_ENR"
+		if [[ "$enr" == enr:* ]]; then
+			echo "OK  L0_DHT bootstrap ENR from env"
+			BOOTSTRAP_ARGS+=(--bootstrap-node="$enr")
+			return 0
+		fi
+		echo "WARN L0_DHT_BOOTSTRAP_ENR is not an enr:* value"
+	fi
+	if [[ -n "${L0_DHT_IDENTITY_URL:-}" ]]; then
+		json="$(curl -s --connect-timeout 6 -m 8 "$L0_DHT_IDENTITY_URL" || true)"
+		enr="$(printf '%s' "$json" | python3 -c 'import sys,json
+try:
+ d=json.load(sys.stdin).get("data") or {}
+ print(d.get("enr") or "")
+except Exception:
+ print("")' 2>/dev/null || true)"
+		if [[ "$enr" == enr:* ]]; then
+			echo "OK  L0_DHT identity $L0_DHT_IDENTITY_URL"
+			BOOTSTRAP_ARGS+=(--bootstrap-node="$enr")
+			return 0
+		fi
+		echo "WARN $L0_DHT_IDENTITY_URL: no ENR"
+	fi
+	echo "L0_DHT: no extra bootstrap ENR; discovery will use the overlay TCP peer after steer"
 }
 
 # Dedicated isolate chains. Never flush or jump CONET_L0D (owned by conet-l0d).
@@ -135,6 +237,7 @@ apply_p2p_isolate() {
 	sudo -n iptables -F "$ISOLATE_CHAIN"
 	sudo -n iptables -A "$ISOLATE_CHAIN" -i lo -j RETURN
 	sudo -n iptables -A "$ISOLATE_CHAIN" -i "$TUN_IFACE" -j RETURN
+	sudo -n iptables -A "$ISOLATE_CHAIN" -d "$L0_NETRESTRICT" -j RETURN
 	local port
 	for port in 8400 4200 4300 13000; do
 		sudo -n iptables -A "$ISOLATE_CHAIN" -p tcp --dport "$port" -j DROP
@@ -148,6 +251,7 @@ apply_p2p_isolate() {
 	sudo -n iptables -F "$ISOLATE_OUT_CHAIN"
 	sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -o lo -j RETURN
 	sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -o "$TUN_IFACE" -j RETURN
+	sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -d "$L0_NETRESTRICT" -j RETURN
 	for port in 8400 4200 4300 13000; do
 		sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -p tcp --dport "$port" -j DROP
 		sudo -n iptables -A "$ISOLATE_OUT_CHAIN" -p udp --dport "$port" -j DROP
@@ -155,6 +259,13 @@ apply_p2p_isolate() {
 	if ! sudo -n iptables -C OUTPUT -j "$ISOLATE_OUT_CHAIN" 2>/dev/null; then
 		sudo -n iptables -I OUTPUT 1 -j "$ISOLATE_OUT_CHAIN"
 	fi
+	# Leftover filter OUTPUT DROP of overlay :8400 sits *before* isolate RETURN
+	# and kills geth static-nodes (lab 2026-08-18: 8k+ packets). Never touch CONET_L0D.
+	local overlay_vip
+	for overlay_vip in 100.64.0.5 100.64.0.6; do
+		sudo -n iptables -D OUTPUT -d "${overlay_vip}/32" -p tcp --dport 8400 -j DROP 2>/dev/null || true
+		sudo -n iptables -D OUTPUT -d "${overlay_vip}/32" -p udp --dport 8400 -j DROP 2>/dev/null || true
+	done
 	echo "P2P isolate on ($ISOLATE_CHAIN / $ISOLATE_OUT_CHAIN); CONET_L0D untouched"
 }
 
@@ -244,6 +355,9 @@ load_extra_beacon_peers() {
 	for peer in $EXTRA_BEACON_PEERS; do
 		peer="${peer//[[:space:]]/}"
 		[[ -n "$peer" ]] || continue
+		if [[ "$peer" == *"/tcp/"*"/udp/"* ]]; then
+			die "refusing combined /tcp/.../udp/... --peer ($peer); libp2p has no transport for that multiaddr. Use /ip4/<vip>/tcp/4200/p2p/<id>"
+		fi
 		echo "OK  extra beacon peer $peer"
 		PEER_ARGS+=(--peer="$peer")
 	done
@@ -308,10 +422,36 @@ start_beacon() {
 		require_overlay_tun
 		apply_p2p_isolate
 		BOOTSTRAP_ARGS=()
-		EXTRA_BEACON_PEERS="$L0_OVERLAY_BEACON_PEER"
+		if l0_dht_on; then
+			if l0_dht_no_static_peer; then
+				EXTRA_BEACON_PEERS=""
+				echo "L0_DHT: no static --peer; discv5 via bootstrap ENR + overlay steer"
+			else
+				EXTRA_BEACON_PEERS="$L0_OVERLAY_BEACON_PEER"
+			fi
+		else
+			EXTRA_BEACON_PEERS="$L0_OVERLAY_BEACON_PEER"
+		fi
 		load_extra_beacon_peers
-		extra+=(--no-discovery --disable-quic --p2p-allowlist="$L0_NETRESTRICT" --p2p-max-peers=4 --min-sync-peers=1)
-		echo "Starting beacon L0_ONLY advertise=$ADVERTISE_IP overlay-peer=$L0_OVERLAY_BEACON_PEER"
+		extra+=(--disable-quic --p2p-max-peers=4 --min-sync-peers=1)
+		if l0_dht_on; then
+			require_l0_dht_steer
+			# Prysm v7.1.4 parses one CIDR per --p2p-allowlist (comma is FATAL).
+			# Last flag wins. Successful DHT dials the hub public ENR, so hub /32
+			# must be last. Steer still DNATs that dest onto L0. Do not --peer the
+			# overlay VIP: last-wins would gater-block 100.64.0.6.
+			extra+=(--p2p-allowlist="$L0_NETRESTRICT")
+			extra+=(--p2p-allowlist="${L0_DHT_HUB_PUBLIC_IP}/32")
+			load_l0_dht_bootstrap
+			if ((${#BOOTSTRAP_ARGS[@]} == 0)) && l0_dht_no_static_peer; then
+				die "L0_DHT abandoned static --peer but has no bootstrap ENR; set L0_DHT_BOOTSTRAP_ENR"
+			fi
+			echo "Starting beacon L0_ONLY+L0_DHT advertise=$ADVERTISE_IP allowlist=$L0_NETRESTRICT then ${L0_DHT_HUB_PUBLIC_IP}/32 (last wins; dial public ENR) overlay-peer=${EXTRA_BEACON_PEERS:-none} (discv5 on; no public :4110)"
+		else
+			extra+=(--p2p-allowlist="$L0_NETRESTRICT")
+			extra+=(--no-discovery)
+			echo "Starting beacon L0_ONLY advertise=$ADVERTISE_IP overlay-peer=$L0_OVERLAY_BEACON_PEER"
+		fi
 	else
 		echo "Starting beacon advertise=$ADVERTISE_IP (no validator)"
 		load_bootstrap_args
@@ -464,8 +604,19 @@ stop-isolate)
 status)
 	show_status
 	;;
+enable-l0-dht)
+	write_l0_dht_env
+	echo "L0_DHT env written. Apply overlay-dht-steer.sh on this host and overlay-beacon-listen-dnat.sh on the public-advertise peer."
+	echo "Beacon still has --no-discovery until an authorized restart-beacon. This script did not restart EL/CL."
+	echo "If beacon connected later drops: overlay-dht-steer.sh apply first (flush ghost conntrack; do not restart EL/CL)."
+	;;
+apply-isolate)
+	require_overlay_tun
+	apply_p2p_isolate
+	echo "Isolate refreshed. Clients were not restarted."
+	;;
 *)
-	echo "Usage: $0 {start|stop|restart|status|start-geth|stop-geth|restart-beacon|start-l0-only|restart-l0-only|stop-isolate}"
+	echo "Usage: $0 {start|stop|restart|status|start-geth|stop-geth|restart-beacon|start-l0-only|restart-l0-only|stop-isolate|enable-l0-dht|apply-isolate}"
 	exit 1
 	;;
 esac

@@ -18,10 +18,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 
-const POST_QUEUE: usize = 64;
-const POST_CONCURRENCY: usize = 8;
-const LISTEN_QUEUE: usize = 32;
+const POST_QUEUE: usize = 2048;
+// 32 in-flight POSTs each walking 3 entries × 12s starves SI /post (listen headers never arrive).
+const POST_CONCURRENCY: usize = 4;
+const LISTEN_QUEUE: usize = 512;
 const LISTEN_RECONNECT_SECS: u64 = 3;
+const BATCH_MAX_PACKETS: usize = 16;
+const BATCH_MAX_BYTES: usize = 12 * 1024;
 
 struct ArmoredCert(String);
 
@@ -43,6 +46,13 @@ impl fmt::Debug for SecretCert {
 struct PeerPgp {
     user: ArmoredCert,
     route: ArmoredCert,
+}
+
+struct PendingOverlay {
+    dest: Ipv4Addr,
+    loc: Locator,
+    packets: Vec<Vec<u8>>,
+    bytes: usize,
 }
 
 struct PostJob {
@@ -89,6 +99,7 @@ pub struct L0Client {
     user_secret: Option<SecretCert>,
     tun_tx: Option<mpsc::Sender<Vec<u8>>>,
     inbound_rx: Option<mpsc::Receiver<String>>,
+    pending: Option<PendingOverlay>,
 }
 
 impl fmt::Debug for L0Client {
@@ -111,6 +122,10 @@ impl fmt::Debug for L0Client {
             .field("inbound_secret", &self.user_secret.is_some())
             .field("tun_writer", &self.tun_tx.is_some())
             .field("listen_worker", &self.inbound_rx.is_some())
+            .field(
+                "pending_packets",
+                &self.pending.as_ref().map(|p| p.packets.len()),
+            )
             .finish()
     }
 }
@@ -143,6 +158,7 @@ impl L0Client {
             user_secret: None,
             tun_tx: None,
             inbound_rx: None,
+            pending: None,
         }
     }
 
@@ -279,6 +295,7 @@ impl L0Client {
             user_secret,
             tun_tx: None,
             inbound_rx,
+            pending: None,
         }
     }
 
@@ -309,28 +326,37 @@ impl L0Client {
             ));
         };
         match listen::inbound_ipv4_from_user_armor(armor, &secret.0) {
-            Ok(ipv4) => {
-                let n = ipv4.len();
-                self.inbound_ready = self.inbound_ready.saturating_add(1);
-                match &self.tun_tx {
-                    Some(tx) => match tx.try_send(ipv4) {
-                        Ok(()) => {
-                            self.tun_writes = self.tun_writes.saturating_add(1);
-                            tracing::info!(bytes = n, "P1 inbound IPv4 queued for TUN write-back");
-                        }
-                        Err(_) => {
-                            self.inbound_dropped = self.inbound_dropped.saturating_add(1);
-                            tracing::warn!(
-                                dropped = self.inbound_dropped,
-                                "P1 inbound TUN queue full; frame dropped"
-                            );
-                        }
-                    },
-                    None => tracing::info!(
-                        bytes = n,
-                        "P1 inbound IPv4 ready; TUN writer not attached"
-                    ),
+            Ok(blob) => {
+                let packets = envelope::split_ipv4_datagrams(&blob)?;
+                let n = blob.len();
+                let packet_count = packets.len();
+                for ipv4 in packets {
+                    self.inbound_ready = self.inbound_ready.saturating_add(1);
+                    match &self.tun_tx {
+                        Some(tx) => match tx.try_send(ipv4) {
+                            Ok(()) => {
+                                self.tun_writes = self.tun_writes.saturating_add(1);
+                            }
+                            Err(_) => {
+                                self.inbound_dropped = self.inbound_dropped.saturating_add(1);
+                                tracing::warn!(
+                                    dropped = self.inbound_dropped,
+                                    "P1 inbound TUN queue full; frame dropped"
+                                );
+                            }
+                        },
+                        None => tracing::debug!(
+                            bytes = n,
+                            packets = packet_count,
+                            "P1 inbound IPv4 ready; TUN writer not attached"
+                        ),
+                    }
                 }
+                tracing::debug!(
+                    bytes = n,
+                    packets = packet_count,
+                    "P1 inbound IPv4 queued for TUN write-back"
+                );
                 Ok(n)
             }
             Err(err) => {
@@ -370,20 +396,66 @@ impl L0Client {
             return;
         };
 
+        if self.pending.as_ref().is_some_and(|p| p.dest != dest) {
+            self.flush_pending_overlay();
+        }
+        if self.pending.is_none() {
+            self.pending = Some(PendingOverlay {
+                dest,
+                loc: loc.clone(),
+                packets: Vec::new(),
+                bytes: 0,
+            });
+        }
+        let should_flush = if let Some(pending) = self.pending.as_mut() {
+            pending.packets.push(packet.to_vec());
+            pending.bytes = pending.bytes.saturating_add(packet.len());
+            pending.packets.len() >= BATCH_MAX_PACKETS || pending.bytes >= BATCH_MAX_BYTES
+        } else {
+            false
+        };
+        if should_flush {
+            self.flush_pending_overlay();
+        }
+    }
+
+    /// Flush a dest-aggregated IPv4 batch as one `conet_l0d_overlay_v1` POST.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn flush_pending_overlay(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if pending.packets.is_empty() {
+            return;
+        }
+        let packet_count = pending.packets.len();
+        let mut raw = Vec::with_capacity(pending.bytes);
+        for pkt in &pending.packets {
+            raw.extend_from_slice(pkt);
+        }
         self.seq = self.seq.saturating_add(1);
-        let framed = frame::encode(self.seq, packet);
-        match self.prepare_overlay_post(dest, packet, self.seq) {
+        let framed = frame::encode(self.seq, &raw);
+        match self.prepare_overlay_post(pending.dest, &raw, self.seq) {
             Ok(prepared) => {
-                self.frames_ready = self.frames_ready.saturating_add(1);
+                self.frames_ready = self.frames_ready.saturating_add(packet_count as u64);
                 self.posts_prepared = self.posts_prepared.saturating_add(1);
-                self.enqueue_post(prepared, dest, loc, framed.len());
+                tracing::info!(
+                    dest = %pending.dest,
+                    locator = %pending.loc.display(),
+                    seq = self.seq,
+                    packets = packet_count,
+                    frame_bytes = framed.len(),
+                    "P1 overlay batch flushed for POST"
+                );
+                self.enqueue_post(prepared, pending.dest, &pending.loc, raw.len(), packet_count);
             }
             Err(err) => {
                 self.posts_refused = self.posts_refused.saturating_add(1);
                 tracing::warn!(
-                    dest = %dest,
-                    locator = %loc.display(),
+                    dest = %pending.dest,
+                    locator = %pending.loc.display(),
                     seq = self.seq,
+                    packets = packet_count,
                     frame_bytes = framed.len(),
                     error = %err,
                     "P1 overlay POST refused; plaintext was not sent"
@@ -412,13 +484,21 @@ impl L0Client {
         Ok(PreparedPost { url, armor })
     }
 
-    fn enqueue_post(&mut self, prepared: PreparedPost, dest: Ipv4Addr, loc: &Locator, frame_bytes: usize) {
+    fn enqueue_post(
+        &mut self,
+        prepared: PreparedPost,
+        dest: Ipv4Addr,
+        loc: &Locator,
+        frame_bytes: usize,
+        packet_count: usize,
+    ) {
         let armor_bytes = prepared.armor_len();
         let Some(tx) = &self.post_tx else {
-            tracing::info!(
+            tracing::debug!(
                 dest = %dest,
                 locator = %loc.display(),
                 seq = self.seq,
+                packets = packet_count,
                 armor_bytes,
                 frame_bytes,
                 "P1 overlay armor ready; POST worker not started (no tokio runtime)"
@@ -430,11 +510,12 @@ impl L0Client {
         }) {
             Ok(()) => {
                 self.posts_queued = self.posts_queued.saturating_add(1);
-                tracing::info!(
+                tracing::debug!(
                     dest = %dest,
                     locator = %loc.display(),
                     seq = self.seq,
                     first_entry = %prepared.url,
+                    packets = packet_count,
                     armor_bytes,
                     frame_bytes,
                     queued = self.posts_queued,
@@ -446,6 +527,7 @@ impl L0Client {
                 tracing::warn!(
                     dest = %dest,
                     seq = self.seq,
+                    packets = packet_count,
                     dropped = self.posts_dropped,
                     "P1 overlay POST queue full; frame dropped (TUN not blocked)"
                 );
@@ -531,7 +613,7 @@ fn spawn_post_worker(entries: Vec<String>) -> Option<mpsc::Sender<PostJob>> {
             tokio::spawn(async move {
                 let _permit = permit;
                 match post::send_via_entries(&client, &entries, &job.armor).await {
-                    Ok((status, entry)) => tracing::info!(
+                    Ok((status, entry)) => tracing::debug!(
                         status,
                         entry,
                         armor_bytes = job.armor.len(),
@@ -583,6 +665,7 @@ mod tests {
             user_secret: None,
             tun_tx: None,
             inbound_rx: None,
+            pending: None,
         }
     }
 
@@ -657,8 +740,65 @@ mod tests {
     #[test]
     fn post_worker_keeps_bounded_concurrency() {
         assert!(POST_CONCURRENCY >= 2);
+        assert!(POST_CONCURRENCY <= 8);
         assert!(POST_CONCURRENCY <= POST_QUEUE);
-        assert!(POST_QUEUE >= 32);
+        assert!(POST_QUEUE >= 512);
+    }
+
+    fn mini_ipv4(id: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[2] = 0;
+        p[3] = 20;
+        p[9] = 6;
+        p[19] = id;
+        p
+    }
+
+    #[test]
+    fn inbound_splits_concatenated_ipv4() {
+        let user = generate_test_cert();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let a = mini_ipv4(1);
+        let b = mini_ipv4(2);
+        let mut raw = a.clone();
+        raw.extend_from_slice(&b);
+        let json = envelope::encode("0x1111111111111111111111111111111111111111", 2, &raw).unwrap();
+        let armor = pgp::encrypt_utf8(&json, &user_pub).unwrap();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        let mut client = L0Client {
+            enabled: true,
+            user_secret: Some(SecretCert(user)),
+            tun_tx: Some(tx),
+            routing_eoa: "0x1111111111111111111111111111111111111111".into(),
+            ..L0Client::disabled()
+        };
+        assert_eq!(client.apply_inbound_armor(&armor).unwrap(), raw.len());
+        assert_eq!(client.inbound_ready, 2);
+        assert_eq!(client.tun_writes, 2);
+        assert_eq!(rx.try_recv().unwrap(), a);
+        assert_eq!(rx.try_recv().unwrap(), b);
+    }
+
+    #[test]
+    fn flush_batches_two_packets_as_one_post() {
+        let user = generate_test_cert();
+        let route = generate_test_cert();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let mut client = client_with_keys(&user_pub, &route_pub);
+        let loc = Locator {
+            host: LocatorHost::Eoa("0x2222222222222222222222222222222222222222".into()),
+            service: crate::locator::OverlayService::Geth,
+        };
+        let dest = Ipv4Addr::new(100, 64, 0, 6);
+        client.note_overlay_packet(dest, Some(&loc), &mini_ipv4(1));
+        client.note_overlay_packet(dest, Some(&loc), &mini_ipv4(2));
+        assert_eq!(client.posts_prepared, 0);
+        client.flush_pending_overlay();
+        assert_eq!(client.posts_prepared, 1);
+        assert_eq!(client.frames_ready, 2);
+        assert_eq!(client.seq, 1);
     }
 
     #[tokio::test]

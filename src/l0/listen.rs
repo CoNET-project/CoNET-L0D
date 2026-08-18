@@ -140,6 +140,10 @@ pub fn pick_listen_entry<'a>(entries: &'a [String], last_failed: Option<&str>) -
 pub fn listen_http_client() -> Result<reqwest::Client, L0dError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(12))
+        .pool_max_idle_per_host(0)
+        .tcp_nodelay(true)
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("conet-l0d/0.1")
         .build()
         .map_err(|e| L0dError::L0(format!("listen http client: {e}")))
@@ -158,12 +162,11 @@ pub async fn open_listen_sse(
     if obj.len() != 1 || !obj.contains_key("data") {
         return Err(L0dError::L0("POST body must be exactly { data }".into()));
     }
-    let response = client
-        .post(url)
-        .json(&body)
-        .send()
+    let send = client.post(url).json(&body).send();
+    let response = tokio::time::timeout(Duration::from_secs(15), send)
         .await
-        .map_err(|e| L0dError::L0(format!("listen POST failed: {e}")))?;
+        .map_err(|_| L0dError::L0("listen POST timed out waiting for headers (15s)".into()))?
+        .map_err(|e| L0dError::L0(post::format_reqwest_error("listen POST failed", e)))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(L0dError::L0(format!("listen POST HTTP {status}")));

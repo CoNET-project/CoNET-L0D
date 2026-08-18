@@ -5,7 +5,19 @@
 use crate::error::L0dError;
 use crate::l0::pgp;
 use serde_json::{json, Value};
+use std::error::Error;
 use std::time::Duration;
+
+/// Walk the reqwest/hyper chain. SI mimic-404 is a status; this is connect/IO/reset.
+pub fn format_reqwest_error(prefix: &str, err: reqwest::Error) -> String {
+    let mut out = format!("{prefix}: {err}");
+    let mut src = err.source();
+    while let Some(inner) = src {
+        out.push_str(&format!("; caused by: {inner}"));
+        src = inner.source();
+    }
+    out
+}
 
 pub fn json_body(armor: &str) -> Result<Value, L0dError> {
     pgp::refuse_plaintext_data(armor)?;
@@ -15,6 +27,13 @@ pub fn json_body(armor: &str) -> Result<Value, L0dError> {
 pub fn http_client() -> Result<reqwest::Client, L0dError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(5))
+        // SI distorySocket() writes keep-alive then destroy(). Reuse desyncs
+        // the next POST into "error sending request" while curl Connection:close works.
+        .pool_max_idle_per_host(0)
+        .tcp_nodelay(true)
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("conet-l0d/0.1")
         .build()
         .map_err(|e| L0dError::L0(format!("http client: {e}")))
@@ -41,7 +60,15 @@ pub async fn send_via_entries(
         };
         match send(client, &url, armor).await {
             Ok(status) => return Ok((status, entry.clone())),
-            Err(err) => last_err = err,
+            Err(err) => {
+                last_err = err;
+                // Every entry forwards to the same mailbox B. A timeout is B/C hang,
+                // not a bad A; walking the rest only multiplies SI load.
+                let msg = last_err.to_string();
+                if msg.contains("timed out") || msg.contains("timeout") {
+                    break;
+                }
+            }
         }
     }
     Err(last_err)
@@ -58,10 +85,11 @@ pub async fn send(client: &reqwest::Client, url: &str, armor: &str) -> Result<u1
     }
     let response = client
         .post(url)
+        .header("Connection", "close")
         .json(&body)
         .send()
         .await
-        .map_err(|e| L0dError::L0(format!("POST /post failed: {e}")))?;
+        .map_err(|e| L0dError::L0(format_reqwest_error("POST /post failed", e)))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(L0dError::L0(format!("POST /post HTTP {status}")));
