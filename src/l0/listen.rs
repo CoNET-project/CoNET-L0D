@@ -1,15 +1,17 @@
 //! Inbound overlay: decrypt user-PGP armor and recover raw IPv4 for TUN write-back.
 //!
-//! In-crate listen worker: EIP-191-sign `mining` + `listenKind: chat`, wrap
-//! `base64({ message, signMessage })` to **this host's** mailbox B route PGP,
-//! `POST { "data" }` to entry **C**, read the listen stream, extract user-PGP armor.
+//! Two listen kinds:
+//! - Chat: EIP-191-sign `mining` + `listenKind: chat` (offers, P1 gossip).
+//! - L0 exclusive: EIP-191-sign `l0_listen` or `mining` + `listenKind: l0`.
+//! Both wrap `base64({ message, signMessage })` to **this host's** mailbox B
+//! route PGP, `POST { "data" }` to entry **C**, and read the stream.
 //!
 //! Live SI mailbox `forWardPGPMessageToClient` writes raw JSON
 //! `{"data":"<armor>"}\r\n\r\n` (no SSE `data:` prefix). Handshake / mining
-//! heartbeats use SSE `data: {status,epoch}`. Ingest matches Chat
-//! `handleInbound`: JSON `{ data }` armor, SSE-wrapped JSON, or classic SSE
-//! armor lines. No `Securitykey`. Tests use wiremock only. Do not POST
-//! production SI from tests.
+//! heartbeats use SSE `data: {status,epoch}`. Occupied L0 pipes AES blobs as
+//! SSE `data: <base64>`. Ingest matches Chat `handleInbound` plus occupy JSON
+//! and AES blobs. No overlay `Securitykey` on B-decryptable commands. Tests
+//! use wiremock only. Do not POST production SI from tests.
 #![allow(dead_code)]
 
 use crate::error::L0dError;
@@ -34,6 +36,44 @@ pub fn encode_listen_command(wallet: &str, timestamp: u64) -> Result<String, L0d
     if text.contains("Securitykey") || text.contains("signMessage") {
         return Err(L0dError::L0(
             "listen command must not carry Securitykey or signMessage".into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// Exclusive L0 listen. Encrypt to B route PGP. Never put overlay Securitykey here.
+pub fn encode_l0_listen_command(wallet: &str, timestamp: u64) -> Result<String, L0dError> {
+    let json = serde_json::json!({
+        "command": "l0_listen",
+        "listenKind": "l0",
+        "walletAddress": wallet.to_ascii_lowercase(),
+        "timestamp": timestamp,
+    });
+    let text = serde_json::to_string(&json).map_err(|e| L0dError::L0(e.to_string()))?;
+    if text.contains("Securitykey") || text.contains("signMessage") {
+        return Err(L0dError::L0(
+            "l0_listen must not carry Securitykey or signMessage".into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// First occupy packet. Encrypt to **target** mailbox B route PGP. No overlay key.
+pub fn encode_l0_connect_command(
+    wallet: &str,
+    target_wallet: &str,
+    timestamp: u64,
+) -> Result<String, L0dError> {
+    let json = serde_json::json!({
+        "command": "l0_connect",
+        "walletAddress": wallet.to_ascii_lowercase(),
+        "targetWallet": target_wallet.to_ascii_lowercase(),
+        "timestamp": timestamp,
+    });
+    let text = serde_json::to_string(&json).map_err(|e| L0dError::L0(e.to_string()))?;
+    if text.contains("Securitykey") || text.contains("signMessage") {
+        return Err(L0dError::L0(
+            "l0_connect must not carry Securitykey or signMessage".into(),
         ));
     }
     Ok(text)
@@ -137,6 +177,30 @@ pub fn prepare_listen_post(
     let armor = wrap_listen_for_post(&cmd, route_pub_armored, eth)?;
     let url = post::post_url(entry)?;
     Ok((url, armor))
+}
+
+pub fn prepare_l0_listen_post(
+    wallet: &str,
+    timestamp: u64,
+    route_pub_armored: &str,
+    entry: &str,
+    eth: &EthSecret,
+) -> Result<(String, String), L0dError> {
+    let cmd = encode_l0_listen_command(wallet, timestamp)?;
+    let armor = wrap_listen_for_post(&cmd, route_pub_armored, eth)?;
+    let url = post::post_url(entry)?;
+    Ok((url, armor))
+}
+
+pub fn wrap_l0_connect_for_post(
+    wallet: &str,
+    target_wallet: &str,
+    timestamp: u64,
+    route_pub_armored: &str,
+    eth: &EthSecret,
+) -> Result<String, L0dError> {
+    let cmd = encode_l0_connect_command(wallet, target_wallet, timestamp)?;
+    wrap_listen_for_post(&cmd, route_pub_armored, eth)
 }
 
 /// Prefer an entry that is not the last failed host. One-entry lists stay usable.
@@ -249,8 +313,12 @@ fn extract_armors_from_frame(frame: &str) -> Vec<String> {
         && (crate::l0::duplex::parse_duplex_frame_json(trimmed).is_some()
             || crate::l0::duplex::parse_accept(trimmed).is_some()
             || crate::l0::duplex::parse_reject(trimmed).is_some()
+            || crate::l0::duplex::parse_l0_occupied(trimmed)
             || trimmed.contains("\"duplex_offer\""))
     {
+        return vec![trimmed.to_string()];
+    }
+    if crate::l0::duplex::looks_like_aes_blob(trimmed) {
         return vec![trimmed.to_string()];
     }
     extract_pgp_armors_from_sse(frame)
@@ -389,6 +457,27 @@ mod tests {
         assert!(!cmd.contains("Securitykey"));
         assert!(!cmd.contains("signMessage"));
         assert!(!cmd.contains("l1p2p"));
+    }
+
+    #[test]
+    fn l0_listen_and_connect_have_no_overlay_key() {
+        let listen = encode_l0_listen_command(
+            "0x1111111111111111111111111111111111111111",
+            1_710_000_000,
+        )
+        .unwrap();
+        assert!(listen.contains("\"l0_listen\""));
+        assert!(listen.contains("\"l0\""));
+        assert!(!listen.contains("Securitykey"));
+        let connect = encode_l0_connect_command(
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            1_710_000_001,
+        )
+        .unwrap();
+        assert!(connect.contains("\"l0_connect\""));
+        assert!(connect.contains("targetWallet"));
+        assert!(!connect.contains("Securitykey"));
     }
 
     #[test]

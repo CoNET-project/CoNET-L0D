@@ -1,7 +1,7 @@
 # conet-l0d — L1 overlay on Layer Minus
 
 **Paired translation:** [简体中文](./conet-l0d.zh-CN.md)  
-**Revision:** 2026-08-18 (application duplex: offer on long-lived Chat SSE; accept / reject / frames on session listen SSEs; P1 gossip on reject or missing accept; optional per-port `[[l0.channels]]` listen SSE; overlay IPv4 batch + POST 32/512; Prysm-bound follow-the-chain; lab overlay UDP + live discv5 via L0 accepted; DHT drop recovery = flush ghost conntrack first; authorized `.45` `restart-beacon` after dial backoff; `ss` public `:4200` is DNAT dest, not a leak; not a production discv5 product)  
+**Revision:** 2026-08-18 (SI `l0_listen` / `l0_connect` occupancy pipe; application duplex: offer on Chat gossip; accept / reject / frames as AES on the occupied pipe; P1 gossip on reject, missing accept, or missing pipe; optional per-port `[[l0.channels]]` listen SSE; overlay IPv4 batch + POST 32/512; Prysm-bound follow-the-chain; lab overlay UDP + live discv5 via L0 accepted; DHT drop recovery = flush ghost conntrack first; authorized `.45` `restart-beacon` after dial backoff; `ss` public `:4200` is DNAT dest, not a leak; not a production discv5 product)  
 **Public operator guide:** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **Public developer guide:** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -112,14 +112,15 @@ Operators never run `iptables` by hand. Teardown must not delete foreign rules.
 | Direction | Encrypt to | HTTP |
 | --- | --- | --- |
 | `duplex_offer` | Peer **long-lived user PGP** | Entry **A ≠ B**. Chat gossip to the existing channel SSE. SI does **not** parse `duplex_*` |
-| `duplex_accept` / `duplex_reject` | Initiator **session listen user PGP** | Entry **A ≠ B**. Lands on the initiator session Chat SSE |
-| Session / channel listen | Mailbox **B route PGP** | Existing `mining` + `listenKind: "chat"` via **C ≠ B**. Two owned SSEs; no guest listen on peer B |
-| Overlay IPv4 (duplex data plane) | AES-256-GCM of `L0D1` \|\| IPv4 inside user-PGP `duplex_frame` to the peer **session listen user PGP**, then mailbox wrap | Entry **A ≠ B**. Same `{ "data" }` as P1 gossip |
-| P1 gossip fallback (`duplex_reject` or no accept) | Peer **user PGP**, then mailbox-work wrap to **B route PGP** | Entry **A ≠ B** |
+| Exclusive L0 listen | Mailbox **B route PGP** | `l0_listen` or `mining` + `listenKind: "l0"` via **C ≠ B**. No overlay AES. Two owned L0 SSEs; no guest listen on peer B |
+| `l0_connect` | **Target** mailbox **B route PGP** | Occupies idle L0 SSE; then AES blobs on the same TCP. Occupied → 409 |
+| `duplex_accept` / `duplex_reject` | AES on occupied initiator L0 pipe | First AES blob after responder occupies `W_I` |
+| Overlay IPv4 (duplex data plane) | AES of `duplex_frame` JSON; `payload` = standard base64 of `L0D1` \|\| IPv4 | Occupied peer L0 pipe |
+| P1 gossip fallback (`duplex_reject` or no accept or no pipe) | Peer **user PGP**, then mailbox-work wrap to **B route PGP** | Entry **A ≠ B** |
 
 HTTP body is only `{ "data": "<armor>" }`. No hop-sig header from this client. No `NoPush` on HTTP JSON.
 
-Duplex is **application JSON** on Chat gossip: `duplex_offer`, `duplex_accept`, `duplex_reject`, `duplex_frame`. Initiator sends the overlay AES key and a **session listen wallet**; responder either rejects onto that SSE or accepts with a key echo and its own session listen wallet. Spec: [Duplex overlay](https://gitbook.conet.network/l0/duplex-forward.html). Crate MVP reuses the registered per-port channel EOA as the session listen identity. Do **not** send `command: "mining"` with `listenKind: "duplex"`. Do **not** document SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` as current SI.
+Duplex is **application JSON** on Chat gossip plus AES on the SI occupancy pipe: `duplex_offer`, `duplex_accept`, `duplex_reject`, `duplex_frame`. Initiator sends the overlay AES key and a **session listen wallet**; responder either occupies that L0 SSE with `duplex_reject` or accepts with a key echo and its own session listen wallet. Spec: [Duplex overlay](https://gitbook.conet.network/l0/duplex-forward.html). Crate MVP reuses the registered per-port channel EOA as the session listen identity. Do **not** send `command: "mining"` with `listenKind: "duplex"`. Do **not** document SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` as current SI. Do document live SI `l0_listen` / `l0_connect`.
 
 Existing UDP forward is a different composition (shorter idle; not overlay TCP).
 

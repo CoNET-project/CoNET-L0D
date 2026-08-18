@@ -1,18 +1,19 @@
 //! Overlay L0 client. Default is the MVP stub.
 //!
-//! Data plane prefers **application duplex** (AES-256-GCM on two owned Chat
-//! SSEs). Offer rides the long-lived channel SSE; accept / reject / frames
-//! ride the session listen SSE. Until `duplex_accept`, fallback is
-//! `conet_l0d_overlay_v1` user-PGP gossip. HTTP `/post` is still `{ "data" }`
-//! only. SI does not implement `duplex_*`. Do not claim live `p2p_stream_*`.
+//! Protocol: exclusive SI `l0_listen` / `l0_connect` occupancy pipe, then
+//! application duplex (`duplex_offer` on Chat gossip; accept / reject / frames
+//! as AES blobs on the occupied pipe). Until `duplex_accept`, fallback is
+//! `conet_l0d_overlay_v1` user-PGP gossip. HTTP first body is still `{ "data" }`
+//! only. Do not claim SI `duplex_*` or live `p2p_stream_*`.
 
 use crate::config::ValidatedConfig;
 use crate::error::L0dError;
 use crate::l0::aes;
 use crate::l0::eip191::EthSecret;
-use crate::l0::{duplex, eip191, envelope, frame, listen, pgp, post};
+use crate::l0::{duplex, eip191, envelope, frame, listen, pgp, pipe, post};
 use crate::locator::{Locator, LocatorHost};
 use crate::packet::overlay_channel_port;
+use base64::Engine;
 use sequoia_openpgp::Cert;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -72,6 +73,8 @@ struct ChannelWire {
     eth: EthSecret,
     #[allow(dead_code)]
     listen_entries: Vec<String>,
+    /// Outbound entries A ≠ B for `l0_connect` occupancy pipes.
+    entries: Vec<String>,
     /// Own session-listen user PGP (channel EOA in crate MVP).
     user_pub: String,
 }
@@ -92,6 +95,9 @@ struct DuplexSession {
     host_eoa: String,
     /// Peer's session-listen user PGP (from accept, or offer for the initiator).
     peer_listen_user_pgp: Option<String>,
+    peer_listen_wallet: Option<String>,
+    /// Occupied `l0_connect` writer. AES blobs only; never overlay key on this channel.
+    pipe_tx: Option<mpsc::Sender<String>>,
 }
 
 impl fmt::Debug for PostJob {
@@ -346,6 +352,12 @@ impl L0Client {
             ));
         }
         let trimmed = chunk.trim();
+        if duplex::parse_l0_occupied(trimmed) {
+            return Ok(0);
+        }
+        if duplex::looks_like_aes_blob(trimmed) {
+            return self.apply_duplex_aes_blob(trimmed);
+        }
         if let Some((session_id, payload)) = duplex::parse_duplex_frame_json(trimmed) {
             return self.apply_duplex_frame(&session_id, &payload);
         }
@@ -399,22 +411,39 @@ impl L0Client {
         Err(last_err)
     }
 
-    fn apply_duplex_frame(&mut self, session_id: &str, payload_b64: &str) -> Result<usize, L0dError> {
-        let key = {
+    fn apply_duplex_aes_blob(&mut self, blob: &str) -> Result<usize, L0dError> {
+        let keys: Vec<[u8; aes::KEY_LEN]> = {
             let guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
-            guard
-                .values()
-                .find(|s| s.session_id == session_id)
-                .and_then(|s| s.key)
+            guard.values().filter_map(|s| s.key).collect()
         };
-        let Some(key) = key else {
+        let mut last = L0dError::L0("AES blob did not open with any duplex key".into());
+        for key in keys {
+            match aes::open(&key, blob) {
+                Ok(plain) => match String::from_utf8(plain) {
+                    Ok(json) => return self.apply_inbound_armor(&json),
+                    Err(err) => last = L0dError::L0(format!("duplex AES plaintext utf8: {err}")),
+                },
+                Err(err) => last = err,
+            }
+        }
+        self.inbound_refused = self.inbound_refused.saturating_add(1);
+        Err(last)
+    }
+
+    fn apply_duplex_frame(&mut self, session_id: &str, payload_b64: &str) -> Result<usize, L0dError> {
+        let has_session = {
+            let guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+            guard.values().any(|s| s.session_id == session_id && s.key.is_some())
+        };
+        if !has_session {
             self.inbound_refused = self.inbound_refused.saturating_add(1);
             return Err(L0dError::L0(
                 "duplex_frame has no overlay key yet; waiting for duplex_offer".into(),
             ));
         };
-        let opened = aes::open(&key, payload_b64)?;
-        let (_seq, ipv4) = frame::decode(&opened)?;
+        let framed = Engine::decode(&base64::engine::general_purpose::STANDARD, payload_b64.trim())
+            .map_err(|e| L0dError::L0(format!("duplex_frame payload base64: {e}")))?;
+        let (_seq, ipv4) = frame::decode(&framed)?;
         if !listen::looks_like_ipv4(ipv4) {
             self.inbound_refused = self.inbound_refused.saturating_add(1);
             return Err(L0dError::L0("duplex plaintext is not IPv4".into()));
@@ -423,8 +452,9 @@ impl L0Client {
     }
 
     fn apply_duplex_offer(&mut self, offer: duplex::DuplexOffer) {
-        let mut send_accept: Option<(ChannelWire, String, DuplexSession)> = None;
-        let mut send_reject: Option<(ChannelWire, String)> = None;
+        let mut send_accept: Option<(ChannelWire, String, String, DuplexSession)> = None;
+        let mut send_reject: Option<(ChannelWire, String, String, [u8; aes::KEY_LEN], String)> =
+            None;
         {
             let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
             for sess in guard.values_mut() {
@@ -433,6 +463,7 @@ impl L0Client {
                 }
                 let waiting = sess.key.is_none();
                 sess.key = Some(offer.key);
+                sess.peer_listen_wallet = Some(offer.listen_wallet.clone());
                 if !offer.listen_user_pgp.trim().is_empty() {
                     sess.peer_listen_user_pgp = Some(offer.listen_user_pgp.clone());
                 }
@@ -446,25 +477,40 @@ impl L0Client {
                     sess.peer_attached = true;
                     sess.rejected = false;
                     if let Some(wire) = self.channel_wire.get(&sess.port) {
-                        let target = if offer.listen_user_pgp.trim().is_empty() {
-                            self.peers
-                                .get(&(sess.dest, sess.port))
-                                .map(|k| k.user.0.clone())
-                        } else {
-                            Some(offer.listen_user_pgp.clone())
-                        };
-                        if let Some(user_pgp) = target {
-                            send_accept = Some((wire.clone(), user_pgp, sess.clone()));
+                        if let Some(keys) = self.peers.get(&(sess.dest, sess.port)) {
+                            send_accept = Some((
+                                wire.clone(),
+                                offer.listen_wallet.clone(),
+                                keys.route.0.clone(),
+                                sess.clone(),
+                            ));
                         }
                     }
                 }
                 break;
             }
         }
-        if let Some((wire, user_pgp, sess)) = send_accept {
-            if let Some(tx) = &self.post_tx {
-                spawn_duplex_accept(wire, user_pgp, sess, tx.clone());
-            }
+        if let Some((wire, target, route, sess)) = send_accept {
+            spawn_l0_pipe(
+                wire,
+                route,
+                target,
+                sess.key.and_then(|k| {
+                    let ts = chrono::Utc::now().timestamp().max(0) as u64;
+                    duplex::encode_accept_command(
+                        &sess.host_eoa,
+                        &sess.host_eoa,
+                        "",
+                        &sess.session_id,
+                        &k,
+                        ts,
+                    )
+                    .ok()
+                    .and_then(|json| aes::seal(&k, json.as_bytes()).ok())
+                }),
+                sess,
+                self.duplex.clone(),
+            );
             return;
         }
         tracing::warn!(
@@ -472,52 +518,85 @@ impl L0Client {
             "duplex_offer did not match a local session; sending duplex_reject"
         );
         if let Some(wire) = self.channel_wire.values().next() {
-            let target = if offer.listen_user_pgp.trim().is_empty() {
-                None
-            } else {
-                Some(offer.listen_user_pgp.clone())
-            };
-            if let Some(user_pgp) = target {
-                send_reject = Some((wire.clone(), user_pgp));
+            if let Some(keys) = self.peers.values().next() {
+                send_reject = Some((
+                    wire.clone(),
+                    offer.listen_wallet.clone(),
+                    keys.route.0.clone(),
+                    offer.key,
+                    offer.session_id.clone(),
+                ));
             }
         }
-        if let Some((wire, user_pgp)) = send_reject {
-            if let Some(tx) = &self.post_tx {
-                spawn_duplex_reject(wire, user_pgp, offer.session_id, tx.clone());
-            }
+        if let Some((wire, target, route, key, session_id)) = send_reject {
+            let ts = chrono::Utc::now().timestamp().max(0) as u64;
+            let first = duplex::encode_reject_command(&wire.eoa, &session_id, ts)
+                .ok()
+                .and_then(|json| aes::seal(&key, json.as_bytes()).ok());
+            let dummy = DuplexSession {
+                session_id,
+                key: Some(key),
+                dest: Ipv4Addr::UNSPECIFIED,
+                port: 0,
+                guest_up: false,
+                peer_attached: false,
+                rejected: true,
+                host_eoa: wire.eoa.clone(),
+                peer_listen_user_pgp: None,
+                peer_listen_wallet: Some(target.clone()),
+                pipe_tx: None,
+            };
+            spawn_l0_pipe(wire, route, target, first, dummy, self.duplex.clone());
         }
     }
 
     fn apply_duplex_accept(&mut self, accept: duplex::DuplexAccept) {
-        let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
-        for sess in guard.values_mut() {
-            if sess.session_id != accept.session_id {
-                continue;
-            }
-            if let Some(own) = sess.key {
-                if own != accept.key {
-                    tracing::warn!(
-                        session = %accept.session_id,
-                        "duplex_accept Securitykey mismatch; keeping P1 gossip"
-                    );
-                    sess.rejected = true;
-                    sess.peer_attached = false;
-                    return;
+        let mut launch: Option<(ChannelWire, String, String, DuplexSession)> = None;
+        {
+            let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+            for sess in guard.values_mut() {
+                if sess.session_id != accept.session_id {
+                    continue;
                 }
-            } else {
-                sess.key = Some(accept.key);
+                if let Some(own) = sess.key {
+                    if own != accept.key {
+                        tracing::warn!(
+                            session = %accept.session_id,
+                            "duplex_accept Securitykey mismatch; keeping P1 gossip"
+                        );
+                        sess.rejected = true;
+                        sess.peer_attached = false;
+                        return;
+                    }
+                } else {
+                    sess.key = Some(accept.key);
+                }
+                if !accept.listen_user_pgp.trim().is_empty() {
+                    sess.peer_listen_user_pgp = Some(accept.listen_user_pgp.clone());
+                }
+                sess.peer_listen_wallet = Some(accept.listen_wallet.clone());
+                sess.peer_attached = true;
+                sess.rejected = false;
+                tracing::info!(
+                    session = %accept.session_id,
+                    peer_listen = %accept.listen_wallet,
+                    "duplex_accept on occupied L0 SSE"
+                );
+                if let Some(wire) = self.channel_wire.get(&sess.port) {
+                    if let Some(keys) = self.peers.get(&(sess.dest, sess.port)) {
+                        launch = Some((
+                            wire.clone(),
+                            accept.listen_wallet.clone(),
+                            keys.route.0.clone(),
+                            sess.clone(),
+                        ));
+                    }
+                }
+                break;
             }
-            if !accept.listen_user_pgp.trim().is_empty() {
-                sess.peer_listen_user_pgp = Some(accept.listen_user_pgp);
-            }
-            sess.peer_attached = true;
-            sess.rejected = false;
-            tracing::info!(
-                session = %accept.session_id,
-                peer_listen = %accept.listen_wallet,
-                "duplex_accept on session listen SSE"
-            );
-            return;
+        }
+        if let Some((wire, target, route, sess)) = launch {
+            spawn_l0_pipe(wire, route, target, None, sess, self.duplex.clone());
         }
     }
 
@@ -661,7 +740,19 @@ impl L0Client {
         self.seq = self.seq.saturating_add(1);
         let framed = frame::encode(self.seq, &raw);
         match self.prepare_overlay_post(pending.dest, pending.port, &raw, self.seq) {
-            Ok(prepared) => {
+            Ok(None) => {
+                self.frames_ready = self.frames_ready.saturating_add(packet_count as u64);
+                tracing::info!(
+                    dest = %pending.dest,
+                    port = pending.port,
+                    locator = %pending.loc.display(),
+                    seq = self.seq,
+                    packets = packet_count,
+                    frame_bytes = framed.len(),
+                    "duplex AES frame written on occupied l0_connect pipe"
+                );
+            }
+            Ok(Some(prepared)) => {
                 self.frames_ready = self.frames_ready.saturating_add(packet_count as u64);
                 self.posts_prepared = self.posts_prepared.saturating_add(1);
                 tracing::info!(
@@ -697,7 +788,7 @@ impl L0Client {
         port: u16,
         packet: &[u8],
         seq: u64,
-    ) -> Result<PreparedPost, L0dError> {
+    ) -> Result<Option<PreparedPost>, L0dError> {
         let keys = self.peers.get(&(dest, port)).ok_or_else(|| {
             L0dError::L0(
                 "peer user+route PGP public files are required; refusing POST".into(),
@@ -708,17 +799,17 @@ impl L0Client {
         })?;
         let url = post::post_url(entry)?;
         if let Some(sess) = self.duplex_ready(dest, port) {
-            if let Some(key) = sess.key {
+            if let (Some(key), Some(tx)) = (sess.key, sess.pipe_tx.as_ref()) {
                 let framed = frame::encode(seq, packet);
-                let payload = aes::seal(&key, &framed)?;
-                let json = duplex::encode_frame_json(&sess.session_id, &payload)?;
-                let user_pgp = sess
-                    .peer_listen_user_pgp
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or(keys.user.0.as_str());
-                let armor = pgp::wrap_overlay_for_post(&json, user_pgp, &keys.route.0)?;
-                return Ok(PreparedPost { url, armor });
+                let blob = duplex::seal_frame(&key, &sess.session_id, &framed)?;
+                match tx.try_send(blob) {
+                    Ok(()) => return Ok(None),
+                    Err(_) => tracing::warn!(
+                        dest = %dest,
+                        port,
+                        "occupied l0 pipe queue full; falling back to P1 gossip"
+                    ),
+                }
             }
         }
         let from = self
@@ -729,7 +820,7 @@ impl L0Client {
             .unwrap_or_else(|| self.routing_eoa.clone());
         let json = envelope::encode(&from, seq, packet)?;
         let armor = pgp::wrap_overlay_for_post(&json, &keys.user.0, &keys.route.0)?;
-        Ok(PreparedPost { url, armor })
+        Ok(Some(PreparedPost { url, armor }))
     }
 
     fn enqueue_post(
@@ -842,13 +933,23 @@ fn spawn_legacy_listen_into(
             return false;
         }
     };
-    spawn_listen_worker(
+    let chat = spawn_listen_worker(
+        cfg.l0.listen_entries.clone(),
+        route.clone(),
+        routing_eoa.to_string(),
+        eth.clone(),
+        tx.clone(),
+        false,
+    );
+    let l0 = spawn_listen_worker(
         cfg.l0.listen_entries.clone(),
         route,
         routing_eoa.to_string(),
         eth,
         tx,
-    )
+        true,
+    );
+    chat || l0
 }
 
 fn spawn_channel_listens_into(
@@ -906,10 +1007,21 @@ fn spawn_channel_listens_into(
         };
         if spawn_listen_worker(
             ch.listen_entries.clone(),
+            route.clone(),
+            ch.routing_eoa.clone(),
+            eth.clone(),
+            tx.clone(),
+            false,
+        ) {
+            spawned += 1;
+        }
+        if spawn_listen_worker(
+            ch.listen_entries.clone(),
             route,
             ch.routing_eoa.clone(),
             eth,
             tx.clone(),
+            true,
         ) {
             spawned += 1;
         }
@@ -923,6 +1035,7 @@ fn spawn_listen_worker(
     routing_eoa: String,
     eth: EthSecret,
     tx: mpsc::Sender<String>,
+    l0_exclusive: bool,
 ) -> bool {
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return false;
@@ -942,23 +1055,29 @@ fn spawn_listen_worker(
                 continue;
             };
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
-            match listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, entry, &eth) {
+            let prepared = if l0_exclusive {
+                listen::prepare_l0_listen_post(&routing_eoa, ts, &mailbox_route, entry, &eth)
+            } else {
+                listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, entry, &eth)
+            };
+            match prepared {
                 Ok((url, armor)) => match listen::run_listen_once(&client, &url, &armor, &tx).await
                 {
                     Ok(_) => {
                         last_failed = None;
                         tracing::info!(
                             eoa = %routing_eoa,
-                            "P1 listen SSE ended; reconnecting after idle"
+                            l0 = l0_exclusive,
+                            "listen SSE ended; reconnecting after idle"
                         );
                     }
                     Err(err) => {
-                        tracing::warn!(eoa = %routing_eoa, error = %err, "P1 listen SSE failed");
+                        tracing::warn!(eoa = %routing_eoa, l0 = l0_exclusive, error = %err, "listen SSE failed");
                         last_failed = Some(entry.to_string());
                     }
                 },
                 Err(err) => {
-                    tracing::warn!(eoa = %routing_eoa, error = %err, "P1 listen wrap refused");
+                    tracing::warn!(eoa = %routing_eoa, error = %err, "listen wrap refused");
                     last_failed = Some(entry.to_string());
                 }
             }
@@ -999,6 +1118,7 @@ fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
                         route_pgp: route.clone(),
                         eth: eth.clone(),
                         listen_entries: listen_entries.clone(),
+                        entries: cfg.l0.entries.clone(),
                         user_pub: user_pub.clone(),
                     },
                 );
@@ -1042,6 +1162,7 @@ fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
                 route_pgp: route.clone(),
                 eth: eth.clone(),
                 listen_entries: cfg.l0.listen_entries.clone(),
+                entries: cfg.l0.entries.clone(),
                 user_pub: user_pub.clone(),
             },
         );
@@ -1093,6 +1214,8 @@ fn spawn_duplex_runtime(
                         rejected: false,
                         host_eoa: wire.eoa.clone(),
                         peer_listen_user_pgp: None,
+                        peer_listen_wallet: None,
+                        pipe_tx: None,
                     },
                 );
             }
@@ -1170,68 +1293,48 @@ fn spawn_duplex_offer(
     });
 }
 
-fn spawn_duplex_accept(
+fn spawn_l0_pipe(
     wire: ChannelWire,
-    peer_user_pgp: String,
+    peer_route_pgp: String,
+    target_wallet: String,
+    first: Option<String>,
     sess: DuplexSession,
-    post_tx: mpsc::Sender<PostJob>,
+    duplex: Arc<Mutex<HashMap<(Ipv4Addr, u16), DuplexSession>>>,
 ) {
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return;
     };
-    let Some(key) = sess.key else {
+    let ts = chrono::Utc::now().timestamp().max(0) as u64;
+    let Ok(connect_armor) =
+        listen::wrap_l0_connect_for_post(&wire.eoa, &target_wallet, ts, &peer_route_pgp, &wire.eth)
+    else {
+        tracing::warn!(session = %sess.session_id, "l0_connect wrap refused");
         return;
     };
-    handle.spawn(async move {
-        loop {
-            let ts = chrono::Utc::now().timestamp().max(0) as u64;
-            match duplex::encode_accept_command(
-                &wire.eoa,
-                &wire.eoa,
-                &wire.user_pub,
-                &sess.session_id,
-                &key,
-                ts,
-            )
-            .and_then(|cmd| duplex::wrap_app_for_user_pgp(&cmd, &peer_user_pgp, &wire.eth))
-            {
-                Ok(armor) => {
-                    if post_tx.send(PostJob { armor }).await.is_ok() {
-                        tracing::info!(session = %sess.session_id, "duplex_accept queued for POST");
-                        return;
-                    }
-                }
-                Err(err) => tracing::warn!(error = %err, "duplex_accept wrap refused"),
-            }
-            tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
+    let (tx, rx) = mpsc::channel::<String>(512);
+    {
+        let mut guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(live) = guard.get_mut(&(sess.dest, sess.port)) {
+            live.pipe_tx = Some(tx.clone());
         }
-    });
-}
-
-fn spawn_duplex_reject(
-    wire: ChannelWire,
-    initiator_listen_user_pgp: String,
-    session_id: String,
-    post_tx: mpsc::Sender<PostJob>,
-) {
-    let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
-        return;
+    }
+    let entries = if wire.entries.is_empty() {
+        wire.listen_entries.clone()
+    } else {
+        wire.entries.clone()
     };
+    let dest = sess.dest;
+    let port = sess.port;
     handle.spawn(async move {
-        loop {
-            let ts = chrono::Utc::now().timestamp().max(0) as u64;
-            match duplex::encode_reject_command(&wire.eoa, &session_id, ts)
-                .and_then(|cmd| duplex::wrap_app_for_user_pgp(&cmd, &initiator_listen_user_pgp, &wire.eth))
-            {
-                Ok(armor) => {
-                    if post_tx.send(PostJob { armor }).await.is_ok() {
-                        tracing::info!(session = %session_id, "duplex_reject queued for POST");
-                        return;
-                    }
+        match pipe::run_occupied_pipe(&entries, &connect_armor, first, rx).await {
+            Ok(()) => tracing::info!(session = %sess.session_id, "l0_connect pipe closed"),
+            Err(err) => {
+                tracing::warn!(session = %sess.session_id, error = %err, "l0_connect pipe failed");
+                let mut guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(live) = guard.get_mut(&(dest, port)) {
+                    live.pipe_tx = None;
                 }
-                Err(err) => tracing::warn!(error = %err, "duplex_reject wrap refused"),
             }
-            tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
         }
     });
 }
@@ -1336,7 +1439,8 @@ mod tests {
         let client = client_with_keys(&user_pub, &route_pub);
         let prepared = client
             .prepare_overlay_post(Ipv4Addr::new(100, 64, 0, 6), 8400, b"\x45\x00pkt", 9)
-            .unwrap();
+            .unwrap()
+            .expect("P1 gossip POST");
         assert!(prepared.url.ends_with("/post"));
         assert!(pgp::is_pgp_message_armor(&prepared.armor));
         let work: serde_json::Value =
@@ -1351,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn duplex_ready_posts_frame_mailbox_work_not_p1_envelope() {
+    fn duplex_ready_without_pipe_keeps_p1_envelope() {
         let user = generate_test_cert();
         let route = generate_test_cert();
         let user_pub = public_cert_armored(&user).unwrap();
@@ -1372,20 +1476,60 @@ mod tests {
                 rejected: false,
                 host_eoa: "0x1111111111111111111111111111111111111111".into(),
                 peer_listen_user_pgp: None,
+                peer_listen_wallet: None,
+                pipe_tx: None,
+            },
+        );
+        let prepared = client
+            .prepare_overlay_post(dest, 8400, b"\x45\x00pkt", 3)
+            .unwrap()
+            .expect("P1 fallback until occupied pipe exists");
+        let work: serde_json::Value =
+            serde_json::from_str(&decrypt_utf8(&prepared.armor, &route).unwrap()).unwrap();
+        assert_eq!(work["NoPush"], true);
+        let inner = work["data"].as_str().unwrap();
+        let env_json = decrypt_utf8(inner, &user).unwrap();
+        assert!(env_json.contains("conet_l0d_overlay_v1"));
+        assert!(!env_json.contains("duplex_frame"));
+        assert!(!env_json.contains("Securitykey"));
+    }
+
+    #[test]
+    fn duplex_ready_with_pipe_does_not_pgp_post() {
+        let user = generate_test_cert();
+        let route = generate_test_cert();
+        let user_pub = public_cert_armored(&user).unwrap();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let client = client_with_keys(&user_pub, &route_pub);
+        let dest = Ipv4Addr::new(100, 64, 0, 6);
+        let key = aes::generate_key();
+        let sid = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+        let (tx, mut rx) = mpsc::channel(4);
+        client.duplex.lock().unwrap().insert(
+            (dest, 8400),
+            DuplexSession {
+                session_id: sid.clone(),
+                key: Some(key),
+                dest,
+                port: 8400,
+                guest_up: true,
+                peer_attached: true,
+                rejected: false,
+                host_eoa: "0x1111111111111111111111111111111111111111".into(),
+                peer_listen_user_pgp: None,
+                peer_listen_wallet: Some("0x2222222222222222222222222222222222222222".into()),
+                pipe_tx: Some(tx),
             },
         );
         let prepared = client
             .prepare_overlay_post(dest, 8400, b"\x45\x00pkt", 3)
             .unwrap();
-        let work: serde_json::Value =
-            serde_json::from_str(&decrypt_utf8(&prepared.armor, &route).unwrap()).unwrap();
-        assert_eq!(work["NoPush"], true);
-        let inner = work["data"].as_str().unwrap();
-        let frame_json = decrypt_utf8(inner, &user).unwrap();
-        assert!(frame_json.contains("duplex_frame"));
-        assert!(!frame_json.contains("duplex_relay"));
-        assert!(!frame_json.contains("Securitykey"));
-        assert!(!frame_json.contains("conet_l0d_overlay_v1"));
+        assert!(prepared.is_none());
+        let blob = rx.try_recv().expect("AES blob on pipe");
+        assert!(duplex::looks_like_aes_blob(&blob));
+        let json = String::from_utf8(aes::open(&key, &blob).unwrap()).unwrap();
+        assert!(json.contains("duplex_frame"));
+        assert!(!json.contains("Securitykey"));
     }
 
     #[test]
@@ -1394,7 +1538,7 @@ mod tests {
         let key = aes::generate_key();
         let pkt = b"\x45\x00fake-ipv4-header!!";
         let framed = frame::encode(1, pkt);
-        let payload = aes::seal(&key, &framed).unwrap();
+        let payload = Engine::encode(&base64::engine::general_purpose::STANDARD, &framed);
         let sid = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let mut client = L0Client {
             enabled: true,
@@ -1412,6 +1556,8 @@ mod tests {
                 rejected: false,
                 host_eoa: "0x1111111111111111111111111111111111111111".into(),
                 peer_listen_user_pgp: None,
+                peer_listen_wallet: None,
+                pipe_tx: None,
             },
         );
         let json = serde_json::json!({
@@ -1421,7 +1567,9 @@ mod tests {
         })
         .to_string();
         assert_eq!(client.apply_inbound_armor(&json).unwrap(), pkt.len());
-        assert_eq!(client.inbound_ready, 1);
+        let blob = duplex::seal_frame(&key, sid, &frame::encode(1, pkt)).unwrap();
+        assert_eq!(client.apply_inbound_armor(&blob).unwrap(), pkt.len());
+        assert_eq!(client.inbound_ready, 2);
     }
 
     #[test]

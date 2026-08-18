@@ -1,10 +1,10 @@
 //! Layer Minus overlay client.
 //!
-//! Do not claim a live SI command named `p2p_stream_*` or `listenKind: "l1p2p"`.
-//! Overlay duplex is an **application** protocol on existing Chat listen +
-//! user-PGP gossip. SI does not implement `duplex_*`. Fallback is P1 gossip
-//! if the peer app never sends `duplex_accept`. Any byte-stream still reuses
-//! `POST /post` with `{ "data": "<armor>" }`.
+//! L0 protocol: exclusive `l0_listen` / `l0_connect` occupancy pipe on SI.
+//! Application duplex (`duplex_offer` / `duplex_accept` / `duplex_frame`) rides
+//! on that pipe after occupy. Do not claim SI `duplex_*`, `p2p_stream_*`, or
+//! `listenKind: "l1p2p"`. Missing accept keeps P1 gossip. HTTP first body is
+//! still `{ "data": "<armor>" }`.
 
 pub mod address_pgp;
 pub mod aes;
@@ -15,6 +15,7 @@ pub mod envelope;
 pub mod frame;
 pub mod listen;
 pub mod pgp;
+pub mod pipe;
 pub mod post;
 
 pub use client::L0Client;

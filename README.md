@@ -17,7 +17,7 @@ Linux userspace daemon that lets CoNET L1 `geth` and Prysm `beacon-chain` use **
 
 Operators do **not** run `iptables` by hand.
 
-**Maturity: under development.** Crate MVP is accepted (CLI, locator, TUN / iptables lifecycle, packet counters). Overlay `/post` prefers **application duplex** on existing Chat gossip (user-PGP `duplex_offer` / `duplex_accept` + AES `duplex_frame`); **P1 gossip** remains the fallback if the peer app never sends `duplex_accept`. P1 outbound encrypt + mailbox wrap + `POST { data }`, inbound decrypt + TUN write-back, and listen HTTP+SSE workers exist in-crate and default **off**. Listen ingest matches SI `forWardPGPMessageToClient` raw JSON `{ "data": "<armor>" }` (Chat `handleInbound`), plus duplex JSON frames. In-crate listen matches SI `checkSign`. An authorized lab may enable `[l0]`. The 2026-08-18 lab on authorized L0_ONLY `.45` advertises overlay vIP `100.64.0.5`, completed overlay geth + beacon TCP, and is running CL initial-sync over overlay; after the batching binary the limiter is Prysm (~3.2 blocks/s); EL is still `0x0`. Lab overlay UDP echo and `:4300` (direct + public-ENR steer) arrived on the peer TUN; live discv5 from L0_ONLY `.45` to the `.98` DHT server over L0 is **accepted** (not a production product). Production mailbox delivery is **not** shipped. Production proposers keep public P2P (geth `8400`, beacon `4200` / `4300`) for the 6-second slot.
+**Maturity: under development.** Crate MVP is accepted (CLI, locator, TUN / iptables lifecycle, packet counters). Overlay `/post` prefers SI **`l0_listen` / `l0_connect`** occupancy plus **application duplex** (`duplex_offer` on Chat gossip; accept / reject / AES `duplex_frame` on the occupied pipe); **P1 gossip** remains the fallback if the peer app never sends `duplex_accept` or the pipe is missing. P1 outbound encrypt + mailbox wrap + `POST { data }`, inbound decrypt + TUN write-back, and listen HTTP+SSE workers exist in-crate and default **off**. Listen ingest matches SI `forWardPGPMessageToClient` raw JSON `{ "data": "<armor>" }` (Chat `handleInbound`), plus duplex JSON frames. In-crate listen matches SI `checkSign`. An authorized lab may enable `[l0]`. The 2026-08-18 lab on authorized L0_ONLY `.45` advertises overlay vIP `100.64.0.5`, completed overlay geth + beacon TCP, and is running CL initial-sync over overlay; after the batching binary the limiter is Prysm (~3.2 blocks/s); EL is still `0x0`. Lab overlay UDP echo and `:4300` (direct + public-ENR steer) arrived on the peer TUN; live discv5 from L0_ONLY `.45` to the `.98` DHT server over L0 is **accepted** (not a production product). Production mailbox delivery is **not** shipped. Production proposers keep public P2P (geth `8400`, beacon `4200` / `4300`) for the 6-second slot.
 
 ## What it is not
 
@@ -29,7 +29,7 @@ Operators do **not** run `iptables` by hand.
 
 Layer Minus stays a PGP / wallet-address forwarding plane. HTTP `/post` is only `{ "data": "<OpenPGP armor>" }`. This crate is an **application composition**, not a second IP network.
 
-Overlay duplex is **application JSON** on Chat gossip. SI does **not** implement `duplex_*`. There is **no** live SI command named `p2p_stream_*` or `listenKind: "l1p2p"`. Do not send `mining` + `listenKind: "duplex"`.
+Overlay duplex is SI **`l0_listen` / `l0_connect`** plus **application JSON** on Chat gossip / occupied AES. SI does **not** implement `duplex_*`. There is **no** live SI command named `p2p_stream_*` or `listenKind: "l1p2p"`. Do not send `mining` + `listenKind: "duplex"`.
 
 ## Identity (`web3://`)
 

@@ -19,7 +19,7 @@ Ship an independent **Linux command** `conet-l0d` that operators can start and s
 | `stop` / SIGINT / SIGTERM | Reverse of start; pid from state file |
 | `teardown` | Same reverse path if the daemon is dead |
 | Packet loop | Count IPv4 packets on the TUN; log dest vIP (no secrets) |
-| L0 | Crate stub accepted: count TUN IPv4 and log dest vIP. Live overlay `/post` prefers **application duplex** (offer on long-lived Chat SSE; accept / reject / frames on session listen SSEs); P1 gossip on `duplex_reject` or missing `duplex_accept` — [P1](./P1.md). Do not claim SI `duplex_*` or `p2p_stream_*` |
+| L0 | Crate stub accepted: count TUN IPv4 and log dest vIP. Live overlay `/post` prefers **SI `l0_listen` / `l0_connect` occupancy pipe + application duplex** (offer on Chat gossip; accept / reject / frames as AES on the occupied pipe); P1 gossip on `duplex_reject` or missing `duplex_accept` or missing pipe — [P1](./P1.md). Do not claim SI `duplex_*` or `p2p_stream_*` |
 | Docs | Whitepaper pair + these MVP pages + GitBook Applications + Developers |
 | Example + unit | `config/conet-l0d.example.toml` and `systemd/conet-l0d.service` (`start`/`stop` only) |
 

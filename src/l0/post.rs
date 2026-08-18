@@ -97,6 +97,11 @@ pub async fn send(client: &reqwest::Client, url: &str, armor: &str) -> Result<u1
     Ok(status)
 }
 
+pub fn json_body_bytes(armor: &str) -> Result<Vec<u8>, L0dError> {
+    let body = json_body(armor)?;
+    serde_json::to_vec(&body).map_err(|e| L0dError::L0(format!("POST JSON: {e}")))
+}
+
 pub fn post_url(entry: &str) -> Result<String, L0dError> {
     let trimmed = entry.trim().trim_end_matches('/');
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {

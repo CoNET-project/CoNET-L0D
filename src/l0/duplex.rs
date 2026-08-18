@@ -1,12 +1,13 @@
-//! Application-layer duplex: two dedicated Chat SSEs + overlay AES.
+//! Application-layer duplex on the L0 exclusive occupancy pipe.
 //!
-//! SI does **not** implement `duplex_*` and has **no** duplex pool. Every listen
-//! is existing `mining` + `listenKind: "chat"`. Offer reaches the peer on their
-//! long-lived channel Chat SSE. Accept / reject / frames go to the **session
-//! listen wallet** named in the offer / accept (a one-time routing EOA with its
-//! own Chat SSE). Crate MVP uses the already-registered per-port channel EOA as
-//! that session listen identity. Missing accept **or** `duplex_reject` keeps
-//! P1 gossip.
+//! SI implements **`l0_listen` / `l0_connect`** (or `mining` + `listenKind: "l0"`):
+//! idle L0 SSE may still receive user-PGP gossip; the first `l0_connect` occupies
+//! the SSE, SI pipes remaining TCP, then rejects later inflows (409).
+//! Application JSON `duplex_offer` / `duplex_accept` / `duplex_reject` /
+//! `duplex_frame` is **not** an SI command. Offer stays user-PGP Chat gossip
+//! so it cannot occupy the exclusive L0 listen. Accept / reject / frames are
+//! AES-256-GCM blobs on the occupied pipe. Missing accept keeps P1 gossip.
+//! Do not send `listenKind: "duplex"` or SI `duplex_*`.
 
 use crate::error::L0dError;
 use crate::l0::aes;
@@ -131,6 +132,37 @@ pub fn encode_frame_json(session_id: &str, payload_b64: &str) -> Result<String, 
         return Err(L0dError::L0("duplex_frame must not carry Securitykey".into()));
     }
     Ok(text)
+}
+
+/// AES-GCM wire blob of `duplex_frame` JSON for the occupied L0 SSE.
+/// Inner JSON: `{ "type":"duplex_frame","sessionId","payload" }` where `payload`
+/// is standard base64 of the `L0D1||IPv4` buffer (JSON cannot carry raw bytes).
+/// Outer wire: standard base64 of `nonce(12) || ciphertext || tag(16)`. No OpenPGP.
+pub fn seal_frame(
+    key: &[u8; aes::KEY_LEN],
+    session_id: &str,
+    framed: &[u8],
+) -> Result<String, L0dError> {
+    let payload = Engine::encode(&base64::engine::general_purpose::STANDARD, framed);
+    let json = encode_frame_json(session_id, &payload)?;
+    aes::seal(key, json.as_bytes())
+}
+
+pub fn looks_like_aes_blob(raw: &str) -> bool {
+    let t = raw.trim();
+    t.len() >= 32
+        && !t.starts_with('{')
+        && !t.starts_with("-----")
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+pub fn parse_l0_occupied(payload: &str) -> bool {
+    let v: Value = match serde_json::from_str(payload.trim()) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    v.get("type").and_then(Value::as_str) == Some("l0_occupied")
 }
 
 /// Sign application JSON and encrypt to the peer **user PGP** only (Chat gossip).
@@ -447,9 +479,18 @@ mod tests {
         let reject = encode_reject_command(eth.address(), &got.session_id, 5).unwrap();
         let sign_r = eth.personal_sign(reject.as_bytes()).unwrap();
         let wrap_r = serde_json::json!({ "message": reject, "signMessage": sign_r }).to_string();
-        assert_eq!(
-            parse_reject(&wrap_r).as_deref(),
-            Some(got.session_id.as_str())
-        );
+        assert_eq!(parse_reject(&wrap_r).as_deref(), Some(got.session_id.as_str()));
+    }
+
+    #[test]
+    fn seal_frame_is_aes_blob_not_pgp() {
+        let key = aes::generate_key();
+        let blob = seal_frame(&key, "aa", b"L0D1xxxx").unwrap();
+        assert!(looks_like_aes_blob(&blob));
+        assert!(!blob.contains("BEGIN PGP"));
+        let plain = String::from_utf8(aes::open(&key, &blob).unwrap()).unwrap();
+        let (sid, payload) = parse_duplex_frame_json(&plain).unwrap();
+        assert_eq!(sid, "aa");
+        assert!(!payload.contains("Securitykey"));
     }
 }

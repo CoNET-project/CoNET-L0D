@@ -19,7 +19,7 @@
 | `stop` / SIGINT / SIGTERM | 与 start 相反；pid 来自 state 文件 |
 | `teardown` | 守护进程已死后仍能走同一反向路径 |
 | 收包循环 | 统计 TUN 上的 IPv4；记录目的 vIP（不含密钥） |
-| L0 | crate 桩已验收：统计 TUN IPv4 并记录目的 vIP。现役 overlay `/post` 优先 **应用层 duplex**（要约走长期 Chat SSE；接受 / 拒绝 / 帧走会话 listen SSE）；`duplex_reject` 或无 accept 则 P1 gossip — [P1](./P1.zh-CN.md)。不得声称 SI `duplex_*` 或 `p2p_stream_*` |
+| L0 | crate 桩已验收：统计 TUN IPv4 并记录目的 vIP。现役 overlay `/post` 优先 **SI `l0_listen` / `l0_connect` 占用管道 + 应用层 duplex**（要约走 Chat gossip；接受 / 拒绝 / 帧为占用管道上的 AES）；`duplex_reject` 或无 accept 或无占用管道则 P1 gossip — [P1](./P1.zh-CN.md)。不得声称 SI `duplex_*` 或 `p2p_stream_*` |
 | 文档 | 成对白皮书 + 本 MVP + GitBook Applications + Developers |
 | 示例 + unit | `config/conet-l0d.example.toml` 与 `systemd/conet-l0d.service`（仅 `start`/`stop`） |
 

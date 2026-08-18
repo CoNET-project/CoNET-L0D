@@ -31,13 +31,13 @@ description: conet-l0d 白皮书 / RULES / MVP 改动必须同任务同步 GitBo
 
 ## 与 L0 协议同步的边界
 
-本产品是 **应用组合**，不是新的 L0 协议层。
+本产品是 **应用组合 + 现役 SI `l0_listen` / `l0_connect`**。
 
 | 改动 | 还须写 L0 协议页？ |
 | --- | --- |
 | 仅 crate / TUN / 操作员文档 | ❌ 不要扩写 `mailbox-routing` / SI 命令表冒充已上线 |
 | 改动应用层 duplex JSON（`duplex_offer` / `duplex_accept` / `duplex_frame`） | ✅ 同任务：`duplex-forward`、`using-l0` 组合表 **以及** 两页 conet-l0d。**不要**往 SI 命令表加 `duplex_*` |
-| 新增或改动现役 SI 命令（**禁止**把 `duplex_*` / `p2p_stream_*` / `listenKind: l1p2p` 写成 current SI） | ✅ 同任务：`using-l0`、mailbox routing、SI developer guide **以及** 两页 conet-l0d |
+| 新增或改动现役 SI 命令（`l0_listen` / `l0_connect`；**禁止**把 `duplex_*` / `p2p_stream_*` / `listenKind: l1p2p` 写成 current SI） | ✅ 同任务：`using-l0`、mailbox routing、SI developer guide **以及** 两页 conet-l0d |
 
 全局协议守则：仓库 `.cursor/rules/conet-depin-gitbook-sync.mdc`。不要把「crate 文档更新」误写成必须改 SI。
 

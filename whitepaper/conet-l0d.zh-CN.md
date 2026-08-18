@@ -1,7 +1,7 @@
 # conet-l0d — 在 Layer Minus 上的 L1 overlay
 
 **成对译本：** [English](./conet-l0d.md)  
-**Revision：** 2026-08-18（应用层 duplex：要约走长期 Chat SSE；接受 / 拒绝 / 帧走会话 listen SSE；拒绝或无 accept 则 P1 gossip；可选按端口 `[[l0.channels]]` listen SSE；overlay IPv4 合批 + POST 32/512；追链受 Prysm 限速；实验室 overlay UDP + 经 L0 的现役 discv5 已通过；DHT 掉线先清幽灵 conntrack；授权 `.45` `restart-beacon` 仅用于拨号 backoff；`ss` 公网 `:4200` 是 DNAT 原目的、不是漏公网；不是生产 discv5 产品）  
+**Revision：** 2026-08-18（SI `l0_listen` / `l0_connect` 占用管道；应用层 duplex：要约走 Chat gossip；接受 / 拒绝 / 帧为占用管道上的 AES；拒绝、无 accept 或无管道则 P1 gossip；可选按端口 `[[l0.channels]]` listen SSE；overlay IPv4 合批 + POST 32/512；追链受 Prysm 限速；实验室 overlay UDP + 经 L0 的现役 discv5 已通过；DHT 掉线先清幽灵 conntrack；授权 `.45` `restart-beacon` 仅用于拨号 backoff；`ss` 公网 `:4200` 是 DNAT 原目的、不是漏公网；不是生产 discv5 产品）  
 **公开操作说明：** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **公开开发说明：** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -112,14 +112,15 @@ SIGINT / SIGTERM / `stop` / `teardown`：
 | 方向 | 加密目标 | HTTP |
 | --- | --- | --- |
 | `duplex_offer` | 对端 **长期 user PGP** | 入口 **A ≠ B**。Chat gossip 到现有通道 SSE。SI **不解析** `duplex_*` |
-| `duplex_accept` / `duplex_reject` | 发起方 **会话 listen user PGP** | 入口 **A ≠ B**。落到发起方会话 Chat SSE |
-| 会话 / 通道 listen | mailbox **B route PGP** | 现有 `mining` + `listenKind: "chat"`，经 **C ≠ B**。两套自有 SSE；禁止在对端 B 上 guest listen |
-| Overlay IPv4（duplex 数据面） | AES-256-GCM（`L0D1` \|\| IPv4）放进 user-PGP `duplex_frame`，加密给对端 **会话 listen user PGP**，再 mailbox wrap | 入口 **A ≠ B**。与 P1 gossip 同一 `{ "data" }` |
-| P1 gossip 回退（`duplex_reject` 或无 accept） | 对端 **user PGP**，再 wrap 给 **B route PGP** | 入口 **A ≠ B** |
+| 独占 L0 listen | mailbox **B route PGP** | `l0_listen` 或 `mining` + `listenKind: "l0"`，经 **C ≠ B**。不得带 overlay AES。两套自有 L0 SSE；禁止在对端 B 上 guest listen |
+| `l0_connect` | **目标** mailbox **B route PGP** | 占用空闲 L0 SSE；随后同一 TCP 上 AES blob。已占用 → 409 |
+| `duplex_accept` / `duplex_reject` | 占用发起方 L0 管道上的 AES | 接收方占用 `W_I` 后的首个 AES blob |
+| Overlay IPv4（duplex 数据面） | AES 封 `duplex_frame` JSON；`payload` = `L0D1` \|\| IPv4 的 standard base64 | 占用对端 L0 管道 |
+| P1 gossip 回退（`duplex_reject` 或无 accept 或无占用管道） | 对端 **user PGP**，再 wrap 给 **B route PGP** | 入口 **A ≠ B** |
 
 HTTP 体只有 `{ "data": "<armor>" }`。本客户端不带 hop-sig 头。HTTP JSON 上不放 `NoPush`。
 
-Duplex 是 Chat gossip 上的 **应用 JSON**：`duplex_offer`、`duplex_accept`、`duplex_reject`、`duplex_frame`。发起方附 overlay AES 钥与 **会话 listen 钱包**；接收方拒绝则打到该 SSE，同意则回钥并附自己的会话 listen 钱包。规范：[Duplex overlay](https://gitbook.conet.network/l0/duplex-forward.html)。crate MVP 用已登记的按端口通道 EOA 作为会话 listen 身份。**禁止**发 `command: "mining"` + `listenKind: "duplex"`。**禁止**把 SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` 写成现役 SI。
+Duplex 是 Chat gossip 上的 **应用 JSON**，加上 SI 占用管道上的 AES：`duplex_offer`、`duplex_accept`、`duplex_reject`、`duplex_frame`。发起方附 overlay AES 钥与 **会话 listen 钱包**；接收方拒绝则以 `l0_connect` 占用该 L0 SSE 并发送 `duplex_reject`，同意则回钥并附自己的会话 listen 钱包。规范：[Duplex overlay](https://gitbook.conet.network/l0/duplex-forward.html)。crate MVP 用已登记的按端口通道 EOA 作为会话 listen 身份。**禁止**发 `command: "mining"` + `listenKind: "duplex"`。**禁止**把 SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` 写成现役 SI。**要**把现役 SI `l0_listen` / `l0_connect` 写进协议页。
 
 现有 UDP forward 是另一条组合（idle 更短；不是 overlay TCP）。
 
