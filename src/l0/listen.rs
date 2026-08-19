@@ -314,6 +314,8 @@ fn extract_armors_from_frame(frame: &str) -> Vec<String> {
             || crate::l0::duplex::parse_accept(trimmed).is_some()
             || crate::l0::duplex::parse_reject(trimmed).is_some()
             || crate::l0::duplex::parse_l0_occupied(trimmed)
+            || crate::l0::duplex::parse_l0_listen_released(trimmed).is_some()
+            || crate::l0::duplex::parse_l0_pipe_end(trimmed).is_some()
             || trimmed.contains("\"duplex_offer\""))
     {
         return vec![trimmed.to_string()];

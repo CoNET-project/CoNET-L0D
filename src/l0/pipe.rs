@@ -4,8 +4,13 @@
 //! After `l0_connect` occupies an idle L0 SSE, those leftover lines are AES
 //! blobs (not OpenPGP). reqwest cannot keep that TCP, so this module writes
 //! the JSON body then extra `\n` + base64 lines on the same stream.
+//!
+//! When SI tears down an occupied listen it may write one JSON line
+//! `{"type":"l0_pipe_end",...}\n` on the inbound TCP before destroy; the
+//! reader here surfaces that as [`L0dError::L0PipeEnd`].
 
 use crate::error::L0dError;
+use crate::l0::duplex;
 use crate::l0::post;
 use rustls::pki_types::ServerName;
 use std::sync::Arc;
@@ -26,22 +31,63 @@ pub async fn run_occupied_pipe(
     let mut last = L0dError::L0("l0_connect pipe failed".into());
     for entry in entries {
         match open_pipe(entry, connect_armor).await {
-            Ok(mut stream) => {
+            Ok((mut stream, mut reader)) => {
                 if let Some(blob) = first.take() {
                     if let Err(err) = write_blob_line(&mut stream, &blob).await {
                         last = err;
                         continue;
                     }
                 }
-                while let Some(blob) = rx.recv().await {
-                    write_blob_line(&mut stream, &blob).await?;
+                let mut line_buf = String::new();
+                loop {
+                    tokio::select! {
+                        blob = rx.recv() => {
+                            match blob {
+                                Some(b) => write_blob_line(&mut stream, &b).await?,
+                                None => return Ok(()),
+                            }
+                        }
+                        line = read_pipe_line(&mut reader, &mut line_buf) => {
+                            match line? {
+                                None => return Ok(()),
+                                Some(l) if l.is_empty() => {}
+                                Some(l) => {
+                                    if let Some(info) = duplex::parse_l0_pipe_end(&l) {
+                                        return Err(L0dError::L0PipeEnd {
+                                            reason: info.reason,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                return Ok(());
             }
             Err(err) => last = err,
         }
     }
     Err(last)
+}
+
+async fn read_pipe_line(
+    reader: &mut PipeReader,
+    buf: &mut String,
+) -> Result<Option<String>, L0dError> {
+    loop {
+        if let Some(pos) = buf.find('\n') {
+            let line: String = buf.drain(..=pos).collect();
+            return Ok(Some(line.trim().to_string()));
+        }
+        let mut tmp = [0u8; 1024];
+        let n = reader
+            .read(&mut tmp)
+            .await
+            .map_err(|e| L0dError::L0(format!("l0 pipe read: {e}")))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
+    }
 }
 
 async fn write_blob_line(stream: &mut SplitPipe, blob: &str) -> Result<(), L0dError> {
@@ -162,7 +208,7 @@ async fn read_http_ok(reader: &mut PipeReader) -> Result<(), L0dError> {
     }
 }
 
-async fn open_pipe(entry: &str, armor: &str) -> Result<SplitPipe, L0dError> {
+async fn open_pipe(entry: &str, armor: &str) -> Result<(SplitPipe, PipeReader), L0dError> {
     let url = post::post_url(entry)?;
     let parsed = url::Url::parse(&url).map_err(|e| L0dError::L0(format!("l0 pipe URL: {e}")))?;
     let host = parsed
@@ -222,16 +268,7 @@ async fn open_pipe(entry: &str, armor: &str) -> Result<SplitPipe, L0dError> {
     // Wait until SI has answered (and attached the occupy data handler) before
     // writing AES blobs; racing Content-Length parsing drops the accept line.
     read_http_ok(&mut reader).await?;
-    tokio::spawn(async move {
-        let mut buf = [0u8; 1024];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-    });
-    Ok(SplitPipe { writer })
+    Ok((SplitPipe { writer }, reader))
 }
 
 fn tls_connector() -> Result<TlsConnector, L0dError> {

@@ -27,6 +27,11 @@ const POST_QUEUE: usize = 2048;
 const POST_CONCURRENCY: usize = 4;
 const LISTEN_QUEUE: usize = 512;
 const LISTEN_RECONNECT_SECS: u64 = 3;
+/// After `l0_connect` fails (e.g. peer L0 listen not idle yet), retry instead of
+/// permanently clearing `pipe_tx` and falling back to P1.
+const L0_PIPE_RETRY_SECS: u64 = 3;
+/// SI signaled explicit teardown on the occupied inbound TCP; retry quickly.
+const L0_PIPE_END_RETRY_SECS: u64 = 1;
 const BATCH_MAX_PACKETS: usize = 16;
 const BATCH_MAX_BYTES: usize = 12 * 1024;
 
@@ -79,6 +84,15 @@ struct ChannelWire {
     user_pub: String,
 }
 
+/// Shared by exclusive `l0_listen` workers so a successful SSE reconnect can
+/// rebuild outbound `l0_connect` pipes instead of leaving `pipe_tx = None` (P1).
+#[derive(Clone)]
+struct L0PipeRebuild {
+    duplex: Arc<Mutex<HashMap<(Ipv4Addr, u16), DuplexSession>>>,
+    wires: Arc<HashMap<u16, ChannelWire>>,
+    peers: Arc<HashMap<(Ipv4Addr, u16), PeerPgp>>,
+}
+
 #[derive(Clone)]
 struct DuplexSession {
     session_id: String,
@@ -98,6 +112,8 @@ struct DuplexSession {
     peer_listen_wallet: Option<String>,
     /// Occupied `l0_connect` writer. AES blobs only; never overlay key on this channel.
     pipe_tx: Option<mpsc::Sender<String>>,
+    /// Bumps on every `spawn_l0_pipe` so a dying task does not clear a newer pipe.
+    pipe_gen: u64,
 }
 
 impl fmt::Debug for PostJob {
@@ -268,6 +284,13 @@ impl L0Client {
 
         let (inbound_tx, inbound_rx_ch) = mpsc::channel::<String>(LISTEN_QUEUE);
         let mut user_secrets = Vec::new();
+        let channel_wire = load_channel_wires(cfg);
+        let duplex = Arc::new(Mutex::new(HashMap::new()));
+        let pipe_rebuild = L0PipeRebuild {
+            duplex: duplex.clone(),
+            wires: Arc::new(channel_wire.clone()),
+            peers: Arc::new(peers.clone()),
+        };
         let mut listen_spawned = false;
         if cfg.l0.enabled {
             listen_spawned = if cfg.l0.channels.is_empty() {
@@ -280,15 +303,21 @@ impl L0Client {
                         ),
                     }
                 }
-                spawn_legacy_listen_into(cfg, &routing_eoa, !user_secrets.is_empty(), inbound_tx.clone())
+                spawn_legacy_listen_into(
+                    cfg,
+                    &routing_eoa,
+                    !user_secrets.is_empty(),
+                    inbound_tx.clone(),
+                    Some(pipe_rebuild.clone()),
+                )
             } else {
-                spawn_channel_listens_into(cfg, &mut user_secrets, inbound_tx.clone())
+                spawn_channel_listens_into(
+                    cfg,
+                    &mut user_secrets,
+                    inbound_tx.clone(),
+                    Some(pipe_rebuild.clone()),
+                )
             };
-        }
-
-        let channel_wire = load_channel_wires(cfg);
-        let duplex = Arc::new(Mutex::new(HashMap::new()));
-        if cfg.l0.enabled {
             spawn_duplex_runtime(
                 cfg,
                 &channel_wire,
@@ -355,6 +384,14 @@ impl L0Client {
         if duplex::parse_l0_occupied(trimmed) {
             return Ok(0);
         }
+        if let Some(info) = duplex::parse_l0_pipe_end(trimmed) {
+            self.release_l0_listen_target(&info.wallet);
+            return Ok(0);
+        }
+        if let Some(wallet) = duplex::parse_l0_listen_released(trimmed) {
+            self.release_l0_listen_target(&wallet);
+            return Ok(0);
+        }
         if duplex::looks_like_aes_blob(trimmed) {
             return self.apply_duplex_aes_blob(trimmed);
         }
@@ -409,6 +446,21 @@ impl L0Client {
         }
         self.inbound_refused = self.inbound_refused.saturating_add(1);
         Err(last_err)
+    }
+
+    /// Drop occupied `l0_connect` writers when SI releases a listen target.
+    fn release_l0_listen_target(&mut self, wallet: &str) {
+        let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+        for sess in guard.values_mut() {
+            if sess
+                .peer_listen_wallet
+                .as_ref()
+                .is_some_and(|w| eip191::eoa_eq(w, wallet))
+            {
+                sess.pipe_tx = None;
+                sess.pipe_gen = sess.pipe_gen.wrapping_add(1);
+            }
+        }
     }
 
     fn apply_duplex_aes_blob(&mut self, blob: &str) -> Result<usize, L0dError> {
@@ -558,6 +610,7 @@ impl L0Client {
                 peer_listen_user_pgp: None,
                 peer_listen_wallet: Some(target.clone()),
                 pipe_tx: None,
+                pipe_gen: 0,
             };
             spawn_l0_pipe(wire, route, target, first, dummy, self.duplex.clone());
         }
@@ -913,6 +966,7 @@ fn spawn_legacy_listen_into(
     routing_eoa: &str,
     has_secret: bool,
     tx: mpsc::Sender<String>,
+    pipe_rebuild: Option<L0PipeRebuild>,
 ) -> bool {
     if !has_secret || routing_eoa.is_empty() || cfg.l0.listen_entries.is_empty() {
         return false;
@@ -958,6 +1012,7 @@ fn spawn_legacy_listen_into(
         eth.clone(),
         tx.clone(),
         false,
+        None,
     );
     let l0 = spawn_listen_worker(
         cfg.l0.listen_entries.clone(),
@@ -966,6 +1021,7 @@ fn spawn_legacy_listen_into(
         eth,
         tx,
         true,
+        pipe_rebuild,
     );
     chat || l0
 }
@@ -974,6 +1030,7 @@ fn spawn_channel_listens_into(
     cfg: &ValidatedConfig,
     user_secrets: &mut Vec<SecretCert>,
     tx: mpsc::Sender<String>,
+    pipe_rebuild: Option<L0PipeRebuild>,
 ) -> bool {
     let mut spawned = 0u32;
     for ch in &cfg.l0.channels {
@@ -1030,6 +1087,7 @@ fn spawn_channel_listens_into(
             eth.clone(),
             tx.clone(),
             false,
+            None,
         ) {
             spawned += 1;
         }
@@ -1040,6 +1098,7 @@ fn spawn_channel_listens_into(
             eth,
             tx.clone(),
             true,
+            pipe_rebuild.clone(),
         ) {
             spawned += 1;
         }
@@ -1054,6 +1113,7 @@ fn spawn_listen_worker(
     eth: EthSecret,
     tx: mpsc::Sender<String>,
     l0_exclusive: bool,
+    pipe_rebuild: Option<L0PipeRebuild>,
 ) -> bool {
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return false;
@@ -1079,21 +1139,45 @@ fn spawn_listen_worker(
                 listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, entry, &eth)
             };
             match prepared {
-                Ok((url, armor)) => match listen::run_listen_once(&client, &url, &armor, &tx).await
-                {
-                    Ok(_) => {
-                        last_failed = None;
-                        tracing::info!(
-                            eoa = %routing_eoa,
-                            l0 = l0_exclusive,
-                            "listen SSE ended; reconnecting after idle"
-                        );
+                Ok((url, armor)) => {
+                    match listen::open_listen_sse(&client, &url, &armor).await {
+                        Ok(response) => {
+                            last_failed = None;
+                            if l0_exclusive {
+                                if let Some(ctx) = pipe_rebuild.as_ref() {
+                                    rebuild_l0_pipes_after_listen_up(&routing_eoa, ctx);
+                                }
+                            }
+                            match listen::pump_sse_armors(response, &tx).await {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        eoa = %routing_eoa,
+                                        l0 = l0_exclusive,
+                                        "listen SSE ended; reconnecting after idle"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        eoa = %routing_eoa,
+                                        l0 = l0_exclusive,
+                                        error = %err,
+                                        "listen SSE failed"
+                                    );
+                                    last_failed = Some(entry.to_string());
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                eoa = %routing_eoa,
+                                l0 = l0_exclusive,
+                                error = %err,
+                                "listen SSE failed"
+                            );
+                            last_failed = Some(entry.to_string());
+                        }
                     }
-                    Err(err) => {
-                        tracing::warn!(eoa = %routing_eoa, l0 = l0_exclusive, error = %err, "listen SSE failed");
-                        last_failed = Some(entry.to_string());
-                    }
-                },
+                }
                 Err(err) => {
                     tracing::warn!(eoa = %routing_eoa, error = %err, "listen wrap refused");
                     last_failed = Some(entry.to_string());
@@ -1103,6 +1187,53 @@ fn spawn_listen_worker(
         }
     });
     true
+}
+
+/// After exclusive `l0_listen` is live again, rebuild outbound occupy pipes for
+/// duplex sessions that already have `peer_attached` (do not leave permanent P1).
+fn rebuild_l0_pipes_after_listen_up(routing_eoa: &str, ctx: &L0PipeRebuild) {
+    let to_launch: Vec<DuplexSession> = {
+        let guard = ctx.duplex.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .values()
+            .filter(|s| {
+                eip191::eoa_eq(&s.host_eoa, routing_eoa)
+                    && s.peer_attached
+                    && !s.rejected
+                    && s.key.is_some()
+                    && s.peer_listen_wallet
+                        .as_ref()
+                        .map(|w| !w.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    };
+    for sess in to_launch {
+        let Some(wire) = ctx.wires.get(&sess.port).cloned() else {
+            continue;
+        };
+        let Some(keys) = ctx.peers.get(&(sess.dest, sess.port)) else {
+            continue;
+        };
+        let Some(target) = sess.peer_listen_wallet.clone() else {
+            continue;
+        };
+        tracing::info!(
+            session = %sess.session_id,
+            eoa = %routing_eoa,
+            target = %target,
+            "L0 listen up — rebuilding l0_connect"
+        );
+        spawn_l0_pipe(
+            wire,
+            keys.route.0.clone(),
+            target,
+            None,
+            sess,
+            ctx.duplex.clone(),
+        );
+    }
 }
 
 fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
@@ -1234,6 +1365,7 @@ fn spawn_duplex_runtime(
                         peer_listen_user_pgp: None,
                         peer_listen_wallet: None,
                         pipe_tx: None,
+                        pipe_gen: 0,
                     },
                 );
             }
@@ -1359,35 +1491,112 @@ fn spawn_l0_pipe(
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return;
     };
-    let ts = chrono::Utc::now().timestamp().max(0) as u64;
-    let Ok(connect_armor) =
-        listen::wrap_l0_connect_for_post(&wire.eoa, &target_wallet, ts, &peer_route_pgp, &wire.eth)
-    else {
-        tracing::warn!(session = %sess.session_id, "l0_connect wrap refused");
-        return;
-    };
-    let (tx, rx) = mpsc::channel::<String>(512);
-    {
-        let mut guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(live) = guard.get_mut(&(sess.dest, sess.port)) {
-            live.pipe_tx = Some(tx.clone());
-        }
-    }
+    let dest = sess.dest;
+    let port = sess.port;
+    let session_id = sess.session_id.clone();
+    let oneshot_reject = sess.rejected;
     let entries = if wire.entries.is_empty() {
         wire.listen_entries.clone()
     } else {
         wire.entries.clone()
     };
-    let dest = sess.dest;
-    let port = sess.port;
     handle.spawn(async move {
-        match pipe::run_occupied_pipe(&entries, &connect_armor, first, rx).await {
-            Ok(()) => tracing::info!(session = %sess.session_id, "l0_connect pipe closed"),
-            Err(err) => {
-                tracing::warn!(session = %sess.session_id, error = %err, "l0_connect pipe failed");
+        let mut first_blob = first;
+        loop {
+            let ts = chrono::Utc::now().timestamp().max(0) as u64;
+            let Ok(connect_armor) = listen::wrap_l0_connect_for_post(
+                &wire.eoa,
+                &target_wallet,
+                ts,
+                &peer_route_pgp,
+                &wire.eth,
+            ) else {
+                tracing::warn!(session = %session_id, "l0_connect wrap refused");
+                return;
+            };
+            let (tx, rx) = mpsc::channel::<String>(512);
+            let gen = if oneshot_reject {
+                // duplex_reject: not in the duplex map. Drop `tx` so rx closes after
+                // `first_blob` (same as the old map-miss path).
+                drop(tx);
+                None
+            } else {
                 let mut guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(live) = guard.get_mut(&(dest, port)) {
-                    live.pipe_tx = None;
+                let Some(live) = guard.get_mut(&(dest, port)) else {
+                    return;
+                };
+                if live.rejected || !live.peer_attached {
+                    return;
+                }
+                live.pipe_gen = live.pipe_gen.wrapping_add(1);
+                let gen = live.pipe_gen;
+                live.pipe_tx = Some(tx);
+                Some(gen)
+            };
+            match pipe::run_occupied_pipe(&entries, &connect_armor, first_blob.take(), rx).await {
+                Ok(()) => {
+                    if oneshot_reject || gen.is_none() {
+                        tracing::info!(session = %session_id, "l0_connect pipe closed");
+                        return;
+                    }
+                    let gen = gen.expect("tracked pipe");
+                    let should_retry = {
+                        let guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+                        match guard.get(&(dest, port)) {
+                            Some(live)
+                                if live.pipe_gen == gen
+                                    && live.peer_attached
+                                    && !live.rejected
+                                    && live.pipe_tx.is_none() =>
+                            {
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if should_retry {
+                        tracing::info!(
+                            session = %session_id,
+                            "l0_connect pipe closed; retrying occupy"
+                        );
+                        tokio::time::sleep(Duration::from_secs(L0_PIPE_RETRY_SECS)).await;
+                        continue;
+                    }
+                    tracing::info!(session = %session_id, "l0_connect pipe closed");
+                    return;
+                }
+                Err(err) => {
+                    let retry_secs = match &err {
+                        L0dError::L0PipeEnd { .. } => L0_PIPE_END_RETRY_SECS,
+                        _ => L0_PIPE_RETRY_SECS,
+                    };
+                    tracing::warn!(session = %session_id, error = %err, "l0_connect pipe failed");
+                    if oneshot_reject || gen.is_none() {
+                        return;
+                    }
+                    let gen = gen.expect("tracked pipe");
+                    let should_retry = {
+                        let mut guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(live) = guard.get_mut(&(dest, port)) {
+                            if live.pipe_gen == gen {
+                                live.pipe_tx = None;
+                                live.peer_attached && !live.rejected
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if !should_retry {
+                        return;
+                    }
+                    tracing::info!(
+                        session = %session_id,
+                        retry_secs,
+                        "l0_connect failed; retrying occupy pipe"
+                    );
+                    tokio::time::sleep(Duration::from_secs(retry_secs)).await;
                 }
             }
         }
@@ -1533,6 +1742,7 @@ mod tests {
                 peer_listen_user_pgp: None,
                 peer_listen_wallet: None,
                 pipe_tx: None,
+                pipe_gen: 0,
             },
         );
         let prepared = client
@@ -1574,6 +1784,7 @@ mod tests {
                 peer_listen_user_pgp: None,
                 peer_listen_wallet: Some("0x2222222222222222222222222222222222222222".into()),
                 pipe_tx: Some(tx),
+                pipe_gen: 1,
             },
         );
         let prepared = client
@@ -1613,6 +1824,7 @@ mod tests {
                 peer_listen_user_pgp: None,
                 peer_listen_wallet: None,
                 pipe_tx: None,
+                pipe_gen: 0,
             },
         );
         let json = serde_json::json!({

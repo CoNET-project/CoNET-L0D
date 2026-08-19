@@ -165,6 +165,45 @@ pub fn parse_l0_occupied(payload: &str) -> bool {
     v.get("type").and_then(Value::as_str) == Some("l0_occupied")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L0PipeEndInfo {
+    pub wallet: String,
+    pub reason: String,
+    pub connector: Option<String>,
+}
+
+/// SI teardown notice on the occupied `l0_connect` TCP (one JSON line + `\n`).
+pub fn parse_l0_pipe_end(payload: &str) -> Option<L0PipeEndInfo> {
+    let v: Value = serde_json::from_str(payload.trim()).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("l0_pipe_end") {
+        return None;
+    }
+    let wallet = v.get("wallet").and_then(Value::as_str)?.to_string();
+    let reason = v
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("pipe_end")
+        .to_string();
+    let connector = v
+        .get("connector")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(L0PipeEndInfo {
+        wallet,
+        reason,
+        connector,
+    })
+}
+
+/// Optional SSE notice when SI releases an occupied L0 listen before drop.
+pub fn parse_l0_listen_released(payload: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload.trim()).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("l0_listen_released") {
+        return None;
+    }
+    v.get("wallet").and_then(Value::as_str).map(str::to_string)
+}
+
 /// Sign application JSON and encrypt to the peer **user PGP** only (Chat gossip).
 pub fn wrap_app_for_user_pgp(
     command_json: &str,
@@ -508,5 +547,24 @@ mod tests {
         let (sid, payload) = parse_duplex_frame_json(&plain).unwrap();
         assert_eq!(sid, "aa");
         assert!(!payload.contains("Securitykey"));
+    }
+
+    #[test]
+    fn parse_l0_pipe_end_and_listen_released() {
+        let end = parse_l0_pipe_end(
+            r#"{"type":"l0_pipe_end","wallet":"0xAbC","connector":"0xdef","reason":"inbound_close"}"#,
+        )
+        .unwrap();
+        assert_eq!(end.wallet, "0xAbC");
+        assert_eq!(end.reason, "inbound_close");
+        assert_eq!(end.connector.as_deref(), Some("0xdef"));
+        assert!(parse_l0_pipe_end(r#"{"type":"l0_occupied"}"#).is_none());
+        assert_eq!(
+            parse_l0_listen_released(
+                r#"{"type":"l0_listen_released","wallet":"0x1111111111111111111111111111111111111111"}"#
+            )
+            .as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
     }
 }
