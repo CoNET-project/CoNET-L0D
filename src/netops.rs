@@ -7,7 +7,10 @@ pub async fn install(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     platform::install(cfg).await
 }
 
-pub async fn uninstall(cfg: &ValidatedConfig, state: Option<&RuntimeState>) -> Result<(), L0dError> {
+pub async fn uninstall(
+    cfg: &ValidatedConfig,
+    state: Option<&RuntimeState>,
+) -> Result<(), L0dError> {
     platform::uninstall(cfg, state).await
 }
 

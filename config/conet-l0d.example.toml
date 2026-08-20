@@ -69,3 +69,22 @@ tcp_ports = [4200]
 # Per-peer public key files (lab override; do not log contents):
 # user_pgp_file = "/etc/conet-l0d/peer-user.asc"
 # route_pgp_file = "/etc/conet-l0d/peer-route.asc"
+
+# Application gateway mode:
+#   conet-l0d gateway --config /etc/conet-l0d-gateway.toml
+# This mode does not create a TUN or change iptables. It listens to the
+# gateway mailbox over SSE, fetches only loopback HTTP content, and posts
+# encrypted responses to the requesting wallet mailbox through Entry nodes.
+#
+# [gateway]
+# rpc = "https://rpc1.conet.network"
+# upstream = "http://127.0.0.1:8080"
+# listen_entries = ["https://<existing-entry-c>.conet.network"]
+# post_entries = ["https://<existing-entry-a>.conet.network"]
+# routing_eoa = "0x<gateway-eoa>"
+# routing_key_file = "/etc/conet-web3-gateway/secrets/gateway-pgp.asc"
+# routing_eth_key_file = "/etc/conet-web3-gateway/secrets/gateway.eth"
+# mailbox_route_pgp_file = "/etc/conet-web3-gateway/secrets/mailbox-route.asc"
+# allowed_methods = ["GET", "HEAD"]
+# max_body_bytes = 8388608
+# request_timeout_seconds = 15

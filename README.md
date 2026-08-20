@@ -57,7 +57,7 @@ cargo build --release
 sudo install -m 0755 target/release/conet-l0d /usr/local/sbin/conet-l0d
 ```
 
-`check-config`, `resolve`, and `status` run on any OS. `start` / `stop` / `teardown` need Linux, `ip`, `iptables`, and `CAP_NET_ADMIN` (usually `sudo`).
+`check-config`, `resolve`, and `status` run on any OS. `start` / `stop` / `teardown` need Linux, `ip`, `iptables`, and `CAP_NET_ADMIN` (usually `sudo`). `gateway` is a separate server mode and does not create a TUN or modify iptables; it reads key material from local files.
 
 ## Commands
 
@@ -66,9 +66,39 @@ conet-l0d check-config --config config/conet-l0d.example.toml
 conet-l0d resolve 'web3://0x1111111111111111111111111111111111111111/p2p/geth'
 conet-l0d status --config /etc/conet-l0d.toml
 sudo conet-l0d start --config /etc/conet-l0d.toml
+conet-l0d gateway --config /etc/conet-l0d-gateway.toml
 sudo conet-l0d stop --config /etc/conet-l0d.toml
 sudo conet-l0d teardown --config /etc/conet-l0d.toml
 ```
+
+Gateway mode uses `[gateway]` with a loopback `upstream`, separate
+`listen_entries` and `post_entries`, `routing_eoa`, and local files for the
+gateway PGP certificate, EIP-191 secret, and mailbox route public key. It
+accepts signed `conet_web3_request_v1` messages over mailbox SSE, proxies
+validated GET/HEAD requests to the upstream, and posts an encrypted
+`conet_web3_response_v1` to the requester through an Entry. The inbound SSE
+is receive-only; the requester receives the response on its own mailbox SSE.
+
+### Verified deployment: `conet.network` (2026-08-20)
+
+The gateway mode was built natively for Linux and deployed on `conet.network`
+as `conet-l0d-gateway.service`. A separate
+`conet-web3-origin-proxy.service` serves the existing
+`https://conet.network` origin through loopback HTTP on `127.0.0.1:8080`.
+Both services were verified active.
+
+The real end-to-end acceptance flow used a newly generated requester EOA and
+PGP identity, the production AddressPGP registration path, a real Entry node,
+and the official gateway destination:
+
+```text
+web3://0xA8386335F1a8C6Fab3798F36cd4F663Ce7bF5A53/
+```
+
+The response returned HTTP `200` with `text/html`; its SHA-256 matched a direct
+fetch of `https://conet.network/` exactly. This proves the deployed mailbox
+request/response path and origin adapter, but does not make the gateway a
+direct public port-80 mailbox or claim production multi-Guardian hosting.
 
 Copy `config/conet-l0d.example.toml` to `/etc/conet-l0d.toml` and set `local_vip`, `identity.locator`, and `[[peers]]`.
 
@@ -114,6 +144,7 @@ Phase 1 uses **static** overlay peers. The crate envelope already carries IPv4 i
 | [白皮书（简体中文）](whitepaper/conet-l0d.zh-CN.md) | Paired translation |
 | [MVP](docs/MVP.md) · [MVP（中文）](docs/MVP.zh-CN.md) | Accepted crate MVP |
 | [P1](docs/P1.md) · [P1（中文）](docs/P1.zh-CN.md) | Overlay `/post` encrypt + mailbox wrap + POST; inbound decrypt + TUN write-back; EIP-191 listen worker; SI gossip JSON ingest; `[l0]` default off; authorized lab may enable `[l0]`; 2026-08-18: `.45` advertises overlay vIP; overlay geth + beacon TCP; CL initial-sync in progress |
+| `systemd/conet-l0d-gateway.service` | Optional gateway-only unit; no `CAP_NET_ADMIN`, TUN, or iptables |
 | [P2](docs/P2.md) · [P2（中文）](docs/P2.zh-CN.md) | Lab overlay UDP / DHT-port comms (echo + `:4300` + public-ENR steer + live discv5 via L0). Not a closed P2 / production product |
 | [Lab overlay QoS 2026-08-18](docs/lab-overlay-qos-2026-08-18.md) | Both-end log + TUN + TCP quality snapshot (~15 min). Mailbox path lossless; overlay RTT ~500 ms; hub TUN `tx_dropped=937`. Not a protocol change |
 | [Operator flags](docs/operator-flags.md) | geth / beacon advertise flags |

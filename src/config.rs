@@ -22,6 +22,43 @@ pub struct DaemonConfig {
     pub peers: Vec<PeerConfig>,
     #[serde(default)]
     pub l0: L0Config,
+    #[serde(default)]
+    pub gateway: Option<GatewayConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    #[serde(default = "default_gateway_rpc")]
+    pub rpc: String,
+    pub upstream: String,
+    pub listen_entries: Vec<String>,
+    pub post_entries: Vec<String>,
+    pub routing_eoa: String,
+    pub routing_key_file: PathBuf,
+    pub routing_eth_key_file: PathBuf,
+    pub mailbox_route_pgp_file: PathBuf,
+    #[serde(default = "default_gateway_methods")]
+    pub allowed_methods: Vec<String>,
+    #[serde(default = "default_gateway_max_body_bytes")]
+    pub max_body_bytes: usize,
+    #[serde(default = "default_gateway_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+}
+
+fn default_gateway_rpc() -> String {
+    "https://rpc1.conet.network".into()
+}
+
+fn default_gateway_methods() -> Vec<String> {
+    vec!["GET".into(), "HEAD".into()]
+}
+
+fn default_gateway_max_body_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+fn default_gateway_timeout_seconds() -> u64 {
+    15
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +145,22 @@ pub struct ValidatedConfig {
     pub identity: Locator,
     pub peers: Vec<ValidatedPeer>,
     pub l0: L0Settings,
+    pub gateway: Option<ValidatedGateway>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedGateway {
+    pub rpc: String,
+    pub upstream: String,
+    pub listen_entries: Vec<String>,
+    pub post_entries: Vec<String>,
+    pub routing_eoa: String,
+    pub routing_key_file: PathBuf,
+    pub routing_eth_key_file: PathBuf,
+    pub mailbox_route_pgp_file: PathBuf,
+    pub allowed_methods: HashSet<String>,
+    pub max_body_bytes: usize,
+    pub request_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -226,7 +279,9 @@ fn allow_existing_http_host(url: &str) -> Result<(), L0dError> {
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
         .ok_or_else(|| {
-            L0dError::Config("l0 entry must be http(s) on an existing CoNET / beamio.app host".into())
+            L0dError::Config(
+                "l0 entry must be http(s) on an existing CoNET / beamio.app host".into(),
+            )
         })?;
     if rest.contains('?') || rest.contains('#') {
         return Err(L0dError::Config(
@@ -241,10 +296,7 @@ fn allow_existing_http_host(url: &str) -> Result<(), L0dError> {
         .next()
         .unwrap_or("");
     let host_l = host.to_ascii_lowercase();
-    if host_l == "beamio.app"
-        || host_l == "www.beamio.app"
-        || host_l.ends_with(".conet.network")
-    {
+    if host_l == "beamio.app" || host_l == "www.beamio.app" || host_l.ends_with(".conet.network") {
         return Ok(());
     }
     Err(L0dError::Config(format!(
@@ -358,10 +410,16 @@ impl DaemonConfig {
             .entries
             .iter()
             .chain(self.l0.listen_entries.iter())
-            .chain(self.l0.channels.iter().flat_map(|c| c.listen_entries.iter()))
+            .chain(
+                self.l0
+                    .channels
+                    .iter()
+                    .flat_map(|c| c.listen_entries.iter()),
+            )
         {
             allow_existing_http_host(entry)?;
         }
+        let gateway = self.gateway.as_ref().map(validate_gateway).transpose()?;
         let routing_eoa = match &self.l0.routing_eoa {
             Some(raw) => Some(normalize_eoa(raw)?),
             None => None,
@@ -425,8 +483,78 @@ impl DaemonConfig {
                 mailbox_route_pgp_file: self.l0.mailbox_route_pgp_file.clone(),
                 channels,
             },
+            gateway,
         })
     }
+}
+
+fn validate_gateway(raw: &GatewayConfig) -> Result<ValidatedGateway, L0dError> {
+    let rpc = raw.rpc.trim().trim_end_matches('/').to_string();
+    if rpc != "https://rpc1.conet.network" && rpc != "https://publicrpc.conet.network" {
+        return Err(L0dError::Config(
+            "gateway.rpc must be https://rpc1.conet.network or https://publicrpc.conet.network"
+                .into(),
+        ));
+    }
+    let upstream = raw.upstream.trim().trim_end_matches('/').to_string();
+    if !(upstream.starts_with("http://127.0.0.1")
+        || upstream.starts_with("http://localhost")
+        || upstream.starts_with("http://[::1]")
+        || upstream.starts_with("https://127.0.0.1")
+        || upstream.starts_with("https://localhost")
+        || upstream.starts_with("https://[::1]"))
+    {
+        return Err(L0dError::Config(
+            "gateway.upstream must target localhost/loopback; refusing remote upstream".into(),
+        ));
+    }
+    if raw.listen_entries.is_empty() || raw.post_entries.is_empty() {
+        return Err(L0dError::Config(
+            "gateway listen_entries and post_entries must not be empty".into(),
+        ));
+    }
+    for entry in raw.listen_entries.iter().chain(raw.post_entries.iter()) {
+        allow_existing_http_host(entry)?;
+    }
+    let routing_eoa = normalize_eoa(&raw.routing_eoa)?;
+    let methods: HashSet<String> = raw
+        .allowed_methods
+        .iter()
+        .map(|method| method.trim().to_ascii_uppercase())
+        .filter(|method| !method.is_empty())
+        .collect();
+    if methods.is_empty()
+        || methods
+            .iter()
+            .any(|method| method != "GET" && method != "HEAD")
+    {
+        return Err(L0dError::Config(
+            "gateway.allowed_methods may contain only GET and HEAD".into(),
+        ));
+    }
+    if raw.max_body_bytes == 0 || raw.max_body_bytes > 64 * 1024 * 1024 {
+        return Err(L0dError::Config(
+            "gateway.max_body_bytes must be between 1 and 67108864".into(),
+        ));
+    }
+    if raw.request_timeout_seconds == 0 || raw.request_timeout_seconds > 120 {
+        return Err(L0dError::Config(
+            "gateway.request_timeout_seconds must be between 1 and 120".into(),
+        ));
+    }
+    Ok(ValidatedGateway {
+        rpc,
+        upstream,
+        listen_entries: raw.listen_entries.clone(),
+        post_entries: raw.post_entries.clone(),
+        routing_eoa,
+        routing_key_file: raw.routing_key_file.clone(),
+        routing_eth_key_file: raw.routing_eth_key_file.clone(),
+        mailbox_route_pgp_file: raw.mailbox_route_pgp_file.clone(),
+        allowed_methods: methods,
+        max_body_bytes: raw.max_body_bytes,
+        request_timeout_seconds: raw.request_timeout_seconds,
+    })
 }
 
 impl ValidatedConfig {
@@ -444,9 +572,9 @@ impl ValidatedConfig {
         if dest == self.local_vip {
             return None;
         }
-        self.peers.iter().find(|p| {
-            p.vip == dest && (p.tcp_ports.contains(&port) || p.udp_ports.contains(&port))
-        })
+        self.peers
+            .iter()
+            .find(|p| p.vip == dest && (p.tcp_ports.contains(&port) || p.udp_ports.contains(&port)))
     }
 
     pub fn overlay_ports(&self) -> HashSet<u16> {
@@ -498,28 +626,37 @@ mod tests {
 
     #[test]
     fn same_vip_two_ports_is_ok() {
-        let mut cfg: DaemonConfig = toml::from_str(include_str!("../config/conet-l0d.example.toml"))
-            .expect("parse example");
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
         cfg.peers[1].udp_ports = vec![4300];
         let validated = cfg.validate().expect("same vip geth+beacon");
         assert_eq!(validated.peers.len(), 2);
-        assert!(validated.lookup_peer("100.64.0.1".parse().unwrap(), 8400).is_some());
-        assert!(validated.lookup_peer("100.64.0.1".parse().unwrap(), 4200).is_some());
-        assert!(validated.lookup_peer("100.64.0.1".parse().unwrap(), 4300).is_some());
+        assert!(validated
+            .lookup_peer("100.64.0.1".parse().unwrap(), 8400)
+            .is_some());
+        assert!(validated
+            .lookup_peer("100.64.0.1".parse().unwrap(), 4200)
+            .is_some());
+        assert!(validated
+            .lookup_peer("100.64.0.1".parse().unwrap(), 4300)
+            .is_some());
     }
 
     #[test]
     fn reject_duplicate_port_on_same_vip() {
-        let mut cfg: DaemonConfig = toml::from_str(include_str!("../config/conet-l0d.example.toml"))
-            .expect("parse example");
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
         cfg.peers[1].tcp_ports = vec![8400];
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn reject_duplicate_channel_eoa() {
-        let mut cfg: DaemonConfig = toml::from_str(include_str!("../config/conet-l0d.example.toml"))
-            .expect("parse example");
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
         cfg.l0.channels = vec![
             L0ChannelConfig {
                 ports: vec![8400],
@@ -543,8 +680,9 @@ mod tests {
 
     #[test]
     fn reject_unknown_l0_entry_host() {
-        let mut cfg: DaemonConfig = toml::from_str(include_str!("../config/conet-l0d.example.toml"))
-            .expect("parse example");
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
         cfg.l0.enabled = true;
         cfg.l0.entries = vec!["https://assets.conet.example/post".into()];
         assert!(cfg.validate().is_err());

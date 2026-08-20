@@ -1,0 +1,23 @@
+[Unit]
+Description=Loopback origin proxy for conet-l0d web3 gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=peter
+Group=peter
+ExecStart=/usr/bin/node /usr/local/lib/conet-l0d/loopback-origin-proxy.mjs
+Environment=LISTEN_HOST=127.0.0.1
+Environment=LISTEN_PORT=8080
+Environment=ORIGIN_URL=https://conet.network
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

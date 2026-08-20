@@ -43,7 +43,9 @@ where
     F: FnMut(),
 {
     if entries.is_empty() {
-        return Err(L0dError::L0("l0.entries is empty; refusing l0_connect pipe".into()));
+        return Err(L0dError::L0(
+            "l0.entries is empty; refusing l0_connect pipe".into(),
+        ));
     }
     let mut last = L0dError::L0("l0_connect pipe failed".into());
     for entry in entries {

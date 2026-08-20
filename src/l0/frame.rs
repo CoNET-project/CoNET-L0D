@@ -19,7 +19,9 @@ pub fn encode(seq: u64, ipv4: &[u8]) -> Vec<u8> {
 #[allow(dead_code)]
 pub fn decode(buf: &[u8]) -> Result<(u64, &[u8]), L0dError> {
     if buf.len() < HEADER_LEN {
-        return Err(L0dError::L0("overlay frame is shorter than the header".into()));
+        return Err(L0dError::L0(
+            "overlay frame is shorter than the header".into(),
+        ));
     }
     if &buf[0..4] != MAGIC {
         return Err(L0dError::L0("overlay frame magic is not L0D1".into()));

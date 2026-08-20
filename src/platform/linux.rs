@@ -43,7 +43,10 @@ pub async fn install(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     Ok(())
 }
 
-pub async fn uninstall(cfg: &ValidatedConfig, state: Option<&RuntimeState>) -> Result<(), L0dError> {
+pub async fn uninstall(
+    cfg: &ValidatedConfig,
+    state: Option<&RuntimeState>,
+) -> Result<(), L0dError> {
     let tun = state
         .map(|s| s.tun_name.as_str())
         .unwrap_or(cfg.raw.tun_name.as_str());
@@ -142,7 +145,12 @@ pub fn process_alive(pid: u32) -> bool {
 }
 
 fn open_tun(name: &str) -> Result<OwnedFd, L0dError> {
-    let fd = unsafe { libc::open(b"/dev/net/tun\0".as_ptr() as *const libc::c_char, libc::O_RDWR) };
+    let fd = unsafe {
+        libc::open(
+            b"/dev/net/tun\0".as_ptr() as *const libc::c_char,
+            libc::O_RDWR,
+        )
+    };
     if fd < 0 {
         return Err(L0dError::Net(format!(
             "open /dev/net/tun: {}",
@@ -210,7 +218,11 @@ async fn run(bin: &str, args: &[&str]) -> Result<(), L0dError> {
 }
 
 async fn ensure_chain(table: &str, chain: &str) -> Result<(), L0dError> {
-    if iptables(table, &["-L", chain, "-n"]).await?.status.success() {
+    if iptables(table, &["-L", chain, "-n"])
+        .await?
+        .status
+        .success()
+    {
         return Ok(());
     }
     let out = iptables(table, &["-N", chain]).await?;
@@ -231,16 +243,20 @@ async fn flush_chain(table: &str, chain: &str) -> Result<(), L0dError> {
     Ok(())
 }
 
-async fn append_return(
-    table: &str,
-    chain: &str,
-    dir: &str,
-    cidr: &str,
-) -> Result<(), L0dError> {
+async fn append_return(table: &str, chain: &str, dir: &str, cidr: &str) -> Result<(), L0dError> {
     let out = iptables(
         table,
         &[
-            "-A", chain, dir, cidr, "-m", "comment", "--comment", COMMENT, "-j", "RETURN",
+            "-A",
+            chain,
+            dir,
+            cidr,
+            "-m",
+            "comment",
+            "--comment",
+            COMMENT,
+            "-j",
+            "RETURN",
         ],
     )
     .await?;

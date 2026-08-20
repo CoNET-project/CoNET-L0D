@@ -110,7 +110,10 @@ pub fn status(path: &Path) -> anyhow::Result<()> {
             println!("chain    {}", state.iptables_chain);
             println!("started  {}", state.started_at);
             if !alive {
-                println!("hint     sudo conet-l0d teardown --config {}", path.display());
+                println!(
+                    "hint     sudo conet-l0d teardown --config {}",
+                    path.display()
+                );
             }
         }
     }

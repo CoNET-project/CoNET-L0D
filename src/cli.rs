@@ -29,6 +29,11 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Run the application gateway without creating a TUN or changing iptables
+    Gateway {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Signal the pid in the state file, then teardown
     Stop {
         #[arg(long)]

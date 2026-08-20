@@ -6,7 +6,10 @@ pub async fn install(_cfg: &ValidatedConfig) -> Result<(), L0dError> {
     Err(L0dError::NotLinux)
 }
 
-pub async fn uninstall(_cfg: &ValidatedConfig, _state: Option<&RuntimeState>) -> Result<(), L0dError> {
+pub async fn uninstall(
+    _cfg: &ValidatedConfig,
+    _state: Option<&RuntimeState>,
+) -> Result<(), L0dError> {
     Err(L0dError::NotLinux)
 }
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=CoNET Web3 Enterprise Gateway (conet-l0d)
+Documentation=https://gitbook.conet.network/applications/conet-l0d.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/conet-l0d gateway --config /etc/conet-l0d-gateway.toml
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

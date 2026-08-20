@@ -2,18 +2,18 @@
 
 use crate::error::L0dError;
 use sequoia_openpgp::cert::prelude::*;
-use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
-use sequoia_openpgp::policy::StandardPolicy;
-use sequoia_openpgp::Packet;
 use sequoia_openpgp::crypto::SessionKey;
 use sequoia_openpgp::packet::{PKESK, SKESK};
 use sequoia_openpgp::parse::stream::{
     DecryptionHelper, DecryptorBuilder, MessageStructure, VerificationHelper,
 };
+use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
+use sequoia_openpgp::policy::StandardPolicy;
 use sequoia_openpgp::serialize::stream::{Armorer, Encryptor2, LiteralWriter, Message};
 use sequoia_openpgp::serialize::SerializeInto;
 use sequoia_openpgp::types::SymmetricAlgorithm;
 use sequoia_openpgp::KeyHandle;
+use sequoia_openpgp::Packet;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -81,8 +81,8 @@ pub fn encrypt_utf8(plaintext: &str, recipient_armored: &str) -> Result<String, 
             .finalize()
             .map_err(|e| L0dError::L0(format!("OpenPGP finalize: {e}")))?;
     }
-    let armor = String::from_utf8(sink)
-        .map_err(|_| L0dError::L0("OpenPGP armor is not UTF-8".into()))?;
+    let armor =
+        String::from_utf8(sink).map_err(|_| L0dError::L0("OpenPGP armor is not UTF-8".into()))?;
     refuse_plaintext_data(&armor)?;
     Ok(armor)
 }
@@ -135,8 +135,8 @@ pub fn load_public_cert_armored(path: &Path) -> Result<String, L0dError> {
 /// Load an armored OpenPGP **secret** cert. Do not log the file contents.
 pub fn load_secret_cert(path: &Path) -> Result<Cert, L0dError> {
     let bytes = std::fs::read(path)?;
-    let cert = Cert::from_bytes(&bytes)
-        .map_err(|e| L0dError::L0(format!("OpenPGP secret cert: {e}")))?;
+    let cert =
+        Cert::from_bytes(&bytes).map_err(|e| L0dError::L0(format!("OpenPGP secret cert: {e}")))?;
     if cert.keys().secret().next().is_none() {
         return Err(L0dError::L0(
             "routing_key_file must be an OpenPGP secret cert".into(),
@@ -265,7 +265,10 @@ mod tests {
         assert!(!armor.contains("hello-overlay"));
         assert_eq!(decrypt_utf8(&armor, &cert).unwrap(), "hello-overlay");
         let ids = pkesk_recipient_key_ids(&armor).unwrap();
-        assert!(!ids.is_empty(), "SI route lookup needs a non-wildcard PKESK key ID");
+        assert!(
+            !ids.is_empty(),
+            "SI route lookup needs a non-wildcard PKESK key ID"
+        );
         let policy = StandardPolicy::new();
         let expected: Vec<String> = cert
             .keys()
@@ -277,7 +280,9 @@ mod tests {
             .map(|k| k.keyid().to_hex())
             .collect();
         assert!(ids.iter().any(|id| expected.contains(id)));
-        assert!(ids.iter().all(|id| id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit())));
+        assert!(ids
+            .iter()
+            .all(|id| id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit())));
     }
 
     #[test]
@@ -310,12 +315,16 @@ mod tests {
         let route = generate_test_cert();
         let user_pub = public_cert_armored(&user).unwrap();
         let route_pub = public_cert_armored(&route).unwrap();
-        let outer = wrap_overlay_for_post(r#"{"type":"conet_l0d_overlay_v1"}"#, &user_pub, &route_pub)
-            .unwrap();
+        let outer =
+            wrap_overlay_for_post(r#"{"type":"conet_l0d_overlay_v1"}"#, &user_pub, &route_pub)
+                .unwrap();
         let work: serde_json::Value =
             serde_json::from_str(&decrypt_utf8(&outer, &route).unwrap()).unwrap();
         assert_eq!(work["NoPush"], true);
         let inner = work["data"].as_str().expect("inner armor");
-        assert_eq!(decrypt_utf8(inner, &user).unwrap(), r#"{"type":"conet_l0d_overlay_v1"}"#);
+        assert_eq!(
+            decrypt_utf8(inner, &user).unwrap(),
+            r#"{"type":"conet_l0d_overlay_v1"}"#
+        );
     }
 }

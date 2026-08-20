@@ -430,12 +430,12 @@ pub async fn pump_sse_armors_with_idle_timeout(
     loop {
         let read = response.chunk();
         let result = match idle_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, read)
-                .await
-                .map_err(|_| L0dError::L0(format!(
+            Some(timeout) => tokio::time::timeout(timeout, read).await.map_err(|_| {
+                L0dError::L0(format!(
                     "listen SSE abandoned: no inbound data for {}s; closing SSE",
                     timeout.as_secs()
-                )))?,
+                ))
+            })?,
             None => Ok(read
                 .await
                 .map_err(|err| L0dError::L0(format!("listen SSE read: {err}")))?),
@@ -445,22 +445,22 @@ pub async fn pump_sse_armors_with_idle_timeout(
                 return Err(L0dError::L0(format!("listen SSE read: {err}")));
             }
             Ok(chunk) => match chunk {
-            Some(chunk) => {
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-                for armor in drain_sse_armors(&mut buf) {
-                    if armor_tx.send(armor).await.is_err() {
-                        return Ok(());
+                Some(chunk) => {
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    for armor in drain_sse_armors(&mut buf) {
+                        if armor_tx.send(armor).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
-            }
-            None => {
-                for armor in extract_inbound_armors(&buf) {
-                    if armor_tx.send(armor).await.is_err() {
-                        return Ok(());
+                None => {
+                    for armor in extract_inbound_armors(&buf) {
+                        if armor_tx.send(armor).await.is_err() {
+                            return Ok(());
+                        }
                     }
+                    return Ok(());
                 }
-                return Ok(());
-            }
             },
         }
     }
@@ -531,7 +531,9 @@ pub fn extract_pgp_armors_from_sse(chunk: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::l0::eip191::{recover_personal_sign, EthSecret};
-    use crate::l0::pgp::{encrypt_utf8, generate_test_cert, mailbox_work_json, public_cert_armored};
+    use crate::l0::pgp::{
+        encrypt_utf8, generate_test_cert, mailbox_work_json, public_cert_armored,
+    };
 
     fn test_eth() -> EthSecret {
         let mut bytes = [0u8; 32];
@@ -541,8 +543,9 @@ mod tests {
 
     #[test]
     fn listen_command_is_chat_kind_without_secrets() {
-        let cmd = encode_listen_command("0x1111111111111111111111111111111111111111", 1_710_000_000)
-            .unwrap();
+        let cmd =
+            encode_listen_command("0x1111111111111111111111111111111111111111", 1_710_000_000)
+                .unwrap();
         assert!(cmd.contains("\"mining\""));
         assert!(cmd.contains("\"chat\""));
         assert!(!cmd.contains("Securitykey"));
@@ -552,11 +555,9 @@ mod tests {
 
     #[test]
     fn l0_listen_and_connect_have_no_overlay_key() {
-        let listen = encode_l0_listen_command(
-            "0x1111111111111111111111111111111111111111",
-            1_710_000_000,
-        )
-        .unwrap();
+        let listen =
+            encode_l0_listen_command("0x1111111111111111111111111111111111111111", 1_710_000_000)
+                .unwrap();
         assert!(listen.contains("\"l0_listen\""));
         assert!(listen.contains("\"l0\""));
         assert!(!listen.contains("Securitykey"));
@@ -589,7 +590,10 @@ mod tests {
         let sig = wrapper["signMessage"].as_str().unwrap();
         assert_eq!(message, cmd);
         assert!(!message.contains("Securitykey"));
-        assert_eq!(recover_personal_sign(message.as_bytes(), sig).unwrap(), eth.address());
+        assert_eq!(
+            recover_personal_sign(message.as_bytes(), sig).unwrap(),
+            eth.address()
+        );
     }
 
     #[test]
@@ -689,7 +693,10 @@ mod tests {
         let drained = drain_sse_armors(&mut buf);
         assert_eq!(drained.len(), 1);
         assert!(buf.is_empty());
-        assert_eq!(inbound_ipv4_from_user_armor(&drained[0], &user).unwrap(), pkt);
+        assert_eq!(
+            inbound_ipv4_from_user_armor(&drained[0], &user).unwrap(),
+            pkt
+        );
     }
 
     #[test]
@@ -768,7 +775,9 @@ mod tests {
         )
         .unwrap();
         assert!(url.ends_with("/post"));
-        assert!(!pgp::decrypt_utf8(&listen_armor, &route).unwrap().contains("Securitykey"));
+        assert!(!pgp::decrypt_utf8(&listen_armor, &route)
+            .unwrap()
+            .contains("Securitykey"));
 
         let (tx, mut rx) = mpsc::channel::<String>(4);
         let client = listen_http_client().unwrap();
@@ -777,7 +786,10 @@ mod tests {
             .expect("mock listen");
         assert_eq!(status, 200);
         let got_armor = rx.recv().await.expect("sse armor");
-        assert_eq!(inbound_ipv4_from_user_armor(&got_armor, &user).unwrap(), pkt);
+        assert_eq!(
+            inbound_ipv4_from_user_armor(&got_armor, &user).unwrap(),
+            pkt
+        );
     }
 
     fn armor_to_si_gossip(armor: &str) -> String {
@@ -824,7 +836,10 @@ mod tests {
             .expect("mock listen");
         assert_eq!(status, 200);
         let got_armor = rx.recv().await.expect("si gossip armor");
-        assert_eq!(inbound_ipv4_from_user_armor(&got_armor, &user).unwrap(), pkt);
+        assert_eq!(
+            inbound_ipv4_from_user_armor(&got_armor, &user).unwrap(),
+            pkt
+        );
     }
 
     fn test_eth_b() -> EthSecret {
@@ -844,8 +859,10 @@ mod tests {
         let route_pub = public_cert_armored(&route).unwrap();
         let pkt_a = b"\x45\x00listen-chan-a-ipv4";
         let pkt_b = b"\x45\x00listen-chan-b-ipv4";
-        let json_a = envelope::encode("0x1111111111111111111111111111111111111111", 1, pkt_a).unwrap();
-        let json_b = envelope::encode("0x2222222222222222222222222222222222222222", 2, pkt_b).unwrap();
+        let json_a =
+            envelope::encode("0x1111111111111111111111111111111111111111", 1, pkt_a).unwrap();
+        let json_b =
+            envelope::encode("0x2222222222222222222222222222222222222222", 2, pkt_b).unwrap();
         let inbound_a = encrypt_utf8(&json_a, &public_cert_armored(&user_a).unwrap()).unwrap();
         let inbound_b = encrypt_utf8(&json_b, &public_cert_armored(&user_b).unwrap()).unwrap();
 
@@ -854,14 +871,18 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/post"))
             .and(body_string_contains("BEGIN PGP MESSAGE"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound_a)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound_a)),
+            )
             .expect(1)
             .mount(&server_a)
             .await;
         Mock::given(method("POST"))
             .and(path("/post"))
             .and(body_string_contains("BEGIN PGP MESSAGE"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound_b)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound_b)),
+            )
             .expect(1)
             .mount(&server_b)
             .await;
@@ -941,8 +962,8 @@ mod tests {
         let route = generate_test_cert();
         let route_pub = public_cert_armored(&route).unwrap();
         let eth = test_eth();
-        let (url, armor) = prepare_listen_post(eth.address(), 1, &route_pub, &server.uri(), &eth)
-            .unwrap();
+        let (url, armor) =
+            prepare_listen_post(eth.address(), 1, &route_pub, &server.uri(), &eth).unwrap();
         let (tx, _rx) = mpsc::channel::<String>(1);
         let client = listen_http_client().unwrap();
         let err = run_listen_once(&client, &url, &armor, &tx)

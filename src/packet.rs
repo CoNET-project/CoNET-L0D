@@ -6,11 +6,8 @@ pub const OVERLAY_BEACON_TCP: u16 = 4200;
 pub const OVERLAY_BEACON_UDP: u16 = 4300;
 
 /// Default overlay service ports when `[[l0.channels]]` is omitted.
-pub const DEFAULT_OVERLAY_PORTS: [u16; 3] = [
-    OVERLAY_GETH_TCP,
-    OVERLAY_BEACON_TCP,
-    OVERLAY_BEACON_UDP,
-];
+pub const DEFAULT_OVERLAY_PORTS: [u16; 3] =
+    [OVERLAY_GETH_TCP, OVERLAY_BEACON_TCP, OVERLAY_BEACON_UDP];
 
 /// Dest IPv4 from a TUN IPv4 packet (IFF_NO_PI).
 #[allow(dead_code)]

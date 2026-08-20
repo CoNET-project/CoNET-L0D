@@ -35,7 +35,6 @@ impl ForwardStats {
             packets = self.ipv4_packets,
             "overlay IPv4 on TUN"
         );
-        self.l0
-            .note_overlay_packet(dest, locator.as_ref(), frame);
+        self.l0.note_overlay_packet(dest, locator.as_ref(), frame);
     }
 }

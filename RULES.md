@@ -67,6 +67,14 @@ This is an operational recovery playbook for the existing SI `l0_listen`/`l0_con
 
 All net objects must be tagged (`CONET_L0D` chain, comment `conet-l0d`) so teardown never deletes foreign rules.
 
+`gateway` is intentionally outside this lifecycle. It must not create a TUN,
+install routes, or touch iptables. It owns only mailbox SSE tasks and
+loopback HTTP proxy tasks. Gateway secrets are file inputs with restrictive
+permissions; they must never be passed as CLI arguments, environment values,
+logs, or committed files. The default gateway policy is GET/HEAD, loopback
+upstream only, bounded bodies, and encrypted response POST through Entry
+nodes to the requester mailbox.
+
 ## Docs
 
 | File | Role |

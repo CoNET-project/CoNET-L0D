@@ -63,10 +63,7 @@ pub fn parse_eth_secret(raw: &str) -> Result<EthSecret, L0dError> {
             "routing_eth_key_file must be a hex secp256k1 key, not an OpenPGP cert".into(),
         ));
     }
-    let hex = raw
-        .trim()
-        .trim_start_matches("0x")
-        .trim_start_matches("0X");
+    let hex = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(L0dError::L0(
             "routing_eth_key_file must be 32-byte hex (optional 0x prefix)".into(),
@@ -128,7 +125,9 @@ fn address_from_verifying_key(vk: &VerifyingKey) -> Result<String, L0dError> {
     let point = vk.to_encoded_point(false);
     let encoded = point.as_bytes();
     if encoded.len() != 65 || encoded[0] != 0x04 {
-        return Err(L0dError::L0("secp256k1 public key is not uncompressed".into()));
+        return Err(L0dError::L0(
+            "secp256k1 public key is not uncompressed".into(),
+        ));
     }
     let hash = keccak256(&encoded[1..]);
     Ok(format!("0x{}", hex::encode(&hash[12..])))

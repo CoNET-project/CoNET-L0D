@@ -159,8 +159,10 @@ mod tests {
 
     #[test]
     fn reject_validator_service() {
-        assert!(Locator::parse("web3://0x1111111111111111111111111111111111111111/p2p/validator")
-            .is_err());
+        assert!(
+            Locator::parse("web3://0x1111111111111111111111111111111111111111/p2p/validator")
+                .is_err()
+        );
     }
 
     #[test]

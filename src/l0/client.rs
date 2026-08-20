@@ -160,7 +160,7 @@ pub struct L0Client {
     pub inbound_ready: u64,
     pub tun_writes: u64,
     pub inbound_refused: u64,
-    pub     inbound_dropped: u64,
+    pub inbound_dropped: u64,
     routing_eoa: String,
     entries: Vec<String>,
     peers: HashMap<(Ipv4Addr, u16), PeerPgp>,
@@ -330,13 +330,7 @@ impl L0Client {
                     Some(pipe_rebuild.clone()),
                 )
             };
-            spawn_duplex_runtime(
-                cfg,
-                &channel_wire,
-                &peers,
-                duplex.clone(),
-                post_tx.clone(),
-            );
+            spawn_duplex_runtime(cfg, &channel_wire, &peers, duplex.clone(), post_tx.clone());
         }
         let inbound_rx = if listen_spawned {
             Some(inbound_rx_ch)
@@ -464,8 +458,7 @@ impl L0Client {
                 Ok(plain) => match String::from_utf8(plain) {
                     Ok(json) => {
                         if let Some(session_id) = duplex::parse_duplex_ping_json(&json) {
-                            let mut guard =
-                                self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
                             if let Some(sess) =
                                 guard.values_mut().find(|s| s.session_id == session_id)
                             {
@@ -492,10 +485,16 @@ impl L0Client {
         Err(last)
     }
 
-    fn apply_duplex_frame(&mut self, session_id: &str, payload_b64: &str) -> Result<usize, L0dError> {
+    fn apply_duplex_frame(
+        &mut self,
+        session_id: &str,
+        payload_b64: &str,
+    ) -> Result<usize, L0dError> {
         let has_session = {
             let guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
-            guard.values().any(|s| s.session_id == session_id && s.key.is_some())
+            guard
+                .values()
+                .any(|s| s.session_id == session_id && s.key.is_some())
         };
         if !has_session {
             self.inbound_refused = self.inbound_refused.saturating_add(1);
@@ -503,8 +502,11 @@ impl L0Client {
                 "duplex_frame has no overlay key yet; waiting for duplex_offer".into(),
             ));
         };
-        let framed = Engine::decode(&base64::engine::general_purpose::STANDARD, payload_b64.trim())
-            .map_err(|e| L0dError::L0(format!("duplex_frame payload base64: {e}")))?;
+        let framed = Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            payload_b64.trim(),
+        )
+        .map_err(|e| L0dError::L0(format!("duplex_frame payload base64: {e}")))?;
         let (_seq, ipv4) = frame::decode(&framed)?;
         if !listen::looks_like_ipv4(ipv4) {
             self.inbound_refused = self.inbound_refused.saturating_add(1);
@@ -564,10 +566,7 @@ impl L0Client {
                             ));
                         }
                     }
-                } else if sess.pipe_tx.is_none()
-                    && !sess.rejected
-                    && !sess.pipe_connect_inflight
-                {
+                } else if sess.pipe_tx.is_none() && !sess.rejected && !sess.pipe_connect_inflight {
                     tracing::info!(
                         session = %offer.session_id,
                         port = sess.port,
@@ -616,14 +615,7 @@ impl L0Client {
                 .ok()
                 .and_then(|json| aes::seal(&k, json.as_bytes()).ok())
             });
-            spawn_l0_pipe(
-                wire,
-                route,
-                target,
-                accept_blob,
-                sess,
-                self.duplex.clone(),
-            );
+            spawn_l0_pipe(wire, route, target, accept_blob, sess, self.duplex.clone());
             return;
         }
         if let Some((wire, target, route, sess, initiator_pipe_pgp)) = send_accept {
@@ -649,14 +641,7 @@ impl L0Client {
                 .ok()
                 .and_then(|json| aes::seal(&k, json.as_bytes()).ok())
             });
-            spawn_l0_pipe(
-                wire,
-                route,
-                target,
-                accept_blob,
-                sess,
-                self.duplex.clone(),
-            );
+            spawn_l0_pipe(wire, route, target, accept_blob, sess, self.duplex.clone());
             return;
         }
         tracing::warn!(
@@ -918,7 +903,13 @@ impl L0Client {
                     frame_bytes = framed.len(),
                     "P1 overlay batch flushed for POST"
                 );
-                self.enqueue_post(prepared, pending.dest, &pending.loc, raw.len(), packet_count);
+                self.enqueue_post(
+                    prepared,
+                    pending.dest,
+                    &pending.loc,
+                    raw.len(),
+                    packet_count,
+                );
             }
             Err(err) => {
                 self.posts_refused = self.posts_refused.saturating_add(1);
@@ -944,13 +935,12 @@ impl L0Client {
         seq: u64,
     ) -> Result<Option<PreparedPost>, L0dError> {
         let keys = self.peers.get(&(dest, port)).ok_or_else(|| {
-            L0dError::L0(
-                "peer user+route PGP public files are required; refusing POST".into(),
-            )
+            L0dError::L0("peer user+route PGP public files are required; refusing POST".into())
         })?;
-        let entry = self.entries.first().ok_or_else(|| {
-            L0dError::L0("l0.entries is empty; refusing POST".into())
-        })?;
+        let entry = self
+            .entries
+            .first()
+            .ok_or_else(|| L0dError::L0("l0.entries is empty; refusing POST".into()))?;
         let url = post::post_url(entry)?;
         if let Some(sess) = self.duplex_ready(dest, port) {
             if let (Some(key), Some(tx)) = (sess.key, sess.pipe_tx.as_ref()) {
@@ -1222,61 +1212,57 @@ fn spawn_listen_worker(
                 listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, entry, &eth)
             };
             match prepared {
-                Ok((url, armor)) => {
-                    match listen::open_listen_sse(&client, &url, &armor).await {
-                        Ok(response) => {
-                            last_failed = None;
-                            if l0_exclusive {
-                                if let Some(ctx) = pipe_rebuild.as_ref() {
-                                    rebuild_l0_pipes_after_listen_up(&routing_eoa, ctx);
-                                }
-                            }
-                            match listen::pump_sse_armors_with_idle_timeout(
-                                response,
-                                &tx,
-                                l0_exclusive.then_some(pipe::PIPE_DATA_TIMEOUT),
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        eoa = %routing_eoa,
-                                        l0 = l0_exclusive,
-                                        "listen SSE ended; reconnecting after idle"
-                                    );
-                                }
-                                Err(err) => {
-                                    if l0_exclusive
-                                        && err
-                                            .to_string()
-                                            .contains("no inbound data for 120s")
-                                    {
-                                        clear_l0_pipe_after_listen_timeout(
-                                            &routing_eoa,
-                                            pipe_rebuild.as_ref(),
-                                        );
-                                    }
-                                    tracing::warn!(
-                                        eoa = %routing_eoa,
-                                        l0 = l0_exclusive,
-                                        error = %err,
-                                        "listen SSE failed"
-                                    );
-                                    last_failed = Some(entry.to_string());
-                                }
+                Ok((url, armor)) => match listen::open_listen_sse(&client, &url, &armor).await {
+                    Ok(response) => {
+                        last_failed = None;
+                        if l0_exclusive {
+                            if let Some(ctx) = pipe_rebuild.as_ref() {
+                                rebuild_l0_pipes_after_listen_up(&routing_eoa, ctx);
                             }
                         }
-                        Err(err) => {
-                            tracing::warn!(
-                                eoa = %routing_eoa,
-                                l0 = l0_exclusive,
-                                error = %err,
-                                "listen SSE failed"
-                            );
-                            last_failed = Some(entry.to_string());
+                        match listen::pump_sse_armors_with_idle_timeout(
+                            response,
+                            &tx,
+                            l0_exclusive.then_some(pipe::PIPE_DATA_TIMEOUT),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    eoa = %routing_eoa,
+                                    l0 = l0_exclusive,
+                                    "listen SSE ended; reconnecting after idle"
+                                );
+                            }
+                            Err(err) => {
+                                if l0_exclusive
+                                    && err.to_string().contains("no inbound data for 120s")
+                                {
+                                    clear_l0_pipe_after_listen_timeout(
+                                        &routing_eoa,
+                                        pipe_rebuild.as_ref(),
+                                    );
+                                }
+                                tracing::warn!(
+                                    eoa = %routing_eoa,
+                                    l0 = l0_exclusive,
+                                    error = %err,
+                                    "listen SSE failed"
+                                );
+                                last_failed = Some(entry.to_string());
+                            }
                         }
                     }
-                }
+                    Err(err) => {
+                        tracing::warn!(
+                            eoa = %routing_eoa,
+                            l0 = l0_exclusive,
+                            error = %err,
+                            "listen SSE failed"
+                        );
+                        last_failed = Some(entry.to_string());
+                    }
+                },
                 Err(err) => {
                     tracing::warn!(eoa = %routing_eoa, error = %err, "listen wrap refused");
                     last_failed = Some(entry.to_string());
@@ -1865,7 +1851,8 @@ fn spawn_l0_pipe(
                     }
                 },
             )
-            .await {
+            .await
+            {
                 Ok(()) => {
                     if oneshot_reject || gen.is_none() {
                         tracing::info!(session = %session_id, "l0_connect pipe closed");
@@ -1960,14 +1947,8 @@ mod tests {
             peers.insert((dest, port), keys.clone());
         }
         let mut channel_eoa = HashMap::new();
-        channel_eoa.insert(
-            8400,
-            "0x1111111111111111111111111111111111111111".into(),
-        );
-        channel_eoa.insert(
-            4200,
-            "0x1111111111111111111111111111111111111111".into(),
-        );
+        channel_eoa.insert(8400, "0x1111111111111111111111111111111111111111".into());
+        channel_eoa.insert(4200, "0x1111111111111111111111111111111111111111".into());
         L0Client {
             enabled: true,
             seq: 0,
@@ -2485,13 +2466,16 @@ mod tests {
     #[test]
     fn l0_pipe_retry_secs_treats_409_as_occupied() {
         assert_eq!(
-            l0_pipe_retry_secs(&L0dError::L0("l0 pipe HTTP not 2xx: HTTP/1.1 409 Conflict".into())),
+            l0_pipe_retry_secs(&L0dError::L0(
+                "l0 pipe HTTP not 2xx: HTTP/1.1 409 Conflict".into()
+            )),
             L0_PIPE_OCCUPIED_RETRY_SECS
         );
         assert_eq!(
             l0_pipe_retry_secs(&L0dError::L0PipeEnd {
                 reason: "test".into(),
-                session_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                session_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
             }),
             L0_PIPE_END_RETRY_SECS
         );

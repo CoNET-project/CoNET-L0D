@@ -125,7 +125,9 @@ pub fn encode_frame_json(session_id: &str, payload_b64: &str) -> Result<String, 
     });
     let text = serde_json::to_string(&json).map_err(|e| L0dError::L0(e.to_string()))?;
     if text.contains("Securitykey") {
-        return Err(L0dError::L0("duplex_frame must not carry Securitykey".into()));
+        return Err(L0dError::L0(
+            "duplex_frame must not carry Securitykey".into(),
+        ));
     }
     Ok(text)
 }
@@ -232,10 +234,7 @@ pub fn wrap_app_for_user_pgp(
         "signMessage": sign_message,
     });
     let text = serde_json::to_string(&envelope).map_err(|e| L0dError::L0(e.to_string()))?;
-    let b64 = Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        text.as_bytes(),
-    );
+    let b64 = Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes());
     pgp::encrypt_utf8(&b64, user_pub_armored)
 }
 
@@ -245,7 +244,9 @@ pub fn wrap_offer_for_user_pgp(
     eth: &EthSecret,
 ) -> Result<String, L0dError> {
     if !command_json.contains("\"duplex_offer\"") {
-        return Err(L0dError::L0("wrap_offer_for_user_pgp is only for duplex_offer".into()));
+        return Err(L0dError::L0(
+            "wrap_offer_for_user_pgp is only for duplex_offer".into(),
+        ));
     }
     wrap_app_for_user_pgp(command_json, user_pub_armored, eth)
 }
@@ -337,7 +338,9 @@ fn parse_signed_or_raw<T>(
             }
         }
     }
-    Err(L0dError::L0("inbound plaintext is not duplex app JSON".into()))
+    Err(L0dError::L0(
+        "inbound plaintext is not duplex app JSON".into(),
+    ))
 }
 
 #[derive(Clone)]
@@ -547,7 +550,10 @@ mod tests {
         let reject = encode_reject_command(eth.address(), &got.session_id, 5).unwrap();
         let sign_r = eth.personal_sign(reject.as_bytes()).unwrap();
         let wrap_r = serde_json::json!({ "message": reject, "signMessage": sign_r }).to_string();
-        assert_eq!(parse_reject(&wrap_r).as_deref(), Some(got.session_id.as_str()));
+        assert_eq!(
+            parse_reject(&wrap_r).as_deref(),
+            Some(got.session_id.as_str())
+        );
     }
 
     #[test]
@@ -575,7 +581,8 @@ mod tests {
         );
         assert!(parse_l0_pipe_end(
             r#"{"type":"l0_pipe_end","pipe_handle":"wrong","reason":"inbound_close"}"#
-        ).is_none());
+        )
+        .is_none());
         assert!(parse_l0_pipe_end(
             r#"{"type":"l0_pipe_end","sessionId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reason":"inbound_close"}"#
         ).is_none());
