@@ -1,0 +1,105 @@
+# Hub 198.251.77.98 — spoke .45 (geth+beacon) + prod hub .82 overlay geth/beacon/udp.
+# Pair with config/conet-l0d.45.lab-dual-beacon.toml on spoke.
+# DHT-over-L0 to .82: overlay-dht-steer.sh PEER_PUBLIC_IP=216.225.202.82
+# PEER_OVERLAY_VIP=100.64.0.7 (do not change .82 --nat). Geth docks overlay
+# enode @100.64.0.7:8400; do not keep the public @216.225.202.82:8400 peer.
+
+tun_name = "conet-l0"
+overlay_cidr = "100.64.0.0/10"
+local_vip = "100.64.0.6"
+iptables_chain = "CONET_L0D"
+state_path = "/home/peter/conet-l0d-lab/run/state.json"
+
+[identity]
+locator = "web3://0x8a2b04C82B43447b69946b31BCCEa14ed29471f4/p2p/geth"
+
+[[peers]]
+locator = "web3://0xEF10752843cAC32C73DAb86658B8ab6E5667199B/p2p/geth"
+vip = "100.64.0.5"
+tcp_ports = [8400]
+user_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-user.asc"
+route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-route.asc"
+
+[[peers]]
+locator = "web3://0x3F84B8f11BF7886DCf0c902A3148cc2926E185dA/p2p/beacon"
+vip = "100.64.0.5"
+tcp_ports = [4200]
+user_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-beacon-user.asc"
+route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-beacon-route.asc"
+
+# Production hub 216.225.202.82 @ 100.64.0.7 — overlay geth + beacon TCP + discv5 UDP.
+[[peers]]
+locator = "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792/p2p/geth"
+vip = "100.64.0.7"
+tcp_ports = [8400]
+user_pgp_file = "/home/peter/conet-l0d-lab/keys/82/peer-geth-user.asc"
+route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-route.asc"
+
+[[peers]]
+locator = "web3://0x3048925d768694D4b95524DFB71b38e812D705Dd/p2p/beacon"
+vip = "100.64.0.7"
+tcp_ports = [4200]
+user_pgp_file = "/home/peter/conet-l0d-lab/keys/82/peer-beacon-user.asc"
+route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-beacon-route.asc"
+
+[[peers]]
+locator = "web3://0x49928729045d55357DC3071802C0E77a930959D3/p2p/beacon"
+vip = "100.64.0.7"
+udp_ports = [4300]
+user_pgp_file = "/home/peter/conet-l0d-lab/keys/82/peer-udp-user.asc"
+route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-udp-route.asc"
+
+[l0]
+enabled = true
+rpc = "https://rpc1.conet.network"
+address_pgp = "0x684b0ac760cEE9c9b85de36d69746420648Cf9e2"
+entries = [
+  "http://20ab90fe82d0e9e3.conet.network",
+  "http://f8117e1568eeaed7.conet.network",
+  "http://ae85a2aeec768225.conet.network",
+]
+listen_entries = [
+  "http://f8117e1568eeaed7.conet.network",
+  "http://ae85a2aeec768225.conet.network",
+  "http://20ab90fe82d0e9e3.conet.network",
+]
+routing_eoa = "0x8a2b04C82B43447b69946b31BCCEa14ed29471f4"
+routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
+routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
+mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route.asc"
+
+[[l0.channels]]
+ports = [8400]
+routing_eoa = "0x8a2b04C82B43447b69946b31BCCEa14ed29471f4"
+routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
+routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
+mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route.asc"
+listen_entries = [
+  "http://f8117e1568eeaed7.conet.network",
+  "http://ae85a2aeec768225.conet.network",
+  "http://20ab90fe82d0e9e3.conet.network",
+]
+
+[[l0.channels]]
+ports = [4200]
+routing_eoa = "0x2Ae19d1f39445fFa218F540cdD6BDCAfBD68ca7b"
+routing_key_file = "/home/peter/conet-l0d-lab/keys/beacon/routing.key"
+routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/beacon/routing.eth"
+mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/beacon/self-mailbox-route.asc"
+listen_entries = [
+  "http://f8117e1568eeaed7.conet.network",
+  "http://ae85a2aeec768225.conet.network",
+  "http://20ab90fe82d0e9e3.conet.network",
+]
+
+[[l0.channels]]
+ports = [4300]
+routing_eoa = "0x72c240E4e35caF9822E6B71BBB816db83E1534a5"
+routing_key_file = "/home/peter/conet-l0d-lab/keys/udp/routing.key"
+routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/udp/routing.eth"
+mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/udp/self-mailbox-route.asc"
+listen_entries = [
+  "http://f8117e1568eeaed7.conet.network",
+  "http://ae85a2aeec768225.conet.network",
+  "http://20ab90fe82d0e9e3.conet.network",
+]

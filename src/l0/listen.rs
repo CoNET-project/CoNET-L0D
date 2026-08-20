@@ -257,8 +257,54 @@ pub async fn open_listen_sse(
     Ok(response)
 }
 
-/// Complete Chat/SI frames end with `\r\n\r\n` or `\n\n`.
+/// Idle L0 may emit SSE comments (`: keepalive` + blank line). Occupied AES
+/// uses `data: <base64>\r\n\r\n`. A comment's `\n\n` must not complete a
+/// half-received AES line.
+fn next_complete_sse_comment(buf: &str) -> Option<(usize, usize)> {
+    let bytes = buf.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_line = i == 0 || bytes[i - 1] == b'\n';
+        if at_line && bytes[i] == b':' {
+            let rest = &buf[i..];
+            if let Some(rel) = rest.find("\r\n\r\n") {
+                return Some((i, i + rel + 4));
+            }
+            if let Some(rel) = rest.find("\n\n") {
+                return Some((i, i + rel + 2));
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn strip_complete_sse_comments(buf: &mut String) {
+    while let Some((start, end)) = next_complete_sse_comment(buf) {
+        buf.drain(start..end);
+    }
+}
+
+fn is_pending_aes_sse(buffer: &str) -> bool {
+    let t = buffer.trim_start();
+    let after = t.strip_prefix("data:").map(str::trim_start).unwrap_or(t);
+    let head = after.lines().next().unwrap_or(after).trim();
+    !head.is_empty()
+        && !head.starts_with('{')
+        && !head.starts_with("-----")
+        && head
+            .bytes()
+            .take(16)
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+/// Complete Chat/SI frames end with `\r\n\r\n` or `\n\n`. AES occupied-pipe
+/// blobs wait for `\r\n\r\n` only so a comment `\n\n` cannot truncate them.
 fn find_frame_end(buffer: &str) -> Option<(usize, usize)> {
+    if is_pending_aes_sse(buffer) {
+        return buffer.find("\r\n\r\n").map(|i| (i, 4));
+    }
     let crlf = buffer.find("\r\n\r\n").map(|i| (i, 4));
     let lf = buffer.find("\n\n").map(|i| (i, 2));
     match (crlf, lf) {
@@ -270,15 +316,27 @@ fn find_frame_end(buffer: &str) -> Option<(usize, usize)> {
 }
 
 /// Chat `handleInbound` payload: join `data:` lines, else the whole block.
+/// If a keepalive split one AES `data:` line, continuation lines (no `data:`
+/// prefix) are concatenated without inserting newlines.
 fn sse_or_raw_payload(block: &str) -> String {
     let mut data_lines = Vec::new();
+    let mut continuations = false;
     for raw in block.lines() {
-        if let Some(rest) = raw.strip_prefix("data:") {
+        let line = raw.trim_end();
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
             data_lines.push(rest.trim_start().to_string());
+        } else if !data_lines.is_empty() {
+            continuations = true;
+            data_lines.push(line.to_string());
         }
     }
     if data_lines.is_empty() {
         block.trim().to_string()
+    } else if continuations {
+        data_lines.join("")
     } else {
         data_lines.join("\n")
     }
@@ -314,8 +372,6 @@ fn extract_armors_from_frame(frame: &str) -> Vec<String> {
             || crate::l0::duplex::parse_accept(trimmed).is_some()
             || crate::l0::duplex::parse_reject(trimmed).is_some()
             || crate::l0::duplex::parse_l0_occupied(trimmed)
-            || crate::l0::duplex::parse_l0_listen_released(trimmed).is_some()
-            || crate::l0::duplex::parse_l0_pipe_end(trimmed).is_some()
             || trimmed.contains("\"duplex_offer\""))
     {
         return vec![trimmed.to_string()];
@@ -328,8 +384,10 @@ fn extract_armors_from_frame(frame: &str) -> Vec<String> {
 
 /// Extract user-PGP armors from SI gossip JSON and/or SSE. Do not log armor.
 pub fn extract_inbound_armors(chunk: &str) -> Vec<String> {
+    let mut buf = chunk.to_string();
+    strip_complete_sse_comments(&mut buf);
     let mut out = Vec::new();
-    let mut rest = chunk;
+    let mut rest = buf.as_str();
     while let Some((end, sep)) = find_frame_end(rest) {
         out.extend(extract_armors_from_frame(&rest[..end]));
         rest = &rest[end + sep..];
@@ -342,8 +400,13 @@ pub fn extract_inbound_armors(chunk: &str) -> Vec<String> {
 
 /// Extract complete frames and drop them from `buffer`. Do not log armor.
 pub fn drain_sse_armors(buffer: &mut String) -> Vec<String> {
+    strip_complete_sse_comments(buffer);
     let mut out = Vec::new();
-    while let Some((end, sep)) = find_frame_end(buffer) {
+    loop {
+        strip_complete_sse_comments(buffer);
+        let Some((end, sep)) = find_frame_end(buffer) else {
+            break;
+        };
         let frame: String = buffer.drain(..end + sep).collect();
         let body_len = frame.len().saturating_sub(sep);
         out.extend(extract_armors_from_frame(&frame[..body_len]));
@@ -358,14 +421,31 @@ pub fn drain_sse_armors(buffer: &mut String) -> Vec<String> {
     out
 }
 
-pub async fn pump_sse_armors(
+pub async fn pump_sse_armors_with_idle_timeout(
     mut response: reqwest::Response,
     armor_tx: &mpsc::Sender<String>,
+    idle_timeout: Option<Duration>,
 ) -> Result<(), L0dError> {
     let mut buf = String::new();
     loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
+        let read = response.chunk();
+        let result = match idle_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, read)
+                .await
+                .map_err(|_| L0dError::L0(format!(
+                    "listen SSE abandoned: no inbound data for {}s; closing SSE",
+                    timeout.as_secs()
+                )))?,
+            None => Ok(read
+                .await
+                .map_err(|err| L0dError::L0(format!("listen SSE read: {err}")))?),
+        };
+        match result {
+            Err(err) => {
+                return Err(L0dError::L0(format!("listen SSE read: {err}")));
+            }
+            Ok(chunk) => match chunk {
+            Some(chunk) => {
                 buf.push_str(&String::from_utf8_lossy(&chunk));
                 for armor in drain_sse_armors(&mut buf) {
                     if armor_tx.send(armor).await.is_err() {
@@ -373,7 +453,7 @@ pub async fn pump_sse_armors(
                     }
                 }
             }
-            Ok(None) => {
+            None => {
                 for armor in extract_inbound_armors(&buf) {
                     if armor_tx.send(armor).await.is_err() {
                         return Ok(());
@@ -381,9 +461,18 @@ pub async fn pump_sse_armors(
                 }
                 return Ok(());
             }
-            Err(err) => return Err(L0dError::L0(format!("listen SSE read: {err}"))),
+            },
         }
     }
+}
+
+/// Pump a normal Chat SSE. Chat heartbeats are governed by the mailbox and
+/// must not be mistaken for an abandoned occupied L0 pipe.
+pub async fn pump_sse_armors(
+    response: reqwest::Response,
+    armor_tx: &mpsc::Sender<String>,
+) -> Result<(), L0dError> {
+    pump_sse_armors_with_idle_timeout(response, armor_tx, None).await
 }
 
 /// One listen POST + SSE drain. Tests use wiremock. Do not call production SI from tests.
@@ -547,12 +636,34 @@ mod tests {
     #[test]
     fn sse_extracts_duplex_frame_json() {
         let frame = concat!(
-            "data: {\"type\":\"duplex_frame\",\"sessionId\":\"aa\",\"payload\":\"YmFzZQ==\"}\r\n\r\n"
+            "data: {\"type\":\"duplex_frame\",\"pipe_handle\":\"aa\",\"payload\":\"YmFzZQ==\"}\r\n\r\n"
         );
         let found = extract_inbound_armors(frame);
         assert_eq!(found.len(), 1);
         assert!(found[0].contains("duplex_frame"));
         assert!(!found[0].contains("BEGIN PGP"));
+    }
+
+    #[test]
+    fn aes_sse_does_not_complete_on_keepalive_nlnl() {
+        let half = "A".repeat(32);
+        let mut buf = format!("data: {half}\n: keepalive\n\n");
+        assert!(drain_sse_armors(&mut buf).is_empty());
+        assert!(buf.contains(&half));
+        assert!(!buf.contains("keepalive"));
+        buf.push_str("BBBB\r\n\r\n");
+        let drained = drain_sse_armors(&mut buf);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0], format!("{half}BBBB"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn chat_json_still_completes_on_nlnl() {
+        let chunk = "data: {\"type\":\"duplex_offer\",\"pipe_handle\":\"aa\"}\n\n";
+        let found = extract_inbound_armors(chunk);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("duplex_offer"));
     }
 
     #[test]

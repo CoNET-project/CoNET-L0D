@@ -19,6 +19,15 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/home/peter/ethereum-pos-mainnet}"
 NODE_DIR="${NODE_DIR:-$PROJECT_DIR/network/node-0}"
 LAB_DIR="${LAB_DIR:-/home/peter/conet-l0d-lab}"
+# Production hub overlay constants (216.225.202.82 / 100.64.0.7); override via env.
+if [[ -f "$LAB_DIR/scripts/l0-prod82-hub.env" ]]; then
+	# shellcheck disable=SC1091
+	source "$LAB_DIR/scripts/l0-prod82-hub.env"
+fi
+if [[ -f "$LAB_DIR/scripts/l0-dual-hub.env" ]]; then
+	# shellcheck disable=SC1091
+	source "$LAB_DIR/scripts/l0-dual-hub.env"
+fi
 PUBLIC_IP="${PUBLIC_IP:-74.208.224.45}"
 CHAIN_ID="${CHAIN_ID:-224422}"
 
@@ -57,6 +66,9 @@ EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-/ip4/198.251.77.98/tcp/4200/p2p/16Uiu2
 
 L0_OVERLAY_ENODE="${L0_OVERLAY_ENODE:-enode://006561987aaeea06a6f2c54d37656a4acccd0c1e16c9025700be1cfc45c6b79596293426694f0cf5eccacc1f92392628a93adb52c607b86b78f8601e5247459b@100.64.0.6:8400}"
 L0_OVERLAY_BEACON_PEER="${L0_OVERLAY_BEACON_PEER:-/ip4/100.64.0.6/tcp/4200/p2p/16Uiu2HAmF1SXGHnne9DQTHGfgGQgje3cBV8pdSLJF25ajYKr2hvS}"
+# Comma-separated extra overlay enodes (e.g. second hub @100.64.0.6 when primary is .7).
+L0_EXTRA_OVERLAY_ENODES="${L0_EXTRA_OVERLAY_ENODES:-}"
+L0_GETH_MAXPEERS="${L0_GETH_MAXPEERS:-}"
 # Combined /tcp/4200/udp/4300 is one multiaddr; libp2p reports "no transport for protocol"
 # and falls back to the hub public IP, which isolate then times out. discv5 uses ENR+steer.
 L0_NETRESTRICT="${L0_NETRESTRICT:-100.64.0.0/10}"
@@ -348,7 +360,6 @@ except Exception:
 }
 
 load_extra_beacon_peers() {
-	PEER_ARGS=()
 	[[ -n "${EXTRA_BEACON_PEERS:-}" ]] || return 0
 	local IFS=','
 	local peer
@@ -363,11 +374,53 @@ load_extra_beacon_peers() {
 	done
 }
 
+merge_beacon_overlay_peers() {
+	local saved="${EXTRA_BEACON_PEERS:-}"
+	PEER_ARGS=()
+	[[ -n "${L0_OVERLAY_BEACON_PEER:-}" ]] && PEER_ARGS+=(--peer="$L0_OVERLAY_BEACON_PEER")
+	EXTRA_BEACON_PEERS="$saved"
+	load_extra_beacon_peers
+}
+
+l0_overlay_enode_list() {
+	local out=("$L0_OVERLAY_ENODE")
+	if [[ -n "${L0_EXTRA_OVERLAY_ENODES:-}" ]]; then
+		local IFS=','
+		local e
+		for e in $L0_EXTRA_OVERLAY_ENODES; do
+			e="${e//[[:space:]]/}"
+			[[ -n "$e" ]] && out+=("$e")
+		done
+	fi
+	printf '%s\n' "${out[@]}"
+}
+
 write_l0_static_nodes() {
 	local static_file="$NODE_DIR/execution/geth/static-nodes.json"
 	mkdir -p "$(dirname "$static_file")"
-	printf '["%s"]\n' "$L0_OVERLAY_ENODE" > "$static_file"
-	echo "Wrote $static_file"
+	local enodes=()
+	while IFS= read -r line; do
+		[[ -n "$line" ]] && enodes+=("$line")
+	done < <(l0_overlay_enode_list)
+	local json='['
+	local i
+	for i in "${!enodes[@]}"; do
+		[[ "$i" -gt 0 ]] && json+=','
+		json+="\"${enodes[$i]}\""
+	done
+	json+=']'
+	printf '%s\n' "$json" > "$static_file"
+	echo "Wrote $static_file (${#enodes[@]} overlay enode(s))"
+}
+
+add_geth_overlay_peers() {
+	local enode
+	while IFS= read -r enode; do
+		[[ -n "$enode" ]] || continue
+		curl -s "http://127.0.0.1:${GETH_HTTP_PORT}" -H 'content-type: application/json' \
+			-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_addPeer\",\"params\":[\"$enode\"]}" \
+			>/dev/null || true
+	done < <(l0_overlay_enode_list)
 }
 
 start_geth() {
@@ -378,8 +431,12 @@ start_geth() {
 		write_l0_static_nodes
 		# --nodiscover does not dial --bootnodes; persist the overlay peer as static.
 		bootnodes="$L0_OVERLAY_ENODE"
-		extra+=(--nodiscover --netrestrict "$L0_NETRESTRICT" --maxpeers 2)
-		echo "Starting geth L0_ONLY advertise=$ADVERTISE_IP overlay-static=$bootnodes"
+		local maxpeers="${L0_GETH_MAXPEERS:-2}"
+		if [[ -n "${L0_EXTRA_OVERLAY_ENODES:-}" ]]; then
+			maxpeers="${L0_GETH_MAXPEERS:-4}"
+		fi
+		extra+=(--nodiscover --netrestrict "$L0_NETRESTRICT" --maxpeers "$maxpeers")
+		echo "Starting geth L0_ONLY advertise=$ADVERTISE_IP overlay-static=$bootnodes extra=${L0_EXTRA_OVERLAY_ENODES:-none} maxpeers=$maxpeers"
 	else
 		bootnodes="$EXECUTION_BOOTNODES"
 		echo "Starting geth advertise=$ADVERTISE_IP cache=$GETH_CACHE (no wipe)"
@@ -410,9 +467,7 @@ start_geth() {
 	wait_for_port 127.0.0.1 "$GETH_AUTH_RPC_PORT" geth-authrpc 120 || true
 	wait_for_port 127.0.0.1 "$GETH_HTTP_PORT" geth-http 30 || true
 	if l0_only_on; then
-		curl -s "http://127.0.0.1:${GETH_HTTP_PORT}" -H 'content-type: application/json' \
-			-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_addPeer\",\"params\":[\"$L0_OVERLAY_ENODE\"]}" \
-			>/dev/null || true
+		add_geth_overlay_peers
 	fi
 }
 
@@ -425,14 +480,14 @@ start_beacon() {
 		if l0_dht_on; then
 			if l0_dht_no_static_peer; then
 				EXTRA_BEACON_PEERS=""
+				PEER_ARGS=()
 				echo "L0_DHT: no static --peer; discv5 via bootstrap ENR + overlay steer"
 			else
-				EXTRA_BEACON_PEERS="$L0_OVERLAY_BEACON_PEER"
+				merge_beacon_overlay_peers
 			fi
 		else
-			EXTRA_BEACON_PEERS="$L0_OVERLAY_BEACON_PEER"
+			merge_beacon_overlay_peers
 		fi
-		load_extra_beacon_peers
 		extra+=(--disable-quic --p2p-max-peers=4 --min-sync-peers=1)
 		if l0_dht_on; then
 			require_l0_dht_steer
@@ -450,7 +505,7 @@ start_beacon() {
 		else
 			extra+=(--p2p-allowlist="$L0_NETRESTRICT")
 			extra+=(--no-discovery)
-			echo "Starting beacon L0_ONLY advertise=$ADVERTISE_IP overlay-peer=$L0_OVERLAY_BEACON_PEER"
+			echo "Starting beacon L0_ONLY advertise=$ADVERTISE_IP overlay-peers=${#PEER_ARGS[@]} (no-discovery)"
 		fi
 	else
 		echo "Starting beacon advertise=$ADVERTISE_IP (no validator)"

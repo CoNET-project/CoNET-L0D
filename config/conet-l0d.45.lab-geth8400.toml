@@ -1,0 +1,50 @@
+# Spoke 74.208.224.45 — lab hub .98 only, geth :8400 duplex (no beacon/udp).
+# Pair with config/conet-l0d.98.lab-geth8400.toml on hub.
+# Use for 409 / l0_connect occupy debugging without multi-channel rebuild storms.
+
+tun_name = "conet-l0"
+overlay_cidr = "100.64.0.0/10"
+local_vip = "100.64.0.5"
+iptables_chain = "CONET_L0D"
+state_path = "/home/peter/conet-l0d-lab/run/state.json"
+
+[identity]
+locator = "web3://0xEF10752843cAC32C73DAb86658B8ab6E5667199B/p2p/geth"
+
+[[peers]]
+locator = "web3://0x8a2b04C82B43447b69946b31BCCEa14ed29471f4/p2p/geth"
+vip = "100.64.0.6"
+tcp_ports = [8400]
+user_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-user.asc"
+route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-route.asc"
+
+[l0]
+enabled = true
+rpc = "https://rpc1.conet.network"
+address_pgp = "0x684b0ac760cEE9c9b85de36d69746420648Cf9e2"
+entries = [
+  "http://20ab90fe82d0e9e3.conet.network",
+  "http://f8117e1568eeaed7.conet.network",
+  "http://ae85a2aeec768225.conet.network",
+]
+listen_entries = [
+  "http://f8117e1568eeaed7.conet.network",
+  "http://ae85a2aeec768225.conet.network",
+  "http://20ab90fe82d0e9e3.conet.network",
+]
+routing_eoa = "0xEF10752843cAC32C73DAb86658B8ab6E5667199B"
+routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
+routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
+mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route.asc"
+
+[[l0.channels]]
+ports = [8400]
+routing_eoa = "0xEF10752843cAC32C73DAb86658B8ab6E5667199B"
+routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
+routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
+mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route.asc"
+listen_entries = [
+  "http://f8117e1568eeaed7.conet.network",
+  "http://ae85a2aeec768225.conet.network",
+  "http://20ab90fe82d0e9e3.conet.network",
+]

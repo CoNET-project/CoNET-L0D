@@ -1,7 +1,7 @@
 # conet-l0d — 在 Layer Minus 上的 L1 overlay
 
 **成对译本：** [English](./conet-l0d.md)  
-**Revision：** 2026-08-18（SI `l0_listen` / `l0_connect` 占用管道；应用层 duplex：要约走 Chat gossip；接受 / 拒绝 / 帧为占用管道上的 AES；拒绝、无 accept 或无管道则 P1 gossip；可选按端口 `[[l0.channels]]` listen SSE；overlay IPv4 合批 + POST 32/512；追链受 Prysm 限速；实验室 overlay UDP + 经 L0 的现役 discv5 已通过；DHT 掉线先清幽灵 conntrack；授权 `.45` `restart-beacon` 仅用于拨号 backoff；`ss` 公网 `:4200` 是 DNAT 原目的、不是漏公网；不是生产 discv5 产品）  
+**Revision：** 2026-08-20（slot 关键指标发表门槛 vs 公网 P2P；多 Guardian / 多 Mailbox 路径多样性；SI `l0_listen` / `l0_connect` 占用管道；应用层 duplex；可选按端口 `[[l0.channels]]`；实验室 overlay TCP/UDP；不是生产 discv5 产品）  
 **公开操作说明：** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **公开开发说明：** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -126,9 +126,11 @@ Duplex 是 Chat gossip 上的 **应用 JSON**，加上 SI 占用管道上的 AES
 
 ## 8. 生产姿态
 
-slot 关键 gossip（6 秒）继续走 **公网 P2P**。L0 overlay 用于 NAT / 无公网 IP / 备份对等。未测时延前，L0-only 提议者不得当默认。
+slot 关键 gossip（`SECONDS_PER_SLOT=6`）继续走 **公网 P2P**。L0 overlay 用于 NAT / 无公网 IP / 备份对等。**在** GitBook [slot 关键发表门槛](https://gitbook.conet.network/developers/l1-node.html#slot-critical-publication-gate) **对照公网 P2P 基线填齐之前**，不得把 L0-only 提议者当默认（须发布：L0 RTT P50/P95/P99；区块传到 50% 与 90% 节点的时间；attestation inclusion delay；missed slot；reorg；duplex 重连时间；Guardian 故障切换时间；UDP/discv5 丢包率）。
 
-L0 额外时延在本 Revision 中是 **估计**（每跳数十到数百毫秒），不是实验室实测。
+2026-08-18 约 15 分钟实验室快照：overlay TCP RTT 约 475–750 ms，相对 `.98` 公网 peer 约 40–55 ms。这 **不是** P50/P95/P99，也 **不是** 提议者集合实测。
+
+若 overlay 流量挤在 **少数 Mailbox**，风险会从验证者 **IP** 集中变成 **Guardian 路径** 集中。生产 overlay 必须有多个独立入口、多个 Mailbox、多个 ASN、多个地区、每 overlay 端口独立 Routing EOA（`[[l0.channels]]`），以及自动重连 **并** 切到另一个 B。同一 B 上的按端口 EOA **不能** 消除 Mailbox 集中。占用重试已在 crate 内；跨 Guardian 故障切换不是已交付产品。
 
 ## 9. 安全
 
@@ -144,7 +146,7 @@ L0 额外时延在本 Revision 中是 **估计**（每跳数十到数百毫秒�
 | **MVP** | **已验收（2026-08-17）。** Linux 命令；TUN + iptables 生命周期；定位符解析；静态对等表；收包计数；L0 客户端桩 |
 | **P1** | **已在 crate；`[l0]` 默认关。** 钱包对钱包 TCP 字节流。对端应用回 `duplex_accept` 时优先 **应用层 duplex**（现有 Chat gossip）；否则保持 **P1 gossip**（user-PGP 信封 + mailbox wrap）。静态 overlay bootnode。crate 把 overlay 信封加密给对端 **user PGP**，再 wrap `{ data, NoPush: true }` 给 mailbox **B route PGP**，仅在 `[l0].enabled` 且对端有 user+route PGP 文件与 entry 时 `POST { "data" }`。入站：解密 user-PGP armor → overlay 信封 → 原始 IPv4 入队写回 TUN（`routing_key_file` 须为 OpenPGP 私钥证书）**已在 crate**。Listen HTTP+SSE worker **已在 crate**：enabled 加上 `listen_entries`（C ≠ B）、`mailbox_route_pgp_file`（本机 B route **公钥**）、`routing_eoa`、`routing_key_file` 与 `routing_eth_key_file`（hex secp256k1；recovered 地址须等于 `routing_eoa`；不是 OpenPGP）。可选 `[[l0.channels]]` 为 overlay 端口 8400 / 4200 / 4300 各用一个 EOA + SSE（出站加密给该端口的对端 user PGP；按知名源或目的端口分类）。未配 channels 时仍是一个 EOA。`:4300` 是 overlay IPv4，不是 `udp_relay`。应用层 host listen **就是**现有 Chat SSE（`mining` + `listenKind: "chat"`，listen **不得**带 overlay AES）。对端不回 `duplex_accept` 则保持 P1 gossip。EIP-191 签成 SI `{ message, signMessage }` base64。Listen 入站对齐 SI `forWardPGPMessageToClient` 的原始 JSON `{ "data": "<armor>" }`（与 Chat `handleInbound` 相同），不再只认 SSE armor 行。测试只用 wiremock。**经授权**的实验室可开 `[l0]`。**禁止**把 SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` 写成现役 SI。**2026-08-17 23:12Z L0-only：** 出站 HTTP 200，无入站 TUN 写回（当时只扫 SSE）。**23:30Z**（只重启 `conet-l0d`）：两机 TUN 均有入站 IPv4，且 overlay geth TCP 已通（`.45` `100.64.0.5` ↔ `.98` `100.64.0.6:8400`）。**2026-08-18：** 授权 L0_ONLY `.45` 通告 overlay vIP `100.64.0.5`；overlay geth + beacon TCP 已 ESTAB；IPv4 合批 + POST 并发 32 / 队列 512（两机必须同升二进制）。该二进制之后 overlay queue-full 为 0；追链剩余限速是 Prysm initial-sync（约 3.2 块/秒、约 15 小时）。EL 仍为 `0x0`。只读抽检：`scripts/watch-l0-follow.sh`。追链门仍开。`.98` 与生产 proposer 仍通告公网 IP。HTTP 200 ≠ 投递。 |
 | **P2** | **实验室通讯已验收；不是产品。** crate 已运 IPv4/UDP — 不必再做 datagram 适配器。2026-08-18 实验室：overlay UDP 回声与 `:4300`（直发 + 公网 ENR steer）已到对端 TUN。随后 L0_ONLY `.45` 放弃静态 `--peer`，经 L0 连上 `.98` DHT 服务器（`.98` 用 `--p2p-static-id`；bootstrap ENR；allowlist = overlay + 枢纽公网 `/32`；TCP/UDP steer DNAT；隔离链仍丢未 steer 的公网 P2P）。DNAT 之后 `.45` `ss` 可能显示枢纽公网 `:4200`（原目的，不是漏公网）；overlay 证明是 TUN VIP + 隔离 DROP=0。若后来 `connected` 掉线，先重打 `overlay-dht-steer.sh`（清幽灵 conntrack；**不要**为此重启 EL/CL）。仅当 Prysm 仍停在拨号 backoff 时才 `restart-beacon`（**2026-08-18 约 17:28Z** `.45` 恢复 `connected=1` 与 `Processing blocks`；启动后不要立刻再打 steer）。第一分钟 `suitable=0` 属预期。EL 仍为 `0x0` 而 `head_slot` 在涨 = CL 滞后。见 `docs/P2.zh-CN.md`。 |
-| **P3** | 混合生产（公网 P2P + L0 备份）；实测 RTT |
+| **P3** | 混合生产（公网 P2P + L0 备份）；**已发布** slot 关键指标 vs 公网 P2P；多入口 / 多 Mailbox / 多 ASN 多样性 |
 
 ## 11. 真相来源
 
@@ -167,3 +169,59 @@ L0 额外时延在本 Revision 中是 **估计**（每跳数十到数百毫秒�
 - [Run an L1 node](https://gitbook.conet.network/developers/l1-node.html)
 - [SilentPass](https://gitbook.conet.network/applications/silentpass-vpn.html) — 出口，不是 L1 P2P
 - [Wallet-addressed peer identity](https://gitbook.conet.network/l0/wallet-address-p2p.html)
+
+## 12. 临时聆听身份与传输拆线（2026-08-20 重设计）
+
+旧的确定性 `sessionId`、钱包/端口关联方式已经废弃，不再作为兼容目标。
+每次双向管道建立都生成新的 32 字节随机 opaque `pipe_handle`。它不能由任一
+钱包、端口、IP 或路由推导。
+
+首个 `duplex_offer` 是 bootstrap 请求，可以先加密到接收方长期公共用户
+PGP，以便 mailbox 找到接收方。请求中携带发起方专用的 listen 管道 PGP。
+接收方接受后，`duplex_accept` 必须加密到请求中提及的
+`listenUserPgp`，不能再加密到发起方长期公共用户 PGP。响应携带接收方自己
+专用的 listen 管道 PGP 和协商出的 AES 密钥。完成交换后，双向控制流只使用
+双方各自的专用管道 PGP；发起方不再使用接收方公共用户 PGP。
+Mailbox/Entry SI 只能把 handle 当作本跳 opaque 值，不能跨跳关联。
+
+SI 的知识边界严格限制为：
+
+- mailbox SI 只知道自己的等待池和自己持有的 occupied TCP；
+- entry SI 只知道本跳 handle 和 socket 生命周期；
+- 任一 SI 都不能获得端到端 AES 密钥或完整路径；
+- 不再发送 SSE 侧 `l0_pipe_end`、钱包、connector 或确定性 session 通知。
+
+`l0_pipe_end` 现在只允许作为 occupied TCP 控制行。它必须出现在已经绑定
+同一个 opaque `pipe_handle` 的 TCP 连接上：
+
+```json
+{
+  "type": "l0_pipe_end",
+  "pipe_handle": "<64 位小写 hex>",
+  "reason": "transport_closed"
+}
+```
+
+不得携带 wallet 或 connector。缺失、格式错误或不匹配的 handle 必须拒绝。
+SSE 解析器绝不能把该对象当成远端拆线命令。entry-to-entry 传输在响应提交前
+使用 HTTP `410`，响应已经进入 keep-alive 后立即 FIN/RST；发送方收到失败后
+必须停止 packet loop，不得继续向失效目标写包。
+
+这样恶意 listener 不能把健康发送方变成 packet 放大器：只有当前绑定的传输
+才能结束自身，重连仍受限于已有的有界 retry/backoff 与占用上限。SI 如需
+跨跳传递拆线，只能在内部使用 opaque handle，不能暴露为应用消息。
+
+## 13. occupied 管道存活超时
+
+occupied 双向管道的发送方负责在每个两分钟窗口内发送至少一段应用数据。
+没有 overlay IPv4 帧时，`conet-l0d` 每 60 秒发送一个加密的
+`duplex_ping` 应用 blob。这是普通双工数据，不是伪造的 IP 数据包。
+
+只有专用 L0 listen SSE 适用该无活动规则；普通 Chat SSE 继续使用 mailbox
+自己的 heartbeat 语义。L0 聆听方以收到的字节作为存活信号：连续 120 秒没有
+任何入站字节，就将管道视为已废弃，关闭自己的 SSE，并清除本地 occupied
+writer。对端观察到 EOF 后必须停止向该管道实例继续写入。
+
+双向 client 只有在自己的聆听 SSE 已终止、并且新的 listen 已成功建立后，
+才可以发起新的 `l0_connect`。新连接必须使用新的请求和新的 `pipe_handle`；
+不得复用旧的 `pipe_tx`。重连仍受现有 retry/backoff 与占用上限约束。

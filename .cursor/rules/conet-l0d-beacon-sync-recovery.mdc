@@ -1,0 +1,106 @@
+---
+description: conet-l0d overlay 追链 / sync 时 beacon connected=0 故障消除经验（全局参照）
+alwaysApply: true
+---
+
+# conet-l0d：L1 overlay sync 时消除 beacon 故障
+
+凡用 **`conet-l0d`** 做 CoNET L1（224422）**geth + Prysm beacon** overlay 追链 / 静态 peer，出现 **beacon `connected=0`**、**dial backoff**、或 **overlay TCP SYN-SENT 不成 ESTAB**，按本守则排查与恢复。
+
+**愿景 vs 生产（勿混）：** GitBook 定位 L1-over-L0 为 **destination**（钱包地址寻址承载共识 gossip）；公开 join 仍文档化公网 hub；Overlay **Under development / lab-proven**。Beacon index ≥2000 **不是**「已全切 L0 gossip」的普查。愿景正文：`developers/l1-node.md` Vision 节。
+
+公开开发者步骤见 GitBook [Run an L1 node](https://gitbook.conet.network/developers/l1-node.html)（Vision + overlay 节）与 [Applications — conet-l0d](https://gitbook.conet.network/applications/conet-l0d.html)。
+
+与 **`critical-chain-infra-restart-requires-approval.mdc`** 并存：**默认禁止**重启 geth / beacon / validator；下列「可授权动作」须用户**同条消息**明确书面同意。
+
+## 1. 先分清两层
+
+| 层 | 健康信号 | 失败时不要先怪 |
+|---|---|---|
+| **Overlay 转发**（`conet-l0d` + SI `l0_listen` / `l0_connect`） | TUN up；`ss` 见 `100.64.x.x`↔`100.64.y.y:8400/:4200` **ESTAB**；日志有 `duplex AES frame`（或稳定 P1）且**无**持续 `HTTP 409` / `listen POST timed out` | 仅看公网 `ss` 或仅看 Entry HTTP |
+| **共识拨号**（Prysm） | `GET …/eth/v1/node/peer_count` → `connected≥1`；日志无反复 `dial backoff` | Overlay 已 ESTAB 仍 `connected=0` 时，优先 dial backoff / peer id，而不是再改 genesis |
+
+**geth overlay ESTAB ≠ beacon 已连上。** 必须单独查 `:4200`。
+
+## 2. 症状对照（2026-08-18/20 实验室）
+
+| 现象 | 常见根因 |
+|---|---|
+| beacon `connected=0`，日志 `failed to dial … /ip4/<hub-vip>/tcp/4200` + **`dial backoff`** | Prysm 退避；或 overlay `:4200` 握手未完成 |
+| `ss`：`100.64.0.5:ephemeral → 100.64.0.6:4200` **SYN-SENT** 不成 ESTAB | Overlay 上 TCP 握手失败（常伴随 `:4200` 管道 409 / 仅 P1） |
+| `conet-l0d`：`l0_connect` / P1 **`HTTP/1.1 409 Conflict`** | Mailbox **B** 上 L0 occupy 未释放（SI 舰队滚动 / 双端 bounce 竞态）；或客户端重启后新 `l0_listen` 撞上仍 live 的占用 |
+| `occupied l0 pipe queue full; falling back to P1 gossip`，overlay `:4200` **SYN-SENT** | Occupy TCP **EOF** 后 crate 未清 `pipe_tx`、占用任务永久退出；TUN 往死 channel `try_send` 失败走 **P1**，P1 完不成 beacon TCP |
+| 客户端 bounce `conet-l0d` 后一直 `409` / 无 AES | SI 旧逻辑：occupied 拒绝替换 `l0_listen`；Entry C 未关 → B 僵尸 occupy。新 SI：inbound destroyed 或 SSE stale 才 drop 并接受替换；活管道仍 409 |
+| geth `:8400` ESTAB，beacon `:4200` 仍 0 | 分端口管道；只修 geth 不够 |
+| Entry `/post` 假 armor 秒回 nginx 拟态 404，真 PGP **8s/15s timeout** | SI `forwardEncryptedSocket` wallet 空且未关 socket（须 SI ≥ `b374d93`）；或 `miningRate.nodeWallets` 空 |
+| `pgrep -n geth` PID 变了，但 `geth.pid` 未变 | **误匹配**：`beacon-chain` 命令行含 geth 路径。验收 **只认 `geth.pid` 文件** |
+| Hub `restart-beacon` 后公网 `connected` 短暂 0 | 公网 peer 重连中（实验室可从 14→0→15）；**spoke overlay `connected` 才是 overlay 测试对象** |
+
+## 3. 推荐恢复顺序（由轻到重）
+
+1. **只读确认**
+   - Spoke：`curl -s http://127.0.0.1:4100/eth/v1/node/peer_count`
+   - `ss -tn \| grep -E '100.64|:4200|:8400'`
+   - Hub：`curl -s http://127.0.0.1:4100/eth/v1/node/identity` → `peer_id` 须等于 spoke `--peer` / static multiaddr
+   - `conet-l0d.log`：`duplex_offer accepted`、`:4200` AES、是否刷屏 `409`
+2. **Steer / DNAT / conntrack（不重启 EL/CL）**
+   - Spoke：`overlay-dht-steer.sh apply`（若使用 public-ENR / hub 公网拨号再 DNAT 到 overlay）
+   - 双端：`overlay-beacon-listen-dnat.sh apply`
+   - 可选：`conntrack -D` 针对 tcp sport/dport **4200**（清 ghost）
+3. **清 Mailbox B 的 L0 占用（仅 SI）**
+   - 对 spoke/hub 的 mailbox B（实验室曾为 `217.160.189.159` / route key `9977E9A45187DD80`）：`pkill -f '/home/peter/CoNET-SI/dist/start.js'`（systemd `Restart=always`；**无** `sudo systemctl` 假失败）
+   - 等 B `conet.service` **active** 后再动客户端
+4. **顺序 bounce 仅 `conet-l0d`**
+   - **先 hub，再 spoke**；每次后重打 DNAT/steer；flush `:4200` conntrack
+   - 勿同时双杀导致双边抢 occupy → 再 409
+5. **仅当仍 dial backoff：授权 `restart-beacon`（只动该机 beacon）**
+   - Spoke：`.45` `./scripts/start-geth-beacon-only.sh restart-beacon`
+   - Hub（须同条消息点名）：`.98` `./start-shared-beacon-98.sh restart-beacon`
+   - **禁止**顺带 geth / validator / wipe；**禁止** `start-l0-only` / `restart`（会带 geth）
+   - restart 后 **不要立刻** `overlay-dht-steer.sh apply`（历史：立即 steer 会打乱刚建的 dial）
+   - TUN bounce 或 beacon 换 PID 后 **要**重打 `overlay-beacon-listen-dnat.sh apply`（这是 listen-DNAT，不是 steer）
+6. **验收（overlay CL sync 是否在执行）**
+   - Spoke `connected≥1`；`ss` overlay `:4200` **ESTAB**（`100.64.x.x`↔`100.64.y.y:4200`）；geth `net_peerCount≥1` 可并行确认
+   - REST `last_seen` / peers：outbound `/ip4/<hub-vip>/tcp/4200`，且 hub `peer_id` 因 `--p2p-static-id` **未变**
+   - `conet-l0d.log`：`:4200` `duplex AES frame`（可到十几 KB）且**无**刷屏 `409`
+   - CL `is_syncing=true` + 大 `sync_distance` + `is_optimistic=true` = 追块中，**不是** peer 故障
+   - **进行中的证明：** `head_slot` **上升** 且 `sync_distance` **下降**（2026-08-20 ~04:09Z 实验室：约 1 分钟 `937984→938207`、`32443→32228`）
+   - Spoke overlay geth 仍 `eth_blockNumber=0x0` 而 CL 在涨 = EL 滞后，**不要**据此重启 geth
+   - 验 geth 未动：读 **`geth.pid`**（`.45` HTTP 常为 `:8545`；`.98` 实验室 HTTP 为 **`:8889`**，不是 `:8545`）
+
+## 3b. Overlay 静态 peer 测 CL sync（2026-08-20）
+
+测 **spoke overlay 追链** 时用 lab-only 双端口 toml（`:8400` + `:4200`），**不要**挂生产 `.82`、**不要** `dual.toml`、本测不必开 `:4300` / `L0_DHT`。
+
+1. Bounce **仅** `conet-l0d`：**先 hub，再 spoke**；两侧 `pipe_tx` 须同时有 `port=4200` 与 `8400`。
+2. 两机 `overlay-beacon-listen-dnat.sh apply`（排除 `:8400`）。
+3. 用户书面授权后：`restart-beacon` **先 hub 再 spoke**；每次后重打 **DNAT**，不打 steer。
+4. Spoke 须 `--no-discovery` + overlay `--peer=/ip4/<hub-vip>/tcp/4200/p2p/<hub-peer-id>`（可另留公网 `--peer`；isolate 仍丢未 steer 的公网拨号）。
+
+## 3c. 客户端断开后重启再连（同进程 vs 新进程）
+
+| 阶段 | 正确行为 | 旧 bug（beacon 断了就不回来） |
+|---|---|---|
+| 同进程 occupy TCP **EOF**（无 `l0_pipe_end`） | 清 `pipe_tx`，`peer_attached` 则 **retry** `l0_connect` | `Ok(())` 且已装 `pipe_tx` → 占用任务退出；TUN queue-full → **P1** → `:4200` SYN-SENT |
+| 同进程 exclusive `l0_listen` 重连 | **HTTP 200 且 SSE 仍活**时 rebuild outbound occupy | rebuild 写在 `pump_sse_armors` **之后**（B 已无 listen）→ occupy 404 |
+| **新进程** bounce `conet-l0d` | 新 `l0_listen`；再 `duplex_offer`/`accept` + `l0_connect`。SI：占用 inbound/SSE **已死**则 drop 旧 occupy 并接受；**活管道仍 409** | occupied 一律 409 → 新 listen 进不了 idle → 新 connect 409，直到 mailbox B `pkill` SI |
+| Prysm 已 `dial backoff` | overlay ESTAB+AES 后若仍 `connected=0`，才授权 **该机** `restart-beacon` | 未修 L0/SI 就重启 beacon 只会再 backoff |
+
+现网仍卡死时（未部署上述 crate/SI）：清 mailbox B occupy → **先 hub 再 spoke** bounce **仅** `conet-l0d` → flush **仅** `:4200` conntrack → 重打 listen-DNAT。未授权不得动 geth / beacon / validator。
+
+## 4. 部署 / 运维禁令
+
+- ❌ 未授权重启 geth / beacon / validator，或 `rm -rf` chaindata
+- ❌ 把 Entry 假 armor 的 nginx 拟态 404 当成「nginx 坏了」（多为 SI `htmlResponse`）
+- ❌ SI 舰队滚动后只 bounce spoke `conet-l0d`、不清 B occupy，却期望 `:4200` 立刻 AES
+- ❌ `restart-beacon` 后立刻反复 `overlay-dht-steer.sh apply`（listen-DNAT **可以**重打）
+- ❌ 用 `pgrep -n geth` 判定 geth 已被重启（须读 `geth.pid`）
+- ❌ 因 spoke EL 仍 `0x0` 或 hub 公网 `connected` 短暂 0 而再重启 geth
+- ❌ 用 SilentPass / `SaaS_Sock5` 冒充 L1 overlay P2P
+
+## 5. 相关
+
+- GitBook：`developers/l1-node.md`（overlay 部署 + recovery）、`applications/conet-l0d.md`、`developers/conet-l0d.md`
+- Crate：`RULES.md`、`docs/P1.md`、`docs/P2.md`、`scripts/overlay-*.sh`、`scripts/start-geth-beacon-only.sh`
+- SI 舰队：`conet-si-fleet-update-restart.mdc`（滚动后若 lab 409，按本守则 §3.3–3.4）
+- 链重启总则：`critical-chain-infra-restart-requires-approval.mdc`

@@ -10,6 +10,7 @@
 //! reader here surfaces that as [`L0dError::L0PipeEnd`].
 
 use crate::error::L0dError;
+use crate::l0::aes;
 use crate::l0::duplex;
 use crate::l0::post;
 use rustls::pki_types::ServerName;
@@ -17,14 +18,30 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration, Instant};
+
+/// The sender must put at least one application blob on the occupied pipe
+/// during this window. The listener uses the same deadline for inbound SSE
+/// bytes. Keep the heartbeat comfortably below the deadline.
+pub const PIPE_DATA_TIMEOUT: Duration = Duration::from_secs(120);
+pub const PIPE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 use tokio_rustls::TlsConnector;
 
-pub async fn run_occupied_pipe(
+/// Opens occupied TCP, waits for HTTP 2xx, then calls `on_up` **before** the
+/// first AES blob. `on_up` is where the crate may install `pipe_tx` so TUN
+/// frames are not queued onto a pipe that never got 200.
+pub async fn run_occupied_pipe<F>(
     entries: &[String],
     connect_armor: &str,
+    expected_session_id: &str,
+    heartbeat_key: Option<[u8; aes::KEY_LEN]>,
     mut first: Option<String>,
     mut rx: mpsc::Receiver<String>,
-) -> Result<(), L0dError> {
+    mut on_up: F,
+) -> Result<(), L0dError>
+where
+    F: FnMut(),
+{
     if entries.is_empty() {
         return Err(L0dError::L0("l0.entries is empty; refusing l0_connect pipe".into()));
     }
@@ -32,6 +49,7 @@ pub async fn run_occupied_pipe(
     for entry in entries {
         match open_pipe(entry, connect_armor).await {
             Ok((mut stream, mut reader)) => {
+                on_up();
                 if let Some(blob) = first.take() {
                     if let Err(err) = write_blob_line(&mut stream, &blob).await {
                         last = err;
@@ -39,6 +57,7 @@ pub async fn run_occupied_pipe(
                     }
                 }
                 let mut line_buf = String::new();
+                let mut heartbeat = Box::pin(sleep(PIPE_HEARTBEAT_INTERVAL));
                 loop {
                     tokio::select! {
                         blob = rx.recv() => {
@@ -47,14 +66,35 @@ pub async fn run_occupied_pipe(
                                 None => return Ok(()),
                             }
                         }
+                        _ = &mut heartbeat, if heartbeat_key.is_some() => {
+                            let key = heartbeat_key.as_ref().expect("heartbeat key");
+                            let ping = duplex::seal_ping(
+                                key,
+                                expected_session_id,
+                                chrono::Utc::now().timestamp().max(0) as u64,
+                            )?;
+                            write_blob_line(&mut stream, &ping).await?;
+                            heartbeat
+                                .as_mut()
+                                .reset(Instant::now() + PIPE_HEARTBEAT_INTERVAL);
+                        }
                         line = read_pipe_line(&mut reader, &mut line_buf) => {
                             match line? {
                                 None => return Ok(()),
                                 Some(l) if l.is_empty() => {}
                                 Some(l) => {
                                     if let Some(info) = duplex::parse_l0_pipe_end(&l) {
+                                        if info.pipe_handle != expected_session_id {
+                                            tracing::warn!(
+                                                expected = %expected_session_id,
+                                                received = %info.pipe_handle,
+                                                "ignoring l0_pipe_end for another pipe"
+                                            );
+                                            continue;
+                                        }
                                         return Err(L0dError::L0PipeEnd {
                                             reason: info.reason,
+                                            session_id: info.pipe_handle,
                                         });
                                     }
                                 }

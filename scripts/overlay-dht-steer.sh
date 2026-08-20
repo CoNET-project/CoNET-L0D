@@ -1,7 +1,9 @@
 #!/bin/bash
-# Lab-only on L0_ONLY .45: rewrite dest <peer public>:4300 UDP and :4200 TCP
-# to the overlay vIP so discv5 that follows a public ENR, then the libp2p
-# dial that ENR advertises, still ride TUN / L0.
+# Rewrite dest <peer public>:4300 UDP and :4200 TCP to the overlay vIP so
+# discv5 that follows a public ENR, then the libp2p dial that ENR advertises,
+# still ride TUN / L0. Lab: L0_ONLY .45 → .98 (defaults). Also .98 → .82
+# (PEER_PUBLIC_IP=216.225.202.82 PEER_OVERLAY_VIP=100.64.0.7). Does not
+# rewrite QUIC :13000 — that stays public until beacon --disable-quic.
 # Does NOT restart geth/beacon/validator. Does NOT touch CONET_L0D.
 #
 # Packet path (locally generated):
