@@ -24,6 +24,8 @@ if [[ -f "$LAB_DIR/scripts/l0-prod82-hub.env" ]]; then
 	# shellcheck disable=SC1091
 	source "$LAB_DIR/scripts/l0-prod82-hub.env"
 fi
+# Optional dual-hub (.98 VIP). Default lab uses l0-dual-hub.env.disabled —
+# SI exclusive occupy cannot mesh .45↔.82↔.98; enabling causes dial backoff.
 if [[ -f "$LAB_DIR/scripts/l0-dual-hub.env" ]]; then
 	# shellcheck disable=SC1091
 	source "$LAB_DIR/scripts/l0-dual-hub.env"
@@ -60,10 +62,13 @@ LAB_98_ENODE="${LAB_98_ENODE:-enode://006561987aaeea06a6f2c54d37656a4acccd0c1e16
 HUB_BOOTNODES="${HUB_BOOTNODES:-enode://e5fe89d9ad924db6e4699480242a12fccba2c00e35772db706e46190c0ded9bb2b7e0d996826f5e46d369e01336213ef263c5038f94552e5f5e6e8ec76573a3f@38.102.126.30:8400,enode://d9243095bca94720f88d38c93ae4ccefc8b67651c66b4c93c915f845f6abfd39a091465db02db32b1a5b8061566c1558d2e6842f75620bf533480bab8a180168@38.102.126.50:8400,enode://5cf9a159e641318cda27e6bc1b4185667c0cdb1b54c3df5b8626eacbacea93af64c243dbdd09b40c62ba24792d0afc571cf17cbc47a5ed5a6207f27054c01d65@216.225.202.23:8400,enode://8e09d44bb4c29543a172e53dd8a74677a2a63d3d98a3d530f9d8b6f6bd6802a542f5b79d509ff737a9a764a66ab44a81403597cb50e350178ddd91f487e28f2d@216.225.202.22:8400,enode://dc0624c81896cdec036af7096886b1629a288b4824a467038df645c5c6b0f7fe75e13758ea80c0c37ba6245b221680db1fb553d564e54b55410eb6063bb64ca0@216.225.197.3:8400,enode://f1e249c97ce861441b3bd4832213cc634dd5c23d1a8722cd9c1aea28492779f6b64e012e8d97d56006d69be5224903ea5a787d8af68e9542db82ac1f76491dd5@216.225.202.82:8400}"
 EXECUTION_BOOTNODES="${EXECUTION_BOOTNODES:-${HUB_BOOTNODES},${LAB_98_ENODE}}"
 
-# Static beacon peer (non-DHT L0_ONLY). Live .98 --p2p-static-id (2026-08-18).
-# L0_DHT with a bootstrap ENR does not use --peer.
-EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-/ip4/198.251.77.98/tcp/4200/p2p/16Uiu2HAmF1SXGHnne9DQTHGfgGQgje3cBV8pdSLJF25ajYKr2hvS}"
+# Optional *extra* static --peer (comma-separated). Primary overlay peer is
+# L0_OVERLAY_BEACON_PEER (from l0-prod82-hub.env → .82 VIP). Default empty:
+# do NOT auto-add .98 public/VIP — SI exclusive occupy + isolate make dual-hub
+# dial backoff. Enable via l0-dual-hub.env or export EXTRA_BEACON_PEERS=...
+EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-}"
 
+# Fallbacks only if l0-prod82-hub.env is missing (legacy .98-as-hub lab).
 L0_OVERLAY_ENODE="${L0_OVERLAY_ENODE:-enode://006561987aaeea06a6f2c54d37656a4acccd0c1e16c9025700be1cfc45c6b79596293426694f0cf5eccacc1f92392628a93adb52c607b86b78f8601e5247459b@100.64.0.6:8400}"
 L0_OVERLAY_BEACON_PEER="${L0_OVERLAY_BEACON_PEER:-/ip4/100.64.0.6/tcp/4200/p2p/16Uiu2HAmF1SXGHnne9DQTHGfgGQgje3cBV8pdSLJF25ajYKr2hvS}"
 # Comma-separated extra overlay enodes (e.g. second hub @100.64.0.6 when primary is .7).
@@ -72,6 +77,7 @@ L0_GETH_MAXPEERS="${L0_GETH_MAXPEERS:-}"
 # Combined /tcp/4200/udp/4300 is one multiaddr; libp2p reports "no transport for protocol"
 # and falls back to the hub public IP, which isolate then times out. discv5 uses ENR+steer.
 L0_NETRESTRICT="${L0_NETRESTRICT:-100.64.0.0/10}"
+# DHT hub defaults follow l0-prod82-hub.env when present; legacy .98 only as fallback.
 L0_DHT_HUB_PUBLIC_IP="${L0_DHT_HUB_PUBLIC_IP:-198.251.77.98}"
 L0_DHT_HUB_OVERLAY_VIP="${L0_DHT_HUB_OVERLAY_VIP:-100.64.0.6}"
 L0_DHT_STEER_CHAIN="${L0_DHT_STEER_CHAIN:-CONET_L0D_DHT_STEER}"

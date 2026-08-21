@@ -77,6 +77,9 @@ pub async fn uninstall(
 }
 
 pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
+    // Proxy-only still runs the TUN loop so IPv4 duplex frames from `--client`
+    // peers can complete overlay TCP (see apply_duplex_frame). Raw proxy drain
+    // remains attached for non-IPv4 stream bytes.
     let fd = open_tun(&cfg.raw.tun_name)?;
     let std_file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
     let writer_std = std_file

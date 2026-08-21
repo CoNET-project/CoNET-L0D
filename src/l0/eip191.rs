@@ -38,6 +38,15 @@ impl EthSecret {
         &self.address
     }
 
+    /// Return the raw key only to in-process protocol adapters (for example
+    /// the route-registration payload). Callers must never log or persist it.
+    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
+        let bytes = self.signing_key.to_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(bytes.as_slice());
+        out
+    }
+
     /// EIP-191 `personal_sign`. Returns `0x` + 65-byte hex (`r || s || v`, `v = 27/28`).
     pub fn personal_sign(&self, message: &[u8]) -> Result<String, L0dError> {
         let digest = eip191_hash(message);

@@ -30,6 +30,9 @@ use tokio_rustls::TlsConnector;
 /// Opens occupied TCP, waits for HTTP 2xx, then calls `on_up` **before** the
 /// first AES blob. `on_up` is where the crate may install `pipe_tx` so TUN
 /// frames are not queued onto a pipe that never got 200.
+///
+/// When `inbound_tx` is set, AES lines read from the occupied TCP (peer return
+/// path) are forwarded into the same listen inbound queue as SSE AES blobs.
 pub async fn run_occupied_pipe<F>(
     entries: &[String],
     connect_armor: &str,
@@ -37,6 +40,7 @@ pub async fn run_occupied_pipe<F>(
     heartbeat_key: Option<[u8; aes::KEY_LEN]>,
     mut first: Option<String>,
     mut rx: mpsc::Receiver<String>,
+    inbound_tx: Option<mpsc::Sender<String>>,
     mut on_up: F,
 ) -> Result<(), L0dError>
 where
@@ -98,6 +102,16 @@ where
                                             reason: info.reason,
                                             session_id: info.pipe_handle,
                                         });
+                                    }
+                                    if duplex::looks_like_aes_blob(&l) {
+                                        if let Some(tx) = inbound_tx.as_ref() {
+                                            if tx.try_send(l).is_err() {
+                                                tracing::warn!(
+                                                    session = %expected_session_id,
+                                                    "occupied pipe inbound AES dropped; listen queue full"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -236,6 +250,12 @@ async fn read_http_ok(reader: &mut PipeReader) -> Result<(), L0dError> {
                 .split_whitespace()
                 .nth(1)
                 .and_then(|s| s.parse::<u16>().ok());
+            if code == Some(410) {
+                return Err(L0dError::L0(format!(
+                    "l0 pipe peer disconnected: {}",
+                    status_line.trim()
+                )));
+            }
             if code.map(|c| (200..300).contains(&c)) != Some(true) {
                 return Err(L0dError::L0(format!(
                     "l0 pipe HTTP not 2xx: {}",

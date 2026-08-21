@@ -1,26 +1,29 @@
-# Spoke 74.208.224.45 — lab hub .98 only, geth :8400 + beacon :4200 duplex.
-# Pair with config/conet-l0d.98.lab-beacon.toml on hub.
-# No prod .82 channels (avoids extra occupy). UDP :4300 omitted; L0_ONLY uses static TCP --peer.
+# Lab: .98 is an L0 client of the .82 proxy hub.
+# Public EL/CL peers may remain configured separately as a fallback, but the
+# overlay request target is always .82's mainWallet:port.
+#
+# .82's proxy allocates a unique temporary listen wallet for every accepted
+# duplex_offer, so .45 and .98 do not contend for the same SI occupation.
 
 tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
-local_vip = "100.64.0.5"
+local_vip = "100.64.0.6"
 iptables_chain = "CONET_L0D"
-state_path = "/home/peter/conet-l0d-lab/run/state.json"
+state_path = "/home/peter/conet-l0d-lab/run/state-lab-client.json"
 
 [identity]
-locator = "web3://0xEF10752843cAC32C73DAb86658B8ab6E5667199B/p2p/geth"
+locator = "web3://0x8a2b04C82B43447b69946b31BCCEa14ed29471f4/p2p/geth"
 
 [[peers]]
-locator = "web3://0x8a2b04C82B43447b69946b31BCCEa14ed29471f4/p2p/geth"
-vip = "100.64.0.6"
+locator = "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792/p2p/geth"
+vip = "100.64.0.7"
 tcp_ports = [8400]
 user_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-user.asc"
 route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-route.asc"
 
 [[peers]]
-locator = "web3://0x2Ae19d1f39445fFa218F540cdD6BDCAfBD68ca7b/p2p/beacon"
-vip = "100.64.0.6"
+locator = "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792/p2p/beacon"
+vip = "100.64.0.7"
 tcp_ports = [4200]
 user_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-beacon-user.asc"
 route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-beacon-route.asc"
@@ -39,14 +42,24 @@ listen_entries = [
   "http://ae85a2aeec768225.conet.network",
   "http://20ab90fe82d0e9e3.conet.network",
 ]
-routing_eoa = "0xEF10752843cAC32C73DAb86658B8ab6E5667199B"
+routing_eoa = "0x8a2b04C82B43447b69946b31BCCEa14ed29471f4"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
 mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route.asc"
+# Billing ≠ channel EOAs. Reuse UDP/DHT listen identity as main paid wallet
+# for this lab-only client toml (no :4300 channel here).
+billing_eoa = "0x72c240E4e35caF9822E6B71BBB816db83E1534a5"
+billing_eth_key_file = "/home/peter/conet-l0d-lab/keys/udp/routing.eth"
+
+# Request .82's mainWallet:port; the proxy hub owns per-client line identity.
+clients = [
+  "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792:8400",
+  "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792:4200",
+]
 
 [[l0.channels]]
 port = 8400
-routing_eoa = "0xEF10752843cAC32C73DAb86658B8ab6E5667199B"
+routing_eoa = "0x8a2b04C82B43447b69946b31BCCEa14ed29471f4"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
 mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route.asc"
@@ -58,7 +71,7 @@ listen_entries = [
 
 [[l0.channels]]
 port = 4200
-routing_eoa = "0x3F84B8f11BF7886DCf0c902A3148cc2926E185dA"
+routing_eoa = "0x2Ae19d1f39445fFa218F540cdD6BDCAfBD68ca7b"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/beacon/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/beacon/routing.eth"
 mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/beacon/self-mailbox-route.asc"

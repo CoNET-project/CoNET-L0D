@@ -132,6 +132,12 @@ pub fn load_public_cert_armored(path: &Path) -> Result<String, L0dError> {
     Ok(text)
 }
 
+pub fn transport_key_id_armored(armored: &str) -> Result<String, L0dError> {
+    let cert = Cert::from_bytes(armored.as_bytes())
+        .map_err(|e| L0dError::L0(format!("OpenPGP public cert: {e}")))?;
+    transport_key_id(&cert)
+}
+
 /// Load an armored OpenPGP **secret** cert. Do not log the file contents.
 pub fn load_secret_cert(path: &Path) -> Result<Cert, L0dError> {
     let bytes = std::fs::read(path)?;
@@ -235,7 +241,6 @@ pub fn generate_test_cert() -> Cert {
         .0
 }
 
-#[cfg(test)]
 pub fn secret_cert_armored(cert: &Cert) -> Result<String, L0dError> {
     String::from_utf8(
         cert.as_tsk()
@@ -244,6 +249,19 @@ pub fn secret_cert_armored(cert: &Cert) -> Result<String, L0dError> {
             .map_err(|e| L0dError::L0(format!("serialize secret cert: {e}")))?,
     )
     .map_err(|_| L0dError::L0("serialized secret cert is not UTF-8".into()))
+}
+
+pub fn transport_key_id(cert: &Cert) -> Result<String, L0dError> {
+    let policy = StandardPolicy::new();
+    cert.keys()
+        .with_policy(&policy, None)
+        .supported()
+        .alive()
+        .revoked(false)
+        .for_transport_encryption()
+        .next()
+        .map(|key| key.keyid().to_hex().to_uppercase())
+        .ok_or_else(|| L0dError::L0("OpenPGP cert has no transport encryption key".into()))
 }
 
 #[cfg(test)]

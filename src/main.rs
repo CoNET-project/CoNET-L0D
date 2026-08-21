@@ -34,7 +34,24 @@ async fn run() -> anyhow::Result<()> {
     match cli.command {
         Command::CheckConfig { config } => lifecycle::check_config(&config),
         Command::Resolve { uri, config } => lifecycle::resolve(&uri, config.as_deref()),
-        Command::Start { config } => lifecycle::start(&config).await,
+        Command::Start {
+            config,
+            main_wallet,
+            main_wallet_pgp,
+            main_wallet_key,
+            proxy,
+            client,
+        } => {
+            lifecycle::start_with_overrides(
+                &config,
+                main_wallet,
+                main_wallet_pgp.as_deref(),
+                main_wallet_key.as_deref(),
+                &proxy,
+                &client,
+            )
+            .await
+        }
         Command::Gateway { config } => gateway::run(&config).await,
         Command::Stop { config } => lifecycle::stop(&config).await,
         Command::Teardown { config } => lifecycle::teardown(&config).await,

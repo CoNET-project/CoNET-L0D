@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **Paired:** [中文](./MVP.zh-CN.md)  
-**Revision:** 2026-08-18 (crate MVP still accepted; authorized L0_ONLY `.45` advertises overlay vIP; overlay geth + beacon TCP proven; follow-the-chain Prysm-bound — see [P1.md](./P1.md); DHT drop recovery and ~17:28Z `restart-beacon` in [P2.md](./P2.md))
+**Revision:** 2026-08-21 (dynamic proxy lines, main-wallet billing, per-line temporary identities)
 
 Public how-to: [Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -22,6 +22,26 @@ Ship an independent **Linux command** `conet-l0d` that operators can start and s
 | L0 | Crate stub accepted: count TUN IPv4 and log dest vIP. Live overlay `/post` prefers **SI `l0_listen` / `l0_connect` occupancy pipe + application duplex** (offer on Chat gossip; accept / reject / frames as AES on the occupied pipe); P1 gossip on `duplex_reject` or missing `duplex_accept` or missing pipe — [P1](./P1.md). Do not claim SI `duplex_*` or `p2p_stream_*` |
 | Docs | Whitepaper pair + these MVP pages + GitBook Applications + Developers |
 | Example + unit | `config/conet-l0d.example.toml` and `systemd/conet-l0d.service` (`start`/`stop` only) |
+
+## Dynamic proxy lines
+
+Server mode may configure `[[l0.proxies]]` targets. `billing_eoa` and its
+local `billing_eth_key_file` sign duplex offer/accept (peer-verified). Mailbox
+`l0_listen` / `l0_connect` are signed by each channel wallet until SI fleets
+ship `billingWallet`. Each line still uses a distinct temporary wallet/PGP/AES
+session identity after `mainWallet:port` match. The temporary identity is
+registered before routing and is released on any transport failure. Multiple
+clients may use one logical port, but never share a line identity or pipe.
+Occupied bytes are copied to the configured `host:port`; offline data is
+discarded.
+
+Proxy-only servers (`[[l0.proxies]]` and no `l0.clients` / `--client`) still
+create TUN + iptables: current clients seal IPv4 on the occupy pipe. Proxy
+upstream copy applies to **non-IPv4** stream bytes; IPv4 frames write to TUN.
+Multi-port proxy must configure one `[[l0.channels]]` routing EOA per port
+(SI exclusive occupy); offer matching still uses `billing_eoa` as `mainWallet`.
+Clients use `--client 'web3://<peerMainWallet>:port'` to seed a pending duplex
+line toward that peer VIP:port while keeping TUN for local geth/beacon.
 
 ## Out of scope (not a failed MVP)
 

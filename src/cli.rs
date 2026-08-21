@@ -28,6 +28,22 @@ pub enum Command {
     Start {
         #[arg(long)]
         config: PathBuf,
+        /// Main paid wallet used to sign and settle proxy-channel commands.
+        #[arg(long = "mainWallet")]
+        main_wallet: Option<String>,
+        /// Optional OpenPGP secret key file for the main wallet.
+        #[arg(long = "mainWalletPgp")]
+        main_wallet_pgp: Option<PathBuf>,
+        /// Local hex secp256k1 key file for main-wallet EIP-191 signing.
+        #[arg(long = "mainWalletKey")]
+        main_wallet_key: Option<PathBuf>,
+        /// Proxy target, repeatable as host:port. The port is the L0 logical port.
+        #[arg(long = "proxy", value_name = "HOST:PORT")]
+        proxy: Vec<String>,
+        /// Client target, repeatable as web3://<wallet|tag.web3>:<port>.
+        /// OS intercept + temporary-wallet duplex toward that mainWallet:port.
+        #[arg(long = "client", value_name = "web3://HOST:PORT")]
+        client: Vec<String>,
     },
     /// Run the application gateway without creating a TUN or changing iptables
     Gateway {

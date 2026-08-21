@@ -61,12 +61,40 @@ pub fn encode_offer_command(
     key: &[u8; aes::KEY_LEN],
     timestamp: u64,
 ) -> Result<String, L0dError> {
+    encode_offer_command_for_port(
+        initiator_wallet,
+        peer_wallet,
+        peer_wallet,
+        listen_wallet,
+        listen_user_pgp,
+        0,
+        session_id,
+        key,
+        timestamp,
+    )
+}
+
+/// Build an offer addressed by the server's main wallet and logical port.
+/// The server allocates a fresh temporary identity after accepting it.
+pub fn encode_offer_command_for_port(
+    initiator_wallet: &str,
+    main_wallet: &str,
+    peer_wallet: &str,
+    listen_wallet: &str,
+    listen_user_pgp: &str,
+    port: u16,
+    session_id: &str,
+    key: &[u8; aes::KEY_LEN],
+    timestamp: u64,
+) -> Result<String, L0dError> {
     let json = serde_json::json!({
         "command": "duplex_offer",
         "walletAddress": normalize_eoa(initiator_wallet)?,
+        "mainWallet": normalize_eoa(main_wallet)?,
         "peerWallet": normalize_eoa(peer_wallet)?,
         "listenWallet": normalize_eoa(listen_wallet)?,
         "listenUserPgp": listen_user_pgp,
+        "port": port,
         "pipe_handle": session_id,
         "algorithm": "aes-256-gcm",
         "Securitykey": aes::key_to_standard_b64(key),
@@ -217,20 +245,30 @@ pub fn wrap_app_for_user_pgp(
     user_pub_armored: &str,
     eth: &EthSecret,
 ) -> Result<String, L0dError> {
-    let parsed: Value = serde_json::from_str(command_json)
+    let mut parsed: Value = serde_json::from_str(command_json)
         .map_err(|e| L0dError::L0(format!("duplex app JSON: {e}")))?;
     let wallet = parsed
         .get("walletAddress")
         .and_then(Value::as_str)
-        .ok_or_else(|| L0dError::L0("duplex app JSON needs walletAddress".into()))?;
-    if !crate::l0::eip191::eoa_eq(wallet, eth.address()) {
+        .ok_or_else(|| L0dError::L0("duplex app JSON needs walletAddress".into()))?
+        .to_owned();
+    if !crate::l0::eip191::eoa_eq(&wallet, eth.address()) && parsed.get("billingWallet").is_none() {
+        parsed["billingWallet"] = Value::String(eth.address().to_string());
+    }
+    let billing_wallet = parsed
+        .get("billingWallet")
+        .and_then(Value::as_str)
+        .unwrap_or(&wallet);
+    if !crate::l0::eip191::eoa_eq(billing_wallet, eth.address()) {
         return Err(L0dError::L0(
-            "routing ETH key does not match duplex walletAddress".into(),
+            "billing ETH key does not match billingWallet".into(),
         ));
     }
-    let sign_message = eth.personal_sign(command_json.as_bytes())?;
+    let signed_command = serde_json::to_string(&parsed)
+        .map_err(|e| L0dError::L0(format!("duplex app JSON: {e}")))?;
+    let sign_message = eth.personal_sign(signed_command.as_bytes())?;
     let envelope = serde_json::json!({
-        "message": command_json,
+        "message": signed_command,
         "signMessage": sign_message,
     });
     let text = serde_json::to_string(&envelope).map_err(|e| L0dError::L0(e.to_string()))?;
@@ -294,17 +332,36 @@ pub fn parse_offer_plain(plain: &str) -> Result<DuplexOffer, L0dError> {
             .and_then(Value::as_str)
             .ok_or_else(|| L0dError::L0("duplex_offer missing walletAddress".into()))?,
     )?;
+    let main_wallet = normalize_eoa(
+        v.get("mainWallet")
+            .and_then(Value::as_str)
+            .or_else(|| v.get("walletAddress").and_then(Value::as_str))
+            .ok_or_else(|| L0dError::L0("duplex_offer missing mainWallet".into()))?,
+    )?;
+    let port = u16::try_from(
+        v.get("port")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| L0dError::L0("duplex_offer missing port".into()))?,
+    )
+    .map_err(|_| L0dError::L0("duplex_offer port out of range".into()))?;
     let listen_user_pgp = v
         .get("listenUserPgp")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let timestamp = v
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| L0dError::L0("duplex_offer missing timestamp".into()))?;
     Ok(DuplexOffer {
         session_id,
+        main_wallet,
+        port,
         key,
         listen_wallet,
         listen_user_pgp,
         from,
+        timestamp,
     })
 }
 
@@ -346,10 +403,13 @@ fn parse_signed_or_raw<T>(
 #[derive(Clone)]
 pub struct DuplexOffer {
     pub session_id: String,
+    pub main_wallet: String,
+    pub port: u16,
     pub key: [u8; aes::KEY_LEN],
     pub listen_wallet: String,
     pub listen_user_pgp: String,
     pub from: String,
+    pub timestamp: u64,
 }
 
 #[derive(Clone)]
@@ -451,6 +511,29 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn offer_is_keyed_by_main_wallet_and_port() {
+        let key = aes::generate_key();
+        let main = "0x2222222222222222222222222222222222222222";
+        let initiator = "0x1111111111111111111111111111111111111111";
+        let cmd = encode_offer_command_for_port(
+            initiator,
+            main,
+            main,
+            initiator,
+            "",
+            8400,
+            &new_pipe_handle(),
+            &key,
+            1,
+        )
+        .unwrap();
+        let offer = parse_offer_plain(&cmd).unwrap();
+        assert_eq!(offer.main_wallet, main);
+        assert_eq!(offer.port, 8400);
+        assert_eq!(offer.from, initiator);
     }
 
     #[test]

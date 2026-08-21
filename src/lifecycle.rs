@@ -22,6 +22,7 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
     println!("l0.entries     {}", cfg.l0.entries.len());
     println!("l0.listen      {}", cfg.l0.listen_entries.len());
     println!("l0.channels    {}", cfg.l0.channels.len());
+    println!("l0.proxies     {}", cfg.l0.proxies.len());
     println!(
         "l0.routing_key {}",
         if cfg.l0.routing_key_file.is_some() {
@@ -33,6 +34,14 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
     println!(
         "l0.eth_key     {}",
         if cfg.l0.routing_eth_key_file.is_some() {
+            "set"
+        } else {
+            "unset"
+        }
+    );
+    println!(
+        "l0.billing_pgp {}",
+        if cfg.l0.billing_pgp_file.is_some() {
             "set"
         } else {
             "unset"
@@ -121,13 +130,42 @@ pub fn status(path: &Path) -> anyhow::Result<()> {
 }
 
 pub async fn start(path: &Path) -> anyhow::Result<()> {
+    start_with_overrides(path, None, None, None, &[], &[]).await
+}
+
+pub async fn start_with_overrides(
+    path: &Path,
+    main_wallet: Option<String>,
+    main_wallet_pgp: Option<&Path>,
+    main_wallet_key: Option<&Path>,
+    proxy_specs: &[String],
+    client_specs: &[String],
+) -> anyhow::Result<()> {
     if !cfg!(target_os = "linux") {
         anyhow::bail!(L0dError::NotLinux);
     }
-    let cfg = load_validated(path)?;
+    let mut raw = DaemonConfig::load(path)?;
+    raw.apply_cli_overrides(
+        main_wallet,
+        main_wallet_pgp.map(Path::to_path_buf),
+        main_wallet_key.map(Path::to_path_buf),
+        proxy_specs,
+        client_specs,
+    )?;
+    let cfg = raw.validate()?;
     if RuntimeState::load(&cfg.raw.state_path)?.is_some() {
         tracing::warn!("dirty state present; tearing down first");
         teardown_inner(&cfg).await?;
+    }
+    // Proxy-only still owns TUN: current `--client` peers seal IPv4 datagrams
+    // on the occupy pipe. Raw `[[l0.proxies]]` drain handles non-IPv4 stream
+    // bytes only. Skipping TUN left IPv4 frames stuffing the proxy queue.
+    let proxy_only = cfg.proxy_server_only();
+    if proxy_only {
+        tracing::info!(
+            proxies = cfg.l0.proxies.len(),
+            "proxy-server mode: TUN + listen for IPv4 clients; raw proxy drain for non-IPv4"
+        );
     }
     netops::install(&cfg).await?;
     let state = RuntimeState::from_config(&cfg, std::process::id());
@@ -135,12 +173,21 @@ pub async fn start(path: &Path) -> anyhow::Result<()> {
         let _ = netops::uninstall(&cfg, Some(&state)).await;
         return Err(err.into());
     }
-    tracing::info!(
-        tun = %cfg.raw.tun_name,
-        vip = %cfg.local_vip,
-        chain = %cfg.raw.iptables_chain,
-        "conet-l0d started; owns TUN + iptables"
-    );
+    if proxy_only {
+        tracing::info!(
+            tun = %cfg.raw.tun_name,
+            vip = %cfg.local_vip,
+            proxies = cfg.l0.proxies.len(),
+            "conet-l0d started (proxy-server; owns TUN + iptables)"
+        );
+    } else {
+        tracing::info!(
+            tun = %cfg.raw.tun_name,
+            vip = %cfg.local_vip,
+            chain = %cfg.raw.iptables_chain,
+            "conet-l0d started; owns TUN + iptables"
+        );
+    }
 
     let run = async {
         #[cfg(unix)]

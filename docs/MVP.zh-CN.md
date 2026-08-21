@@ -1,7 +1,7 @@
 # MVP — conet-l0d
 
 **成对：** [English](./MVP.md)  
-**Revision：** 2026-08-18（crate MVP 仍验收；授权 L0_ONLY `.45` 通告 overlay vIP；overlay geth + beacon TCP 已证明；追链受 Prysm 限速 — 见 [P1.zh-CN.md](./P1.zh-CN.md)；DHT 掉线恢复与约 17:28Z `restart-beacon` 见 [P2.zh-CN.md](./P2.zh-CN.md)）
+**Revision：** 2026-08-21（动态代理线路、主钱包计费、每线路临时身份）
 
 公开 how-to：[Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -22,6 +22,23 @@
 | L0 | crate 桩已验收：统计 TUN IPv4 并记录目的 vIP。现役 overlay `/post` 优先 **SI `l0_listen` / `l0_connect` 占用管道 + 应用层 duplex**（要约走 Chat gossip；接受 / 拒绝 / 帧为占用管道上的 AES）；`duplex_reject` 或无 accept 或无占用管道则 P1 gossip — [P1](./P1.zh-CN.md)。不得声称 SI `duplex_*` 或 `p2p_stream_*` |
 | 文档 | 成对白皮书 + 本 MVP + GitBook Applications + Developers |
 | 示例 + unit | `config/conet-l0d.example.toml` 与 `systemd/conet-l0d.service`（仅 `start`/`stop`） |
+
+## 动态代理线路
+
+服务器模式可配置 `[[l0.proxies]]` 上游目标。`billing_eoa` 与本机
+`billing_eth_key_file` 为 duplex offer/accept（对端验签）身份；mailbox
+`l0_listen` / `l0_connect` 由各 channel 钱包签名，直至 SI 舰队支持
+`billingWallet`。每条线路在 `mainWallet:port` 匹配后仍使用独立临时钱包、
+PGP/AES/session。临时身份必须先登记再路由，任何传输失败时释放。一个
+逻辑端口可并发多条线路，但绝不共享线路身份或 pipe。占用管道字节转发到
+配置的 `host:port`；不保存离线数据。
+
+仅代理服务器（有 `[[l0.proxies]]`、无 `l0.clients` / `--client`）仍创建
+TUN + iptables：当前客户端在 occupy 管道上封装 IPv4。代理上游拷贝仅用于
+**非 IPv4** 流字节；IPv4 帧写入 TUN。多端口代理须为每个端口配置独立的
+`[[l0.channels]]` routing EOA（SI 独占占用）；offer 匹配仍用 `billing_eoa` 作为
+`mainWallet`。客户端用 `--client 'web3://<peerMainWallet>:port'` 向该对端
+VIP:port 播种 pending duplex 线路，同时保留 TUN 供本机 geth/beacon 拨号。
 
 ## 范围外（不算 MVP 失败）
 

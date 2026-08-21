@@ -48,7 +48,7 @@ tcp_ports = [4200]
 # :4300 is still overlay IPv4 (not SI udp_relay). listenKind stays "chat".
 #
 # [[l0.channels]]
-# ports = [8400]
+# port = 8400
 # routing_eoa = "0x<geth-routing-eoa>"
 # routing_key_file = "/etc/conet-l0d/geth.key"
 # routing_eth_key_file = "/etc/conet-l0d/geth.eth"
@@ -65,6 +65,27 @@ tcp_ports = [4200]
 # routing_key_file = "/etc/conet-l0d/routing.key"
 # routing_eth_key_file = "/etc/conet-l0d/routing.eth"
 # mailbox_route_pgp_file = "/etc/conet-l0d/self-mailbox-route.asc"
+# Main paid account for all temporary channel mailbox signatures. Required
+# whenever [[l0.channels]] is used; its key must match billing_eoa.
+# billing_eoa = "0x<main-paid-wallet>"
+# billing_eth_key_file = "/etc/conet-l0d/billing.eth"
+# billing_pgp_file = "/etc/conet-l0d/billing-pgp.asc" # optional main-wallet PGP
+#
+# Server-side dynamic proxy. The upstream port is also the logical L0 port.
+# Every incoming request receives a new temporary wallet/PGP/AES/session.
+# Temporary identities are memory-only and are registered before routing.
+# When proxies are set and clients is empty (proxy_server_only), start still
+# owns TUN (IPv4 duplex from --client peers). Proxies drain non-IPv4 only.
+# [[l0.proxies]]
+# host = "127.0.0.1"
+# port = 8400
+#
+# Client intercept toward a peer mainWallet:port (TUN still required).
+# Seeds pending duplex even when the port is absent from peers.*.ports.
+# clients = [
+#   "web3://0x<mainWallet>:8400",
+#   "web3://0x<mainWallet>:4200",
+# ]
 #
 # Per-peer public key files (lab override; do not log contents):
 # user_pgp_file = "/etc/conet-l0d/peer-user.asc"

@@ -74,7 +74,7 @@ routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
 mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route.asc"
 
 [[l0.channels]]
-ports = [8400]
+port = 8400
 routing_eoa = "0xEF10752843cAC32C73DAb86658B8ab6E5667199B"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
@@ -86,7 +86,7 @@ listen_entries = [
 ]
 
 [[l0.channels]]
-ports = [4200]
+port = 4200
 routing_eoa = "0x3F84B8f11BF7886DCf0c902A3148cc2926E185dA"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/beacon/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/beacon/routing.eth"
@@ -98,7 +98,7 @@ listen_entries = [
 ]
 
 [[l0.channels]]
-ports = [4300]
+port = 4300
 routing_eoa = "0xEc22Ff53E4197db39179Be55C83d70cb97fF5738"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/udp/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/udp/routing.eth"

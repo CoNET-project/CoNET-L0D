@@ -240,3 +240,26 @@ successfully been established, a bidirectional client may issue a new
 `l0_connect`. The replacement uses a fresh request and fresh `pipe_handle`;
 stale `pipe_tx` state must not be reused. Reconnect remains bounded by the
 existing retry/backoff and occupancy limits.
+
+## 14. Main-wallet billing for temporary channels (2026-08-21)
+
+For a proxy request addressed to `mainWallet:port`, `conet-l0d` creates a
+fresh, process-memory-only communication wallet and OpenPGP identity for that
+line. It registers the temporary user PGP and route key with the existing
+AddressPGP registration API before sending the identity's first mailbox
+command. The temporary wallet is therefore routable, but is never the payer.
+
+The mailbox command keeps the temporary wallet in `walletAddress` and carries
+the configured paid account in `billingWallet`. Its EIP-191 signature is made
+by the paid account. CoNET-SI verifies the signature against
+`billingWallet`, while retaining `walletAddress` as the routing and mailbox
+subject, and charges hop usage to the billing wallet. If `billingWallet` is
+absent, SI preserves the legacy rule that the signer must recover to
+`walletAddress`.
+
+Every accepted proxy line has an independent temporary wallet, PGP
+registration, AES key, occupied pipe, opaque handle, and upstream socket.
+Multiple clients may share a logical proxy port without sharing any of these
+identities or transport resources. Registration or billing failure is
+fail-closed; it must not silently fall back to an unregistered temporary
+route.

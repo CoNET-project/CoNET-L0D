@@ -8,6 +8,43 @@ Independent Linux command. Canonical git remote: [https://github.com/CoNET-proje
 
 It does **not** patch geth, Prysm `beacon-chain`, or `validator`.
 
+## Dynamic proxy lines
+
+`l0.billing_eoa`/`billing_eth_key_file` identify the main paid account. A
+duplex request is addressed by `mainWallet:port` and signed by the main paid
+wallet. The server allocates the temporary communication identity only after
+matching that pair; the temporary identity is never used as the payer.
+
+Each `[[l0.proxies]]` entry is an upstream `host` plus `port`. The port is the
+logical L0 port. Every accepted request must have its own temporary wallet,
+OpenPGP route identity, AES key, session/pipe handle, and occupied socket.
+Temporary identities are memory-only, are registered before they are used for
+routing, and are destroyed on EOF, failed HTTP status headers, timeout, or
+socket close. Multiple lines may use the same logical port, but no wallet,
+PGP key, AES key, pipe, or socket may be shared.
+
+The occupied pipe is a byte transport only. Proxy data is forwarded to the
+configured upstream `host:port` with bounded async bidirectional copying; it
+does not use iptables DNAT and it does not save offline data. A failed line is
+isolated from other sessions on the same port.
+
+**Proxy-only server:** when `[[l0.proxies]]` is set and no `--client` / `l0.clients`
+are configured (`proxy_server_only`), the daemon **still owns TUN + iptables** so
+`--client` peers that seal **IPv4** datagrams on the occupy pipe can complete
+overlay TCP (hub VIP + listen-DNAT as needed). `[[l0.proxies]]` drains **non-IPv4**
+raw stream bytes to `host:port`. Do not stuff full IPv4 packets into the proxy
+upstream queue. Multi-port proxy (e.g. `:8400` + `:4200`) **must** use a distinct
+`[[l0.channels]]` routing EOA per port: SI exclusive occupy is **one pipe per
+listen wallet**. Empty channels collapse every port onto `billing_eoa` / identity
+locator and cause sustained `l0_connect` **HTTP 409**. Inbound `duplex_offer`
+matching uses `billing_eoa` (`mainWallet:port`), not the per-port channel EOA.
+
+**Client intercept:** `--client 'web3://<peerMainWallet>:port'` (or `l0.clients`)
+seeds an independent pending duplex line keyed by that peer EOA + port, even
+when the port is absent from `peers.*.ports`. The client still uses TUN +
+overlay VIP so local geth/beacon dial the peer VIP; AES frames on the occupy
+pipe carry IPv4 (TUN) or raw proxy bytes when the peer runs proxy mode.
+
 ## Hard constraints
 
 1. Catch only the overlay prefix (default `100.64.0.0/10`). Never REDIRECT `0.0.0.0/0:8400`.
@@ -34,8 +71,13 @@ This run established the following operational facts:
 1. Geth and beacon are separate overlay TCP planes. `100.64.0.5 → :8400 ESTAB` does not prove beacon health; always check `:4200` and Prysm `peer_count` separately.
 2. A Prysm error dialing `/ip4/100.64.0.7/tcp/4200` with `i/o timeout`, followed by `dial backoff`, means the overlay beacon TCP handshake did not complete. It is not by itself a peer-ID mismatch or a protocol change.
 3. A public-advertise hub may bind beacon to its public IP (`216.225.202.82:4200`) while the overlay peer dials `100.64.0.7:4200`. The hub therefore requires `overlay-beacon-listen-dnat.sh apply`; the public listen address alone is not proof that the overlay path works.
-4. Repeated `l0_connect HTTP 409 Conflict` indicates an exclusive SI occupy/pipe collision or stale mailbox-B state. `P1 overlay batch flushed` is fallback traffic, not proof of a live duplex pipe or successful HTTP delivery.
+4. Repeated `l0_connect HTTP 409 Conflict` indicates an exclusive SI occupy/pipe collision or stale mailbox-B state. `P1 overlay batch flushed` is fallback traffic, not proof of a live duplex pipe or successful HTTP delivery. After a daemon bounce, mailbox B may flush older `duplex_offer` armors before any live peer:port pipe exists: the crate rejects offers older than **`DUPLEX_OFFER_MAX_AGE_SECS` (90s)** wall-clock age (plus skew), and also skips stale offers when a live occupy already exists for that peer:port.
 5. One healthy beacon peer is sufficient to prove connectivity, but both configured hubs should remain in the static peer list for redundancy. Do not require both peers to be simultaneously `connected`.
+
+6. For a configured duplex session, P1 is not a transport fallback. While the
+   session is negotiating or rebuilding `l0_connect`, packets are suppressed;
+   a full occupied-pipe queue is also a drop condition. P1 becomes eligible
+   only after the duplex session explicitly receives `duplex_reject`.
 
 ### Recovery order
 
@@ -158,3 +200,34 @@ PGP identities for the `l0_connect` / `l0_listen` control path. The initiator
 must not continue using the receiver's long-lived public user PGP for duplex
 traffic. Each endpoint still owns a separate occupied pipe; the two pipes are
 bound by the same `pipe_handle` only at the application layer.
+
+## Main-wallet billing for temporary channels (2026-08-21)
+
+`walletAddress` is the communication subject and mailbox route identity for a
+channel. It may be a temporary wallet/PGP identity and must be registered with
+AddressPGP before the SI entry can route its PGP posts. It is not the account
+that pays for the channel.
+
+Every mailbox SI command (`l0_listen`, `l0_connect`, Chat listen) keeps the
+temporary communication identity in `walletAddress` and carries the configured
+paid account in `billingWallet`. The paid account signs the EIP-191 command.
+The deployed CoNET-SI verifier recovers against `billingWallet` while retaining
+`walletAddress` for routing and mailbox ownership. Without `billingWallet`, SI
+keeps the legacy recover == `walletAddress` rule.
+
+`duplex_offer` / `duplex_accept` (application-layer, peer-verified) are signed by
+the configured paid account. When the duplex signer differs from `walletAddress`,
+the signed command contains:
+
+```json
+{"walletAddress":"<temporary-channel-wallet>","billingWallet":"<main-paid-wallet>"}
+```
+
+Peer `conet-l0d` and SI verify the EIP-191 signature against `billingWallet`.
+SI routes the outer user-PGP ciphertext using the temporary communication
+identity. Billing and communication identities must never be silently conflated.
+
+Each `[[l0.channels]]` entry now owns exactly one `port`; a port cannot be
+shared by two channels. Configure `[l0].billing_eoa` and
+`[l0].billing_eth_key_file` for the main paid account. The channel
+`routing_eth_key_file` signs mailbox listen/connect until SI ships `billingWallet`.

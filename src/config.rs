@@ -1,5 +1,5 @@
 use crate::error::L0dError;
-use crate::locator::Locator;
+use crate::locator::{Locator, LocatorHost};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -61,6 +61,10 @@ fn default_gateway_timeout_seconds() -> u64 {
     15
 }
 
+fn default_route_register_url() -> String {
+    "https://beamio.app/api/regiestChatRoute".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L0Config {
     #[serde(default)]
@@ -82,14 +86,43 @@ pub struct L0Config {
     /// This host's mailbox **B route public** key. Not the peer route file.
     #[serde(default)]
     pub mailbox_route_pgp_file: Option<PathBuf>,
+    /// Main paid account used to sign L0 mailbox commands. Channel identities
+    /// remain the route/PGP identities and must not be used for billing.
+    #[serde(default)]
+    pub billing_eoa: Option<String>,
+    #[serde(default)]
+    pub billing_eth_key_file: Option<PathBuf>,
+    /// Optional main-wallet OpenPGP secret cert used for mailbox control.
+    #[serde(default)]
+    pub billing_pgp_file: Option<PathBuf>,
     /// Per-port listen identities. Empty = one legacy routing EOA for all overlay ports.
     #[serde(default)]
     pub channels: Vec<L0ChannelConfig>,
+    /// Server-side logical proxy targets. Each incoming L0 line gets its own
+    /// temporary communication identity and occupied pipe.
+    #[serde(default)]
+    pub proxies: Vec<L0ProxyConfig>,
+    /// Client targets: `web3://<wallet|tag.web3>:<port>`. OS intercept +
+    /// temporary duplex toward that mainWallet:port.
+    #[serde(default)]
+    pub clients: Vec<String>,
+    /// Public API used to register ephemeral per-line AddressPGP routes.
+    #[serde(default = "default_route_register_url")]
+    pub route_register_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L0ProxyConfig {
+    /// Upstream host reached after the occupied L0 pipe is established.
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L0ChannelConfig {
-    pub ports: Vec<u16>,
+    /// Exactly one local overlay port per duplex channel. A channel must
+    /// never be reused by two ports.
+    pub port: u16,
     pub routing_eoa: String,
     pub routing_key_file: PathBuf,
     pub routing_eth_key_file: PathBuf,
@@ -111,7 +144,13 @@ impl Default for L0Config {
             routing_key_file: None,
             routing_eth_key_file: None,
             mailbox_route_pgp_file: None,
+            billing_eoa: None,
+            billing_eth_key_file: None,
+            billing_pgp_file: None,
             channels: Vec::new(),
+            proxies: Vec::new(),
+            clients: Vec::new(),
+            route_register_url: default_route_register_url(),
         }
     }
 }
@@ -145,7 +184,15 @@ pub struct ValidatedConfig {
     pub identity: Locator,
     pub peers: Vec<ValidatedPeer>,
     pub l0: L0Settings,
+    pub clients: Vec<crate::locator::ClientTarget>,
     pub gateway: Option<ValidatedGateway>,
+}
+
+impl ValidatedConfig {
+    /// Proxy-only server: proxies configured, no client intercept. Skip TUN.
+    pub fn proxy_server_only(&self) -> bool {
+        !self.l0.proxies.is_empty() && self.clients.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,17 +224,27 @@ pub struct L0Settings {
     pub routing_eth_key_file: Option<PathBuf>,
     /// This host's mailbox B route **public** cert. Unused when `[l0]` is off.
     pub mailbox_route_pgp_file: Option<PathBuf>,
+    pub billing_eoa: Option<String>,
+    pub billing_eth_key_file: Option<PathBuf>,
+    pub billing_pgp_file: Option<PathBuf>,
     pub channels: Vec<ValidatedL0Channel>,
+    pub proxies: Vec<ValidatedL0Proxy>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ValidatedL0Channel {
-    pub ports: Vec<u16>,
+    pub port: u16,
     pub routing_eoa: String,
     pub routing_key_file: PathBuf,
     pub routing_eth_key_file: PathBuf,
     pub mailbox_route_pgp_file: PathBuf,
     pub listen_entries: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedL0Proxy {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +367,38 @@ impl DaemonConfig {
         toml::from_str(&text).map_err(|e| L0dError::Config(e.to_string()))
     }
 
+    pub fn apply_cli_overrides(
+        &mut self,
+        main_wallet: Option<String>,
+        main_wallet_pgp: Option<PathBuf>,
+        main_wallet_key: Option<PathBuf>,
+        proxy_specs: &[String],
+        client_specs: &[String],
+    ) -> Result<(), L0dError> {
+        if let Some(wallet) = main_wallet {
+            self.l0.billing_eoa = Some(wallet);
+        }
+        if let Some(path) = main_wallet_pgp {
+            self.l0.billing_pgp_file = Some(path);
+        }
+        if let Some(path) = main_wallet_key {
+            self.l0.billing_eth_key_file = Some(path);
+        }
+        if !proxy_specs.is_empty() {
+            self.l0.proxies = proxy_specs
+                .iter()
+                .map(|spec| parse_proxy_spec(spec))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        if !client_specs.is_empty() {
+            self.l0.clients = client_specs
+                .iter()
+                .map(|spec| crate::locator::ClientTarget::parse(spec).map(|t| t.display()))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<ValidatedConfig, L0dError> {
         if self.tun_name.is_empty() || self.tun_name.contains('/') {
             return Err(L0dError::Config("tun_name is invalid".into()));
@@ -424,24 +513,31 @@ impl DaemonConfig {
             Some(raw) => Some(normalize_eoa(raw)?),
             None => None,
         };
+        let billing_eoa = match &self.l0.billing_eoa {
+            Some(raw) => Some(normalize_eoa(raw)?),
+            None if self.l0.channels.is_empty() => routing_eoa.clone(),
+            None => None,
+        };
+        if !self.l0.channels.is_empty()
+            && (billing_eoa.is_none() || self.l0.billing_eth_key_file.is_none())
+        {
+            return Err(L0dError::Config(
+                "l0.billing_eoa and l0.billing_eth_key_file are required when channels are configured"
+                    .into(),
+            ));
+        }
         let mut channels = Vec::new();
         let mut channel_ports = HashSet::new();
         let mut channel_eoas = HashSet::new();
         for ch in &self.l0.channels {
-            if ch.ports.is_empty() {
-                return Err(L0dError::Config(
-                    "l0.channels entry needs at least one overlay port".into(),
-                ));
+            if ch.port == 0 {
+                return Err(L0dError::Config("l0.channels port 0 is not allowed".into()));
             }
-            for port in &ch.ports {
-                if *port == 0 {
-                    return Err(L0dError::Config("l0.channels port 0 is not allowed".into()));
-                }
-                if !channel_ports.insert(*port) {
-                    return Err(L0dError::Config(format!(
-                        "l0.channels overlay port {port} is assigned twice"
-                    )));
-                }
+            if !channel_ports.insert(ch.port) {
+                return Err(L0dError::Config(format!(
+                    "l0.channels overlay port {} is assigned twice",
+                    ch.port
+                )));
             }
             let eoa = normalize_eoa(&ch.routing_eoa)?;
             if !channel_eoas.insert(eoa.clone()) {
@@ -449,6 +545,9 @@ impl DaemonConfig {
                     "l0.channels routing_eoa must be unique per listen SSE".into(),
                 ));
             }
+            // billing_eoa may equal one channel (common: geth channel == paid
+            // mainWallet). Distinct ports still need distinct channel EOAs above
+            // so SI exclusive occupy does not 409 across :8400/:4200.
             let mut listen_entries = if ch.listen_entries.is_empty() {
                 self.l0.listen_entries.clone()
             } else {
@@ -456,13 +555,95 @@ impl DaemonConfig {
             };
             listen_entries.retain(|e| !e.trim().is_empty());
             channels.push(ValidatedL0Channel {
-                ports: ch.ports.clone(),
+                port: ch.port,
                 routing_eoa: eoa,
                 routing_key_file: ch.routing_key_file.clone(),
                 routing_eth_key_file: ch.routing_eth_key_file.clone(),
                 mailbox_route_pgp_file: ch.mailbox_route_pgp_file.clone(),
                 listen_entries,
             });
+        }
+        let mut proxies = Vec::new();
+        let mut proxy_ports = HashSet::new();
+        for proxy in &self.l0.proxies {
+            let host = proxy.host.trim().to_string();
+            if host.is_empty()
+                || host.chars().any(char::is_whitespace)
+                || host.contains('/')
+                || host.contains('#')
+                || host.contains('?')
+            {
+                return Err(L0dError::Config(format!(
+                    "l0 proxy host is invalid: {}",
+                    proxy.host
+                )));
+            }
+            if proxy.port == 0 {
+                return Err(L0dError::Config("l0 proxy port 0 is not allowed".into()));
+            }
+            if !proxy_ports.insert(proxy.port) {
+                return Err(L0dError::Config(format!(
+                    "l0 proxy port {} is assigned twice",
+                    proxy.port
+                )));
+            }
+            proxies.push(ValidatedL0Proxy {
+                host,
+                port: proxy.port,
+            });
+        }
+        let mut clients = Vec::new();
+        for raw in &self.l0.clients {
+            let target = crate::locator::ClientTarget::parse(raw)?;
+            clients.push(target);
+        }
+        if !clients.is_empty() && !self.l0.enabled {
+            return Err(L0dError::Config(
+                "l0.enabled must be true when l0 clients are configured".into(),
+            ));
+        }
+
+        if !proxies.is_empty() {
+            if !self.l0.enabled {
+                return Err(L0dError::Config(
+                    "l0.enabled must be true when l0 proxy targets are configured".into(),
+                ));
+            }
+            if billing_eoa.is_none() || self.l0.billing_eth_key_file.is_none() {
+                return Err(L0dError::Config(
+                    "l0.billing_eoa and l0.billing_eth_key_file are required for proxy targets"
+                        .into(),
+                ));
+            }
+        }
+        match (&billing_eoa, &self.l0.billing_eth_key_file) {
+            (Some(expected), Some(path)) => {
+                let secret = crate::l0::eip191::load_eth_secret(path).map_err(|err| {
+                    L0dError::Config(format!(
+                        "billing_eth_key_file {} is invalid: {err}",
+                        path.display()
+                    ))
+                })?;
+                if !crate::l0::eip191::eoa_eq(expected, secret.address()) {
+                    return Err(L0dError::Config(
+                        "billing_eth_key_file does not match billing_eoa".into(),
+                    ));
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(L0dError::Config(
+                    "billing_eoa and billing_eth_key_file must be provided together".into(),
+                ));
+            }
+            (None, None) => {}
+        }
+        if let Some(path) = &self.l0.billing_pgp_file {
+            if !path.is_file() {
+                return Err(L0dError::Config(format!(
+                    "billing_pgp_file does not exist: {}",
+                    path.display()
+                )));
+            }
         }
 
         Ok(ValidatedConfig {
@@ -481,11 +662,30 @@ impl DaemonConfig {
                 routing_key_file: self.l0.routing_key_file.clone(),
                 routing_eth_key_file: self.l0.routing_eth_key_file.clone(),
                 mailbox_route_pgp_file: self.l0.mailbox_route_pgp_file.clone(),
+                billing_eoa,
+                billing_eth_key_file: self.l0.billing_eth_key_file.clone(),
+                billing_pgp_file: self.l0.billing_pgp_file.clone(),
                 channels,
+                proxies,
             },
+            clients,
             gateway,
         })
     }
+}
+
+fn parse_proxy_spec(raw: &str) -> Result<L0ProxyConfig, L0dError> {
+    let value = raw.trim();
+    let (host, port) = value
+        .rsplit_once(':')
+        .ok_or_else(|| L0dError::Config(format!("proxy must be HOST:PORT: {raw}")))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| L0dError::Config(format!("proxy port is invalid: {raw}")))?;
+    Ok(L0ProxyConfig {
+        host: host.trim().trim_matches(['[', ']']).to_string(),
+        port,
+    })
 }
 
 fn validate_gateway(raw: &GatewayConfig) -> Result<ValidatedGateway, L0dError> {
@@ -572,27 +772,47 @@ impl ValidatedConfig {
         if dest == self.local_vip {
             return None;
         }
-        self.peers
-            .iter()
-            .find(|p| p.vip == dest && (p.tcp_ports.contains(&port) || p.udp_ports.contains(&port)))
+        self.peers.iter().find(|p| {
+            if p.vip != dest {
+                return false;
+            }
+            if p.tcp_ports.contains(&port) || p.udp_ports.contains(&port) {
+                return true;
+            }
+            // `--client web3://<peerEoa>:port` may address a port that is not
+            // listed under peers.*.ports (independent multiline / proxy line).
+            self.clients.iter().any(|c| {
+                c.port == port
+                    && match &c.host {
+                        LocatorHost::Eoa(eoa) => match &p.locator.host {
+                            LocatorHost::Eoa(peer) => crate::l0::eip191::eoa_eq(eoa, peer),
+                            LocatorHost::Tag(_) => false,
+                        },
+                        LocatorHost::Tag(_) => false,
+                    }
+            })
+        })
     }
 
     pub fn overlay_ports(&self) -> HashSet<u16> {
-        if !self.l0.channels.is_empty() {
-            return self
-                .l0
-                .channels
+        let mut ports: HashSet<u16> = if !self.l0.channels.is_empty() {
+            self.l0.channels.iter().map(|c| c.port).collect()
+        } else {
+            let mut from_peers: HashSet<u16> = self
+                .peers
                 .iter()
-                .flat_map(|c| c.ports.iter().copied())
+                .flat_map(|p| p.tcp_ports.iter().chain(p.udp_ports.iter()).copied())
                 .collect();
+            if from_peers.is_empty() {
+                from_peers = crate::packet::default_overlay_port_set();
+            }
+            from_peers
+        };
+        for client in &self.clients {
+            ports.insert(client.port);
         }
-        let mut ports: HashSet<u16> = self
-            .peers
-            .iter()
-            .flat_map(|p| p.tcp_ports.iter().chain(p.udp_ports.iter()).copied())
-            .collect();
-        if ports.is_empty() {
-            ports = crate::packet::default_overlay_port_set();
+        for proxy in &self.l0.proxies {
+            ports.insert(proxy.port);
         }
         ports
     }
@@ -659,7 +879,7 @@ mod tests {
                 .expect("parse example");
         cfg.l0.channels = vec![
             L0ChannelConfig {
-                ports: vec![8400],
+                port: 8400,
                 routing_eoa: "0x1111111111111111111111111111111111111111".into(),
                 routing_key_file: "/tmp/a.key".into(),
                 routing_eth_key_file: "/tmp/a.eth".into(),
@@ -667,7 +887,7 @@ mod tests {
                 listen_entries: vec!["https://node.conet.network".into()],
             },
             L0ChannelConfig {
-                ports: vec![4200],
+                port: 4200,
                 routing_eoa: "0x1111111111111111111111111111111111111111".into(),
                 routing_key_file: "/tmp/b.key".into(),
                 routing_eth_key_file: "/tmp/b.eth".into(),
@@ -686,5 +906,69 @@ mod tests {
         cfg.l0.enabled = true;
         cfg.l0.entries = vec!["https://assets.conet.example/post".into()];
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn billing_key_must_match_billing_eoa() {
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("billing.eth");
+        std::fs::write(
+            &key_file,
+            "0000000000000000000000000000000000000000000000000000000000000001\n",
+        )
+        .unwrap();
+        cfg.l0.billing_eth_key_file = Some(key_file);
+        cfg.l0.billing_eoa = Some("0x0000000000000000000000000000000000000001".into());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn proxy_server_only_when_proxies_without_clients() {
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("billing.eth");
+        // secp256k1 secret 1 → 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+        std::fs::write(
+            &key_file,
+            "0000000000000000000000000000000000000000000000000000000000000001\n",
+        )
+        .unwrap();
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
+        cfg.l0.billing_eoa = Some("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf".into());
+        cfg.l0.billing_eth_key_file = Some(key_file);
+        cfg.l0.proxies = vec![L0ProxyConfig {
+            host: "127.0.0.1".into(),
+            port: 8400,
+        }];
+        let validated = cfg.validate().expect("proxy-only config");
+        assert!(validated.proxy_server_only());
+        assert!(validated.overlay_ports().contains(&8400));
+    }
+
+    #[test]
+    fn clients_extend_overlay_ports_and_lookup_peer() {
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
+        cfg.peers[0].locator = "web3://0x2222222222222222222222222222222222222222/p2p/geth".into();
+        cfg.peers[0].tcp_ports = vec![8400];
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
+        cfg.l0.clients = vec!["web3://0x2222222222222222222222222222222222222222:9999".into()];
+        let validated = cfg.validate().expect("clients with l0 on");
+        assert!(!validated.proxy_server_only());
+        assert!(validated.overlay_ports().contains(&9999));
+        assert!(validated
+            .lookup_peer("100.64.0.1".parse().unwrap(), 9999)
+            .is_some());
+        assert!(validated
+            .lookup_peer("100.64.0.1".parse().unwrap(), 8400)
+            .is_some());
     }
 }

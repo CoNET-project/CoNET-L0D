@@ -85,6 +85,16 @@ pub fn encode_signed_listen_plaintext(
     command_json: &str,
     eth: &EthSecret,
 ) -> Result<String, L0dError> {
+    encode_signed_listen_plaintext_as(command_json, eth)
+}
+
+/// Sign a mailbox command with the paid account while preserving the
+/// temporary/channel wallet as `walletAddress`. SI verifies the signature
+/// against `billingWallet` and charges that main wallet.
+pub fn encode_signed_listen_plaintext_as(
+    command_json: &str,
+    eth: &EthSecret,
+) -> Result<String, L0dError> {
     if command_json.contains("Securitykey") {
         return Err(L0dError::L0(
             "refusing to encrypt a listen command that contains Securitykey".into(),
@@ -95,24 +105,62 @@ pub fn encode_signed_listen_plaintext(
             "listen command JSON must not embed signMessage; it belongs in the SI wrapper".into(),
         ));
     }
-    let parsed: Value = serde_json::from_str(command_json)
+    let mut parsed: Value = serde_json::from_str(command_json)
         .map_err(|e| L0dError::L0(format!("listen command JSON: {e}")))?;
     let wallet = parsed
         .get("walletAddress")
         .and_then(Value::as_str)
-        .ok_or_else(|| L0dError::L0("listen command needs walletAddress".into()))?;
-    if !eip191::eoa_eq(wallet, eth.address()) {
+        .ok_or_else(|| L0dError::L0("listen command needs walletAddress".into()))?
+        .to_owned();
+    if !eip191::eoa_eq(&wallet, eth.address()) && parsed.get("billingWallet").is_none() {
+        parsed["billingWallet"] = Value::String(eth.address().to_string());
+    }
+    let signed_command = serde_json::to_string(&parsed)
+        .map_err(|e| L0dError::L0(format!("listen command JSON: {e}")))?;
+    let billing_wallet = parsed
+        .get("billingWallet")
+        .and_then(Value::as_str)
+        .unwrap_or(&wallet);
+    if !eip191::eoa_eq(billing_wallet, eth.address()) {
         return Err(L0dError::L0(
-            "routing ETH key does not match listen walletAddress".into(),
+            "billing ETH key does not match billingWallet".into(),
         ));
     }
-    let sign_message = eth.personal_sign(command_json.as_bytes())?;
+    let sign_message = eth.personal_sign(signed_command.as_bytes())?;
     let envelope = serde_json::json!({
-        "message": command_json,
+        "message": signed_command,
         "signMessage": sign_message,
     });
     let text = serde_json::to_string(&envelope).map_err(|e| L0dError::L0(e.to_string()))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(text.as_bytes()))
+}
+
+/// Sign a command with the billing wallet while retaining the temporary
+/// wallet in `walletAddress` for mailbox routing.
+pub fn encode_signed_listen_plaintext_with_billing(
+    command_json: &str,
+    eth: &EthSecret,
+    billing_wallet: &str,
+) -> Result<String, L0dError> {
+    let valid_billing = billing_wallet.len() == 42
+        && billing_wallet.starts_with("0x")
+        && billing_wallet[2..].chars().all(|c| c.is_ascii_hexdigit());
+    if !valid_billing {
+        return Err(L0dError::L0(
+            "billingWallet is not an Ethereum address".into(),
+        ));
+    }
+    let mut value: Value =
+        serde_json::from_str(command_json).map_err(|e| L0dError::L0(e.to_string()))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| L0dError::L0("listen command must be a JSON object".into()))?;
+    object.insert(
+        "billingWallet".into(),
+        Value::String(billing_wallet.to_ascii_lowercase()),
+    );
+    let command = serde_json::to_string(&value).map_err(|e| L0dError::L0(e.to_string()))?;
+    encode_signed_listen_plaintext_as(&command, eth)
 }
 
 /// Encrypt the SI listen wrapper to mailbox **B route PGP**. HTTP body is still `{ data }`.
@@ -122,6 +170,15 @@ pub fn wrap_listen_for_post(
     eth: &EthSecret,
 ) -> Result<String, L0dError> {
     let plaintext = encode_signed_listen_plaintext(command_json, eth)?;
+    pgp::encrypt_utf8(&plaintext, route_pub_armored)
+}
+
+pub fn wrap_listen_for_post_as(
+    command_json: &str,
+    route_pub_armored: &str,
+    eth: &EthSecret,
+) -> Result<String, L0dError> {
+    let plaintext = encode_signed_listen_plaintext_as(command_json, eth)?;
     pgp::encrypt_utf8(&plaintext, route_pub_armored)
 }
 
@@ -174,7 +231,7 @@ pub fn prepare_listen_post(
     eth: &EthSecret,
 ) -> Result<(String, String), L0dError> {
     let cmd = encode_listen_command(wallet, timestamp)?;
-    let armor = wrap_listen_for_post(&cmd, route_pub_armored, eth)?;
+    let armor = wrap_listen_for_post_as(&cmd, route_pub_armored, eth)?;
     let url = post::post_url(entry)?;
     Ok((url, armor))
 }
@@ -187,7 +244,25 @@ pub fn prepare_l0_listen_post(
     eth: &EthSecret,
 ) -> Result<(String, String), L0dError> {
     let cmd = encode_l0_listen_command(wallet, timestamp)?;
-    let armor = wrap_listen_for_post(&cmd, route_pub_armored, eth)?;
+    let armor = wrap_listen_for_post_as(&cmd, route_pub_armored, eth)?;
+    let url = post::post_url(entry)?;
+    Ok((url, armor))
+}
+
+pub fn prepare_l0_listen_post_with_billing(
+    wallet: &str,
+    billing_wallet: &str,
+    timestamp: u64,
+    route_pub_armored: &str,
+    entry: &str,
+    billing_eth: &EthSecret,
+) -> Result<(String, String), L0dError> {
+    let cmd = encode_signed_listen_plaintext_with_billing(
+        &encode_l0_listen_command(wallet, timestamp)?,
+        billing_eth,
+        billing_wallet,
+    )?;
+    let armor = wrap_listen_for_post_as(&cmd, route_pub_armored, billing_eth)?;
     let url = post::post_url(entry)?;
     Ok((url, armor))
 }
@@ -200,7 +275,7 @@ pub fn wrap_l0_connect_for_post(
     eth: &EthSecret,
 ) -> Result<String, L0dError> {
     let cmd = encode_l0_connect_command(wallet, target_wallet, timestamp)?;
-    wrap_listen_for_post(&cmd, route_pub_armored, eth)
+    wrap_listen_for_post_as(&cmd, route_pub_armored, eth)
 }
 
 /// Prefer an entry that is not the last failed host. One-entry lists stay usable.
@@ -597,13 +672,29 @@ mod tests {
     }
 
     #[test]
-    fn listen_wrap_refuses_key_mismatch() {
+    fn listen_wrap_allows_temporary_identity_with_billing_signer() {
         let eth = test_eth();
         let route = generate_test_cert();
         let route_pub = public_cert_armored(&route).unwrap();
         let cmd = encode_listen_command("0x2222222222222222222222222222222222222222", 9).unwrap();
-        let err = wrap_listen_for_post(&cmd, &route_pub, &eth).unwrap_err();
-        assert!(err.to_string().contains("does not match"));
+        let armor = wrap_listen_for_post(&cmd, &route_pub, &eth).unwrap();
+        let b64 = pgp::decrypt_utf8(&armor, &route).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .unwrap();
+        let wrapper: Value = serde_json::from_slice(&raw).unwrap();
+        let message = wrapper["message"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(message).unwrap();
+        assert_eq!(
+            parsed["walletAddress"],
+            "0x2222222222222222222222222222222222222222"
+        );
+        assert_eq!(parsed["billingWallet"], eth.address());
+        assert_eq!(
+            recover_personal_sign(message.as_bytes(), wrapper["signMessage"].as_str().unwrap())
+                .unwrap(),
+            eth.address()
+        );
     }
 
     #[test]

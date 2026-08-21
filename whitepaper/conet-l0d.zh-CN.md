@@ -225,3 +225,21 @@ writer。对端观察到 EOF 后必须停止向该管道实例继续写入。
 双向 client 只有在自己的聆听 SSE 已终止、并且新的 listen 已成功建立后，
 才可以发起新的 `l0_connect`。新连接必须使用新的请求和新的 `pipe_handle`；
 不得复用旧的 `pipe_tx`。重连仍受现有 retry/backoff 与占用上限约束。
+
+## 14. 临时通道由主钱包计费（2026-08-21）
+
+当 proxy 请求以 `mainWallet:port` 寻址时，`conet-l0d` 为该线路生成仅存在于
+进程内存的临时通信钱包与 OpenPGP 身份，并在发送该身份的第一条 mailbox
+命令前，通过现有 AddressPGP 注册接口登记临时用户 PGP 与 route key。临时
+钱包因此可以被路由，但绝不是付款方。
+
+Mailbox 命令的 `walletAddress` 保留临时钱包，另携带配置的付费账户
+`billingWallet`，并由付费账户制作 EIP-191 签名。CoNET-SI 使用
+`billingWallet` 验签，同时保留 `walletAddress` 作为路由和 mailbox subject，
+并将 hop 用量记到计费钱包。没有 `billingWallet` 时，SI 保留旧规则：签名
+恢复地址必须等于 `walletAddress`。
+
+每条 proxy 线路拥有独立的临时钱包、PGP 登记、AES 密钥、occupied pipe、
+opaque handle 与上游 socket。多个 client 可以共享逻辑端口，但不得共享
+上述任何身份或传输资源。登记或计费失败必须 fail-closed，不能静默使用
+未登记的临时路由。
