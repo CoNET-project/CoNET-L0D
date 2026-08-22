@@ -11,6 +11,8 @@ pub struct DaemonConfig {
     pub tun_name: String,
     #[serde(default = "default_overlay_cidr")]
     pub overlay_cidr: String,
+    /// Local overlay VIP. `auto` selects a free-looking address in the overlay.
+    #[serde(default = "default_local_vip")]
     pub local_vip: String,
     #[serde(default = "default_chain")]
     pub iptables_chain: String,
@@ -102,10 +104,15 @@ pub struct L0Config {
     /// temporary communication identity and occupied pipe.
     #[serde(default)]
     pub proxies: Vec<L0ProxyConfig>,
-    /// Client targets: `web3://<wallet|tag.web3>:<port>`. OS intercept +
-    /// temporary duplex toward that mainWallet:port.
+    /// Server-side persistent bidirectional proxy targets.
+    #[serde(default)]
+    pub proxy_duplex: Vec<L0ProxyConfig>,
+    /// Local request/response client targets: `web3://<wallet|tag.web3>:<port>`.
     #[serde(default)]
     pub clients: Vec<String>,
+    /// Duplex client targets. These seed an occupied bidirectional channel.
+    #[serde(default)]
+    pub client_duplex: Vec<String>,
     /// Public API used to register ephemeral per-line AddressPGP routes.
     #[serde(default = "default_route_register_url")]
     pub route_register_url: String,
@@ -149,7 +156,9 @@ impl Default for L0Config {
             billing_pgp_file: None,
             channels: Vec::new(),
             proxies: Vec::new(),
+            proxy_duplex: Vec::new(),
             clients: Vec::new(),
+            client_duplex: Vec::new(),
             route_register_url: default_route_register_url(),
         }
     }
@@ -185,13 +194,89 @@ pub struct ValidatedConfig {
     pub peers: Vec<ValidatedPeer>,
     pub l0: L0Settings,
     pub clients: Vec<crate::locator::ClientTarget>,
+    pub client_duplex: Vec<crate::locator::ClientTarget>,
     pub gateway: Option<ValidatedGateway>,
 }
 
 impl ValidatedConfig {
     /// Proxy-only server: proxies configured, no client intercept. Skip TUN.
     pub fn proxy_server_only(&self) -> bool {
-        !self.l0.proxies.is_empty() && self.clients.is_empty()
+        (!self.l0.proxies.is_empty() || !self.l0.proxy_duplex.is_empty())
+            && self.clients.is_empty()
+            && self.client_duplex.is_empty()
+    }
+
+    /// Legacy packet mode is required only by request/response `--client`.
+    /// Duplex clients use local TCP listeners and raw stream frames.
+    pub fn packet_mode_required(&self) -> bool {
+        !self.clients.is_empty()
+    }
+
+    /// Resolve the local virtual endpoint used by a client target.
+    ///
+    /// A client application connects to this daemon's `local_vip:port`.
+    /// The packet loop must then select the configured remote web3 peer rather
+    /// than treating the packet as traffic for this daemon's own identity.
+    pub fn lookup_client_target(&self, dest: Ipv4Addr, port: u16) -> Option<Locator> {
+        if dest != self.local_vip {
+            return None;
+        }
+        let target = self
+            .clients
+            .iter()
+            .chain(self.client_duplex.iter())
+            .find(|target| target.port == port)?;
+        self.lookup_peer_for_target(target)
+    }
+
+    /// Resolve a configured peer for one client target.
+    ///
+    /// The same EOA may expose more than one protocol port (for example Geth
+    /// and Beacon).  Port matching is therefore part of identity resolution;
+    /// selecting the first EOA entry can attach a Beacon socket to the Geth
+    /// PGP/route key.
+    pub fn lookup_peer_for_target(&self, target: &crate::locator::ClientTarget) -> Option<Locator> {
+        match &target.host {
+            LocatorHost::Eoa(eoa) => self
+                .peers
+                .iter()
+                .find(|peer| {
+                    let port_matches = peer.tcp_ports.contains(&target.port)
+                        || peer.udp_ports.contains(&target.port)
+                        // Non-standard client ports are logical proxy ports and
+                        // may intentionally be absent from peers.*.tcp_ports.
+                        || target.service().is_none();
+                    port_matches
+                        && match &peer.locator.host {
+                            LocatorHost::Eoa(peer_eoa) => crate::l0::eip191::eoa_eq(eoa, peer_eoa),
+                            LocatorHost::Tag(_) => false,
+                        }
+                })
+                .map(|peer| peer.locator.clone()),
+            LocatorHost::Tag(_) => None,
+        }
+    }
+
+    /// Human-readable local virtual endpoint mappings for startup/status output.
+    pub fn client_mappings(&self) -> Vec<(String, String)> {
+        self.clients
+            .iter()
+            .chain(self.client_duplex.iter())
+            .map(|target| {
+                (
+                    target.display(),
+                    format!(
+                        "{}:{}",
+                        if self.packet_mode_required() {
+                            self.local_vip
+                        } else {
+                            Ipv4Addr::UNSPECIFIED
+                        },
+                        target.port
+                    ),
+                )
+            })
+            .collect()
     }
 }
 
@@ -229,6 +314,7 @@ pub struct L0Settings {
     pub billing_pgp_file: Option<PathBuf>,
     pub channels: Vec<ValidatedL0Channel>,
     pub proxies: Vec<ValidatedL0Proxy>,
+    pub proxy_duplex: Vec<ValidatedL0Proxy>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +331,13 @@ pub struct ValidatedL0Channel {
 pub struct ValidatedL0Proxy {
     pub host: String,
     pub port: u16,
+    pub mode: ProxyMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyMode {
+    RequestResponse,
+    Duplex,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +394,32 @@ fn default_tun_name() -> String {
 }
 fn default_overlay_cidr() -> String {
     "100.64.0.0/10".into()
+}
+
+fn default_local_vip() -> String {
+    "auto".into()
+}
+
+fn select_local_vip(overlay: Ipv4Cidr, peers: &[PeerConfig]) -> Result<Ipv4Addr, L0dError> {
+    let used: HashSet<Ipv4Addr> = peers
+        .iter()
+        .filter_map(|peer| peer.vip.parse().ok())
+        .collect();
+    let network = u32::from(overlay.network);
+    let host_count = if overlay.prefix >= 31 {
+        0
+    } else {
+        (1u32 << (32 - overlay.prefix)).saturating_sub(2)
+    };
+    for offset in 5..host_count.saturating_add(1) {
+        let candidate = Ipv4Addr::from(network.saturating_add(offset));
+        if overlay.contains(candidate) && !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(L0dError::Config(
+        "unable to automatically allocate a local overlay VIP".into(),
+    ))
 }
 fn default_chain() -> String {
     "CONET_L0D".into()
@@ -373,7 +492,9 @@ impl DaemonConfig {
         main_wallet_pgp: Option<PathBuf>,
         main_wallet_key: Option<PathBuf>,
         proxy_specs: &[String],
+        proxy_duplex_specs: &[String],
         client_specs: &[String],
+        client_duplex_specs: &[String],
     ) -> Result<(), L0dError> {
         if let Some(wallet) = main_wallet {
             self.l0.billing_eoa = Some(wallet);
@@ -390,8 +511,20 @@ impl DaemonConfig {
                 .map(|spec| parse_proxy_spec(spec))
                 .collect::<Result<Vec<_>, _>>()?;
         }
+        if !proxy_duplex_specs.is_empty() {
+            self.l0.proxy_duplex = proxy_duplex_specs
+                .iter()
+                .map(|spec| parse_proxy_spec(spec))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
         if !client_specs.is_empty() {
             self.l0.clients = client_specs
+                .iter()
+                .map(|spec| crate::locator::ClientTarget::parse(spec).map(|t| t.display()))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        if !client_duplex_specs.is_empty() {
+            self.l0.client_duplex = client_duplex_specs
                 .iter()
                 .map(|spec| crate::locator::ClientTarget::parse(spec).map(|t| t.display()))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -415,10 +548,14 @@ impl DaemonConfig {
         }
 
         let overlay = Ipv4Cidr::parse(&self.overlay_cidr)?;
-        let local_vip: Ipv4Addr = self
-            .local_vip
-            .parse()
-            .map_err(|_| L0dError::Config(format!("invalid local_vip {}", self.local_vip)))?;
+        let local_vip: Ipv4Addr =
+            if self.local_vip.eq_ignore_ascii_case("auto") || self.local_vip.trim().is_empty() {
+                select_local_vip(overlay, &self.peers)?
+            } else {
+                self.local_vip.parse().map_err(|_| {
+                    L0dError::Config(format!("invalid local_vip {}", self.local_vip))
+                })?
+            };
         if !overlay.contains(local_vip) {
             return Err(L0dError::Config(
                 "local_vip must sit inside overlay_cidr".into(),
@@ -564,37 +701,55 @@ impl DaemonConfig {
             });
         }
         let mut proxies = Vec::new();
+        let mut proxy_duplex = Vec::new();
         let mut proxy_ports = HashSet::new();
-        for proxy in &self.l0.proxies {
-            let host = proxy.host.trim().to_string();
-            if host.is_empty()
-                || host.chars().any(char::is_whitespace)
-                || host.contains('/')
-                || host.contains('#')
-                || host.contains('?')
-            {
-                return Err(L0dError::Config(format!(
-                    "l0 proxy host is invalid: {}",
-                    proxy.host
-                )));
+        for (mode, raw_targets) in [
+            (ProxyMode::RequestResponse, &self.l0.proxies),
+            (ProxyMode::Duplex, &self.l0.proxy_duplex),
+        ] {
+            for proxy in raw_targets {
+                let host = proxy.host.trim().to_string();
+                if host.is_empty()
+                    || host.chars().any(char::is_whitespace)
+                    || host.contains('/')
+                    || host.contains('#')
+                    || host.contains('?')
+                {
+                    return Err(L0dError::Config(format!(
+                        "l0 proxy host is invalid: {}",
+                        proxy.host
+                    )));
+                }
+                if proxy.port == 0 {
+                    return Err(L0dError::Config("l0 proxy port 0 is not allowed".into()));
+                }
+                if !proxy_ports.insert(proxy.port) {
+                    return Err(L0dError::Config(format!(
+                        "l0 proxy port {} is assigned twice across proxy modes",
+                        proxy.port
+                    )));
+                }
+                let target = ValidatedL0Proxy {
+                    host,
+                    port: proxy.port,
+                    mode,
+                };
+                match mode {
+                    ProxyMode::RequestResponse => proxies.push(target),
+                    ProxyMode::Duplex => proxy_duplex.push(target),
+                }
             }
-            if proxy.port == 0 {
-                return Err(L0dError::Config("l0 proxy port 0 is not allowed".into()));
-            }
-            if !proxy_ports.insert(proxy.port) {
-                return Err(L0dError::Config(format!(
-                    "l0 proxy port {} is assigned twice",
-                    proxy.port
-                )));
-            }
-            proxies.push(ValidatedL0Proxy {
-                host,
-                port: proxy.port,
-            });
         }
         let mut clients = Vec::new();
+        let mut client_ports = HashSet::new();
         for raw in &self.l0.clients {
             let target = crate::locator::ClientTarget::parse(raw)?;
+            if !client_ports.insert(target.port) {
+                return Err(L0dError::Config(format!(
+                    "l0 client port {} is assigned twice",
+                    target.port
+                )));
+            }
             clients.push(target);
         }
         if !clients.is_empty() && !self.l0.enabled {
@@ -602,8 +757,24 @@ impl DaemonConfig {
                 "l0.enabled must be true when l0 clients are configured".into(),
             ));
         }
+        let mut client_duplex = Vec::new();
+        for raw in &self.l0.client_duplex {
+            let target = crate::locator::ClientTarget::parse(raw)?;
+            if !client_ports.insert(target.port) {
+                return Err(L0dError::Config(format!(
+                    "l0 client port {} is assigned twice",
+                    target.port
+                )));
+            }
+            client_duplex.push(target);
+        }
+        if !client_duplex.is_empty() && !self.l0.enabled {
+            return Err(L0dError::Config(
+                "l0.enabled must be true when l0 duplex clients are configured".into(),
+            ));
+        }
 
-        if !proxies.is_empty() {
+        if !proxies.is_empty() || !proxy_duplex.is_empty() {
             if !self.l0.enabled {
                 return Err(L0dError::Config(
                     "l0.enabled must be true when l0 proxy targets are configured".into(),
@@ -667,8 +838,10 @@ impl DaemonConfig {
                 billing_pgp_file: self.l0.billing_pgp_file.clone(),
                 channels,
                 proxies,
+                proxy_duplex,
             },
             clients,
+            client_duplex,
             gateway,
         })
     }
@@ -808,10 +981,13 @@ impl ValidatedConfig {
             }
             from_peers
         };
-        for client in &self.clients {
+        for client in self.clients.iter().chain(self.client_duplex.iter()) {
             ports.insert(client.port);
         }
         for proxy in &self.l0.proxies {
+            ports.insert(proxy.port);
+        }
+        for proxy in &self.l0.proxy_duplex {
             ports.insert(proxy.port);
         }
         ports
@@ -829,6 +1005,20 @@ mod tests {
         assert!(cidr.contains("100.127.255.255".parse().unwrap()));
         assert!(!cidr.contains("100.128.0.1".parse().unwrap()));
         assert!(!cidr.contains("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn auto_vip_skips_configured_peer_vips() {
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
+        cfg.local_vip = "auto".into();
+        cfg.peers[0].vip = "100.64.0.5".into();
+        let validated = cfg.validate().expect("auto vip");
+        assert_eq!(
+            validated.local_vip,
+            "100.64.0.6".parse::<Ipv4Addr>().unwrap()
+        );
     }
 
     #[test]
@@ -952,15 +1142,35 @@ mod tests {
     }
 
     #[test]
+    fn proxy_modes_share_port_namespace() {
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
+        cfg.l0.proxies = vec![L0ProxyConfig {
+            host: "127.0.0.1".into(),
+            port: 8400,
+        }];
+        cfg.l0.proxy_duplex = cfg.l0.proxies.clone();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn clients_extend_overlay_ports_and_lookup_peer() {
         let mut cfg: DaemonConfig =
             toml::from_str(include_str!("../config/conet-l0d.example.toml"))
                 .expect("parse example");
         cfg.peers[0].locator = "web3://0x2222222222222222222222222222222222222222/p2p/geth".into();
         cfg.peers[0].tcp_ports = vec![8400];
+        cfg.peers[1].locator =
+            "web3://0x2222222222222222222222222222222222222222/p2p/beacon".into();
+        cfg.peers[1].tcp_ports = vec![4200];
         cfg.l0.enabled = true;
         cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
         cfg.l0.clients = vec!["web3://0x2222222222222222222222222222222222222222:9999".into()];
+        cfg.l0.client_duplex =
+            vec!["web3://0x2222222222222222222222222222222222222222:4200".into()];
         let validated = cfg.validate().expect("clients with l0 on");
         assert!(!validated.proxy_server_only());
         assert!(validated.overlay_ports().contains(&9999));
@@ -970,5 +1180,19 @@ mod tests {
         assert!(validated
             .lookup_peer("100.64.0.1".parse().unwrap(), 8400)
             .is_some());
+        assert_eq!(
+            validated
+                .lookup_client_target("100.64.0.5".parse().unwrap(), 9999)
+                .expect("local client endpoint")
+                .display(),
+            "web3://0x2222222222222222222222222222222222222222/p2p/geth"
+        );
+        assert_eq!(
+            validated
+                .lookup_client_target("100.64.0.5".parse().unwrap(), 4200)
+                .expect("local beacon endpoint")
+                .display(),
+            "web3://0x2222222222222222222222222222222222222222/p2p/beacon"
+        );
     }
 }

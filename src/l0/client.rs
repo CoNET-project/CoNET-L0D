@@ -7,7 +7,7 @@
 //! through `conet_l0d_overlay_v1` transport frames. HTTP first body is still `{ "data" }`
 //! only. Do not claim SI `duplex_*` or live `p2p_stream_*`.
 
-use crate::config::ValidatedConfig;
+use crate::config::{ProxyMode, ValidatedConfig};
 use crate::error::L0dError;
 use crate::l0::aes;
 use crate::l0::eip191::EthSecret;
@@ -16,19 +16,29 @@ use crate::locator::{Locator, LocatorHost};
 use crate::packet::overlay_channel_port;
 use base64::Engine;
 use sequoia_openpgp::Cert;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 const POST_QUEUE: usize = 2048;
 // 32 in-flight POSTs each walking 3 entries × 12s starves SI /post (listen headers never arrive).
 const POST_CONCURRENCY: usize = 4;
 const LISTEN_QUEUE: usize = 512;
 const LISTEN_RECONNECT_SECS: u64 = 3;
+/// `regiestChatRoute` acknowledges queue admission before the AddressPGP write
+/// is necessarily visible to every SI.  A temporary line is not usable until
+/// an entry returns a real `text/event-stream` L0 listen, so keep the local
+/// socket paused across several propagation/retry cycles.
+const DYNAMIC_LISTEN_READY_TIMEOUT_SECS: u64 = 120;
+/// After `responseChunk`, keep the proxy upstream read side paused only until
+/// the initiator occupy attaches. Geth / beacon often send no extra bytes
+/// after Hello until the return pipe is live, so an empty first blob is OK.
 /// After `l0_connect` fails (e.g. peer L0 listen not idle yet), retry instead of
 /// permanently clearing `pipe_tx` and falling back to P1.
 const L0_PIPE_RETRY_SECS: u64 = 3;
@@ -52,6 +62,43 @@ const DUPLEX_OFFER_CLOCK_SKEW_SECS: u64 = 10;
 const DUPLEX_OFFER_MAX_AGE_SECS: u64 = 90;
 const BATCH_MAX_PACKETS: usize = 16;
 const BATCH_MAX_BYTES: usize = 12 * 1024;
+/// Keep this many listen-ready temporary identities per duplex port so
+/// `duplex_offer` / `duplex_accept` can fire before RLPx / libp2p RST the
+/// local TCP (AddressPGP + SSE ready is typically 2–6s).
+const READY_IDENTITY_POOL_TARGET: usize = 2;
+
+/// Pre-registered, listen-ready ephemeral identities for one logical port.
+struct ReadyIdentityPool {
+    ready: Mutex<VecDeque<crate::l0::identity::TemporaryIdentity>>,
+    warming: AtomicU64,
+}
+
+impl ReadyIdentityPool {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ready: Mutex::new(VecDeque::new()),
+            warming: AtomicU64::new(0),
+        })
+    }
+
+    fn take(&self) -> Option<crate::l0::identity::TemporaryIdentity> {
+        self.ready
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop_front()
+    }
+
+    fn push(&self, identity: crate::l0::identity::TemporaryIdentity) {
+        self.ready
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push_back(identity);
+    }
+
+    fn ready_len(&self) -> usize {
+        self.ready.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
 
 #[derive(Clone)]
 struct ArmoredCert(String);
@@ -62,7 +109,20 @@ impl fmt::Debug for ArmoredCert {
     }
 }
 
-struct SecretCert(Cert);
+struct SecretCert {
+    cert: Cert,
+    /// Wallet whose user-PGP key decrypted this armor. This is required to
+    /// prove that a new offer actually arrived on the configured mainWallet,
+    /// instead of trusting a mainWallet string carried inside the offer.
+    wallet: Option<String>,
+}
+
+impl SecretCert {
+    #[cfg(test)]
+    fn unscoped(cert: Cert) -> Self {
+        Self { cert, wallet: None }
+    }
+}
 
 impl fmt::Debug for SecretCert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -111,6 +171,8 @@ struct ChannelWire {
     entries: Vec<String>,
     /// Own session-listen user PGP (channel EOA in crate MVP).
     user_pub: String,
+    /// CoNET L1 RPC used after `regiestChatRoute` HTTP 200 to wait for searchKey.
+    rpc: String,
 }
 
 /// Shared by exclusive `l0_listen` workers so a successful SSE reconnect can
@@ -166,18 +228,27 @@ struct DuplexSession {
     host_eoa: String,
     /// Peer's session-listen user PGP (from accept, or offer for the initiator).
     peer_listen_user_pgp: Option<String>,
+    /// Exact mailbox route PGP registered for the peer's per-socket temporary
+    /// listen wallet. Dynamic lines must never substitute a static peer route.
+    peer_listen_route_pgp: Option<String>,
     peer_listen_wallet: Option<String>,
     /// Acceptor-side temporary identity, allocated after mainWallet:port
     /// matching. It is never reused by another line.
     accept_identity: Option<crate::l0::identity::TemporaryIdentity>,
     /// Acceptor: initiator sent at least one `duplex_frame` (return path is live).
     peer_return_attached: bool,
+    /// The control-plane responseChunk is replayed until the reverse occupied
+    /// pipe is established, but it must be written to the local socket once.
+    response_chunk_delivered: bool,
     /// Occupied `l0_connect` writer. AES blobs only; never overlay key on this channel.
     pipe_tx: Option<mpsc::Sender<String>>,
     /// Bumps on every `spawn_l0_pipe` so a dying task does not clear a newer pipe.
     pipe_gen: u64,
     /// True while an async `spawn_l0_pipe` task owns occupy/retry (prevents duplicate spawns).
     pipe_connect_inflight: bool,
+    /// Shared with the occupy task. Retain / remove must set this so the pipe
+    /// stops instead of sending heartbeats with a stale spawn-time key.
+    pipe_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl fmt::Debug for PostJob {
@@ -237,6 +308,11 @@ pub struct L0Client {
     proxy_registry: proxy::ProxyRegistry,
     proxy_receivers: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
     proxy_seq: Arc<AtomicU64>,
+    /// Raw TCP streams accepted on the automatically assigned local client
+    /// endpoint. Duplex frames for these sessions bypass TUN packet handling.
+    local_streams: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    /// Per-port listen-ready temporary identities (spoke client + proxy hub).
+    ready_identities: HashMap<u16, Arc<ReadyIdentityPool>>,
 }
 
 impl fmt::Debug for L0Client {
@@ -305,6 +381,8 @@ impl L0Client {
             proxy_registry: proxy::ProxyRegistry::new(Vec::new()),
             proxy_receivers: Arc::new(Mutex::new(HashMap::new())),
             proxy_seq: Arc::new(AtomicU64::new(1)),
+            local_streams: Arc::new(Mutex::new(HashMap::new())),
+            ready_identities: HashMap::new(),
         }
     }
 
@@ -345,21 +423,17 @@ impl L0Client {
                     if let LocatorHost::Eoa(peer_eoa) = &peer.locator.host {
                         keys.peer_eoa = peer_eoa.clone();
                     }
-                    for port in peer.tcp_ports.iter().chain(peer.udp_ports.iter()) {
-                        peers.insert((peer.vip, *port), keys.clone());
-                    }
-                    // Client targets may use ports absent from peers.*.ports.
-                    for client in &cfg.clients {
-                        let LocatorHost::Eoa(client_eoa) = &client.host else {
-                            continue;
-                        };
-                        let LocatorHost::Eoa(peer_eoa) = &peer.locator.host else {
-                            continue;
-                        };
-                        if eip191::eoa_eq(client_eoa, peer_eoa) {
-                            peers.insert((peer.vip, client.port), keys.clone());
-                        }
-                    }
+                    // A single mainWallet can have distinct user-PGP keys per
+                    // port. Only this row's explicit ports receive its key.
+                    // Filling client_duplex ports from another row (or_insert)
+                    // encrypted :8400 offers to the beacon PGP when the geth
+                    // peer file failed to load.
+                    insert_peer_pgp_ports(
+                        &mut peers,
+                        peer.vip,
+                        peer.tcp_ports.iter().chain(peer.udp_ports.iter()).copied(),
+                        &keys,
+                    );
                 }
                 Err(err) => tracing::warn!(
                     dest = %peer.vip,
@@ -381,7 +455,15 @@ impl L0Client {
         let duplex = Arc::new(Mutex::new(HashMap::new()));
         let proxy_receivers = Arc::new(Mutex::new(HashMap::new()));
         let proxy_seq = Arc::new(AtomicU64::new(1));
-        let proxy_registry = proxy::ProxyRegistry::new(cfg.l0.proxies.clone());
+        let local_streams = Arc::new(Mutex::new(HashMap::new()));
+        let proxy_registry = proxy::ProxyRegistry::new(
+            cfg.l0
+                .proxies
+                .iter()
+                .chain(cfg.l0.proxy_duplex.iter())
+                .cloned()
+                .collect(),
+        );
         let pipe_extras = PipeExtras {
             inbound_tx: Some(inbound_tx.clone()),
             proxy_registry: proxy_registry.clone(),
@@ -399,7 +481,10 @@ impl L0Client {
             listen_spawned = if cfg.l0.channels.is_empty() {
                 if let Some(path) = cfg.l0.routing_key_file.as_ref() {
                     match pgp::load_secret_cert(path) {
-                        Ok(cert) => user_secrets.push(SecretCert(cert)),
+                        Ok(cert) => user_secrets.push(SecretCert {
+                            cert,
+                            wallet: Some(routing_eoa.clone()),
+                        }),
                         Err(err) => tracing::warn!(
                             error = %err,
                             "P1: routing_key_file was not loaded; inbound decrypt for that wallet stays off"
@@ -433,6 +518,18 @@ impl L0Client {
         } else {
             None
         };
+        let mut ready_identities = HashMap::new();
+        for port in cfg
+            .client_duplex
+            .iter()
+            .map(|target| target.port)
+            .chain(cfg.l0.proxy_duplex.iter().map(|proxy| proxy.port))
+        {
+            ready_identities
+                .entry(port)
+                .or_insert_with(ReadyIdentityPool::new);
+        }
+        spawn_ready_identity_warmers(&ready_identities, &channel_wire, inbound_feed.clone());
 
         Self {
             enabled: cfg.l0.enabled,
@@ -463,6 +560,157 @@ impl L0Client {
             proxy_registry,
             proxy_receivers,
             proxy_seq,
+            local_streams,
+            ready_identities,
+        }
+    }
+
+    /// Start raw TCP listeners for configured duplex client targets.
+    ///
+    /// Every `accept()` event is a new local connection handle.  It must get
+    /// its own temporary identity and occupied pipe; selecting a session by
+    /// logical port would incorrectly merge concurrent Geth/Prysm sockets.
+    pub fn spawn_local_tcp_listeners(&self, cfg: &ValidatedConfig) {
+        for target in &cfg.client_duplex {
+            let Some(peer) = cfg.peers.iter().find(|peer| {
+                peer.tcp_ports.contains(&target.port)
+                    && match (&target.host, &peer.locator.host) {
+                        (LocatorHost::Eoa(target_eoa), LocatorHost::Eoa(peer_eoa)) => {
+                            eip191::eoa_eq(target_eoa, peer_eoa)
+                        }
+                        _ => false,
+                    }
+            }) else {
+                tracing::warn!(
+                    target = %target.display(),
+                    "duplex client target has no peer entry for its port"
+                );
+                continue;
+            };
+            let dest = peer.vip;
+            // Duplex-only clients deliberately do not create the overlay VIP.
+            // Bind their local stream endpoint on all local interfaces instead;
+            // packet-mode `--client` continues to use the configured VIP.
+            let bind = if cfg.packet_mode_required() {
+                cfg.local_vip
+            } else {
+                Ipv4Addr::UNSPECIFIED
+            };
+            let port = target.port;
+            let duplex = self.duplex.clone();
+            let local_streams = self.local_streams.clone();
+            let Some(wire) = self.channel_wire.get(&port).cloned() else {
+                tracing::warn!(port, "duplex client has no channel wire");
+                continue;
+            };
+            let Some(peer_keys) = self.peers.get(&(dest, port)).cloned() else {
+                tracing::warn!(port, "duplex client has no peer PGP keys");
+                continue;
+            };
+            match pgp::transport_key_id_armored(&peer_keys.user.0) {
+                Ok(kid) => tracing::info!(
+                    port,
+                    dest = %dest,
+                    peer_user_key_id = %kid,
+                    "duplex client listener bound to peer user PGP"
+                ),
+                Err(err) => tracing::warn!(
+                    port,
+                    dest = %dest,
+                    error = %err,
+                    "duplex client peer user PGP has no transport key"
+                ),
+            }
+            let inbound_feed = self.inbound_feed.clone();
+            let wires = Arc::new(self.channel_wire.clone());
+            let peers = Arc::new(self.peers.clone());
+            let proxy_registry = self.proxy_registry.clone();
+            let proxy_receivers = self.proxy_receivers.clone();
+            let proxy_seq = self.proxy_seq.clone();
+            let ready_pool = self.ready_identities.get(&port).cloned();
+            tokio::spawn(async move {
+                // A local EL commonly owns `*:8400`.  Binding the overlay VIP
+                // to the same port then fails even though the VIP itself is
+                // unused, because Linux checks the wildcard listener too.
+                // Keep the requested port when possible; otherwise expose a
+                // deterministic stream endpoint at port + 10000 and print it
+                // for the application to use.
+                let (listener, local_port) = match TcpListener::bind((bind, port)).await {
+                    Ok(listener) => (listener, port),
+                    Err(first_err) => {
+                        let fallback_port = port.checked_add(10_000).unwrap_or(0);
+                        match TcpListener::bind((bind, fallback_port)).await {
+                            Ok(listener) => (listener, fallback_port),
+                            Err(second_err) => {
+                                tracing::warn!(
+                                    bind = %bind,
+                                    port,
+                                    fallback_port,
+                                    first_error = %first_err,
+                                    error = %second_err,
+                                    "local client TCP listener failed"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                };
+                tracing::info!(
+                    bind = %bind,
+                    port = local_port,
+                    target_port = port,
+                    "local client TCP listener active"
+                );
+                loop {
+                    let (stream, peer) = match listener.accept().await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            tracing::warn!(bind = %bind, port, error = %err, "local client TCP accept failed");
+                            continue;
+                        }
+                    };
+                    tracing::info!(
+                        %peer,
+                        bind = %bind,
+                        local_port,
+                        target_port = port,
+                        "local client TCP connection accepted"
+                    );
+                    let duplex = duplex.clone();
+                    let local_streams = local_streams.clone();
+                    let wire = wire.clone();
+                    let peer_keys = peer_keys.clone();
+                    let inbound_feed = inbound_feed.clone();
+                    let wires = wires.clone();
+                    let peers = peers.clone();
+                    let proxy_registry = proxy_registry.clone();
+                    let proxy_receivers = proxy_receivers.clone();
+                    let proxy_seq = proxy_seq.clone();
+                    let ready_pool = ready_pool.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = run_dynamic_local_tcp_stream(
+                            stream,
+                            duplex,
+                            local_streams,
+                            dest,
+                            port,
+                            wire,
+                            peer_keys,
+                            inbound_feed,
+                            wires,
+                            peers,
+                            proxy_registry,
+                            proxy_receivers,
+                            proxy_seq,
+                            ready_pool,
+                        )
+                        .await
+                        {
+                            tracing::debug!(%peer, port, error = %err, "local client TCP stream closed");
+                        }
+                    });
+                }
+            });
         }
     }
 
@@ -573,7 +821,7 @@ impl L0Client {
         if let Some((session_id, payload)) = duplex::parse_duplex_frame_json(trimmed) {
             return self.apply_duplex_frame(&session_id, &payload);
         }
-        if let Some(accept) = duplex::parse_accept(trimmed) {
+        if let Ok(accept) = duplex::parse_accept_from_inbound_plain(trimmed) {
             self.apply_duplex_accept(accept);
             return Ok(0);
         }
@@ -581,40 +829,54 @@ impl L0Client {
             self.mark_duplex_rejected(&session_id);
             return Ok(0);
         }
-        if self.user_secrets.is_empty() {
-            self.inbound_refused = self.inbound_refused.saturating_add(1);
-            return Err(L0dError::L0(
-                "routing_key_file OpenPGP secret is required for inbound write-back".into(),
-            ));
-        }
         let mut last_err = L0dError::L0("inbound decrypt failed for every listen wallet".into());
-        for secret in &self.user_secrets {
-            match listen::inbound_plain_from_user_armor(chunk, &secret.0) {
+        let recipients = pgp::pkesk_recipient_key_ids(chunk).unwrap_or_default();
+        if !recipients.is_empty() {
+            tracing::debug!(
+                recipients = ?recipients,
+                "inbound user-PGP PKESK recipients"
+            );
+        }
+        let static_secrets: Vec<(Cert, Option<String>)> = self
+            .user_secrets
+            .iter()
+            .map(|secret| (secret.cert.clone(), secret.wallet.clone()))
+            .collect();
+        for (secret, ingress_wallet) in static_secrets {
+            if !inbound_secret_matches_recipients(&secret, &recipients) {
+                continue;
+            }
+            match listen::inbound_plain_from_user_armor(chunk, &secret) {
                 Ok(plain) => {
-                    if let Ok(offer) = duplex::parse_offer_from_inbound_plain(&plain) {
-                        self.apply_duplex_offer(offer);
-                        return Ok(0);
-                    }
-                    if let Some(accept) = duplex::parse_accept(&plain) {
-                        self.apply_duplex_accept(accept);
-                        return Ok(0);
-                    }
-                    if let Some(session_id) = duplex::parse_reject(&plain) {
-                        self.mark_duplex_rejected(&session_id);
-                        return Ok(0);
-                    }
-                    if let Some((session_id, payload)) = duplex::parse_duplex_frame_json(&plain) {
-                        return self.apply_duplex_frame(&session_id, &payload);
-                    }
-                    match envelope::decode(&plain) {
-                        Ok((_env, ipv4)) if listen::looks_like_ipv4(&ipv4) => {
-                            return self.queue_inbound_ipv4(ipv4);
-                        }
-                        Ok(_) => {
-                            last_err = L0dError::L0("inbound payload is not IPv4".into());
-                        }
-                        Err(err) => last_err = err,
-                    }
+                    return self.apply_decrypted_inbound_plain(&plain, ingress_wallet.as_deref())
+                }
+                Err(err) => last_err = err,
+            }
+        }
+        // Per-socket temporary identities are process-memory-only and are not
+        // part of the static channel secret list.  Their listen SSE carries
+        // the peer's duplex_accept/reject encrypted to this temporary PGP key.
+        let temporary_secrets: Vec<(Cert, String)> = {
+            let guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .values()
+                .filter_map(|session| {
+                    session.accept_identity.as_ref().map(|identity| {
+                        (
+                            identity.user_cert.clone(),
+                            identity.wallet_address().to_owned(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        for (secret, ingress_wallet) in temporary_secrets {
+            if !inbound_secret_matches_recipients(&secret, &recipients) {
+                continue;
+            }
+            match listen::inbound_plain_from_user_armor(chunk, &secret) {
+                Ok(plain) => {
+                    return self.apply_decrypted_inbound_plain(&plain, Some(&ingress_wallet))
                 }
                 Err(err) => last_err = err,
             }
@@ -623,11 +885,44 @@ impl L0Client {
         Err(last_err)
     }
 
+    fn apply_decrypted_inbound_plain(
+        &mut self,
+        plain: &str,
+        ingress_wallet: Option<&str>,
+    ) -> Result<usize, L0dError> {
+        if let Ok(offer) = duplex::parse_offer_from_inbound_plain(plain) {
+            self.apply_duplex_offer(offer, ingress_wallet);
+            return Ok(0);
+        }
+        if let Ok(accept) = duplex::parse_accept_from_inbound_plain(plain) {
+            self.apply_duplex_accept(accept);
+            return Ok(0);
+        }
+        if let Some(session_id) = duplex::parse_reject(plain) {
+            self.mark_duplex_rejected(&session_id);
+            return Ok(0);
+        }
+        if let Some((session_id, payload)) = duplex::parse_duplex_frame_json(plain) {
+            return self.apply_duplex_frame(&session_id, &payload);
+        }
+        match envelope::decode(plain) {
+            Ok((_env, ipv4)) if listen::looks_like_ipv4(&ipv4) => self.queue_inbound_ipv4(ipv4),
+            Ok(_) => Err(L0dError::L0("inbound payload is not IPv4".into())),
+            Err(err) => Err(err),
+        }
+    }
+
     fn apply_duplex_aes_blob(&mut self, blob: &str) -> Result<usize, L0dError> {
         let keys: Vec<[u8; aes::KEY_LEN]> = {
             let guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
-            guard.values().filter_map(|s| s.key).collect()
+            let mut rows: Vec<(u64, [u8; aes::KEY_LEN])> = guard
+                .values()
+                .filter_map(|s| s.key.map(|k| (s.created_at, k)))
+                .collect();
+            rows.sort_by(|a, b| b.0.cmp(&a.0));
+            rows.into_iter().map(|(_, k)| k).collect()
         };
+        let key_count = keys.len();
         let mut last = L0dError::L0("AES blob did not open with any duplex key".into());
         for key in keys {
             match aes::open(&key, blob) {
@@ -639,6 +934,10 @@ impl L0Client {
                                 guard.values_mut().find(|s| s.session_id == session_id)
                             {
                                 sess.peer_return_attached = true;
+                                tracing::debug!(
+                                    session = %session_id,
+                                    "duplex_ping; occupy alive (not a resume chunk)"
+                                );
                                 return Ok(0);
                             }
                             return Err(L0dError::L0(
@@ -656,6 +955,8 @@ impl L0Client {
         tracing::warn!(
             error = %last,
             blob_chars = blob.len(),
+            key_count,
+            blob_prefix = %blob.get(..12).unwrap_or(blob),
             "duplex AES blob did not open"
         );
         Err(last)
@@ -685,27 +986,40 @@ impl L0Client {
         .map_err(|e| L0dError::L0(format!("duplex_frame payload base64: {e}")))?;
         let (_seq, payload) = frame::decode(&framed)?;
         let inbound = payload.to_vec();
-        // TUN clients seal full IPv4 datagrams. Proxy drain expects raw TCP
-        // stream bytes only. Prefer TUN whenever the frame is IPv4 so hub
-        // geth/beacon can complete TCP over the overlay VIP (+ listen-DNAT).
-        let n = if listen::looks_like_ipv4(&inbound) {
-            self.queue_inbound_ipv4(inbound)?
-        } else {
+        // Stream clients register a local TCP return channel before sending
+        // bytes. Check it first: a raw TCP payload can begin with a byte that
+        // looks like an IPv4 header, and proxy-only peers intentionally have
+        // no TUN writer. Only legacy packet-mode sessions use the TUN path.
+        // A stream payload must be routed by session first.  TCP data is
+        // arbitrary bytes, so inspecting the first byte for an IPv4 header
+        // before consulting the stream maps can misclassify a payload that
+        // happens to start with 0x45 (or another IPv4-looking byte).  It also
+        // made the proxy-only endpoint try to write stream data to a
+        // nonexistent TUN device.
+        let local_stream = {
+            let receivers = self.local_streams.lock().unwrap_or_else(|p| p.into_inner());
+            receivers.get(session_id).cloned()
+        };
+        let proxy_stream = if local_stream.is_none() {
             let receivers = self
                 .proxy_receivers
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if let Some(tx) = receivers.get(session_id) {
-                tx.try_send(inbound.clone())
-                    .map_err(|_| L0dError::L0("proxy session inbound queue is full".into()))?;
-                inbound.len()
-            } else {
-                drop(receivers);
-                self.inbound_refused = self.inbound_refused.saturating_add(1);
-                return Err(L0dError::L0(
-                    "duplex plaintext is not IPv4 and no proxy drain is attached".into(),
-                ));
-            }
+            receivers.get(session_id).cloned()
+        } else {
+            None
+        };
+        let n = if let Some(tx) = local_stream.or(proxy_stream) {
+            tx.try_send(inbound.clone())
+                .map_err(|_| L0dError::L0("duplex stream queue is full".into()))?;
+            inbound.len()
+        } else if listen::looks_like_ipv4(&inbound) {
+            self.queue_inbound_ipv4(inbound)?
+        } else {
+            self.inbound_refused = self.inbound_refused.saturating_add(1);
+            return Err(L0dError::L0(
+                "duplex plaintext is not IPv4 and no stream receiver is attached".into(),
+            ));
         };
         {
             let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
@@ -719,7 +1033,7 @@ impl L0Client {
         Ok(n)
     }
 
-    fn apply_duplex_offer(&mut self, offer: duplex::DuplexOffer) {
+    fn apply_duplex_offer(&mut self, offer: duplex::DuplexOffer, ingress_wallet: Option<&str>) {
         let now = chrono::Utc::now().timestamp().max(0) as u64;
         if duplex_offer_is_expired(offer.timestamp, now) {
             tracing::info!(
@@ -735,6 +1049,15 @@ impl L0Client {
         }
         // (wire, initiator_listen, mailbox_route, sess, initiator_pipe_pgp)
         let mut send_accept: Option<(ChannelWire, String, String, DuplexSession, String)> = None;
+        let mut proxy_handshake: Option<(
+            ChannelWire,
+            String,
+            String,
+            DuplexSession,
+            String,
+            Vec<u8>,
+            bool,
+        )> = None;
         let mut send_reject: Option<(ChannelWire, String, String, [u8; aes::KEY_LEN], String)> =
             None;
         let mut offer_matched = false;
@@ -766,33 +1089,27 @@ impl L0Client {
                     sess.session_id = offer.session_id.clone();
                 }
                 let had_key = sess.key.is_some();
+                if duplex_duplicate_offer_should_ignore(sess, had_key) {
+                    offer_duplicate_ignored = true;
+                    tracing::debug!(
+                        session = %offer.session_id,
+                        port = sess.port,
+                        pipe_up = sess.pipe_tx.is_some(),
+                        pipe_inflight = sess.pipe_connect_inflight,
+                        rejected = sess.rejected,
+                        "duplex_offer duplicate ignored before mutating session ownership"
+                    );
+                    break;
+                }
                 sess.key = Some(offer.key);
                 sess.peer_listen_wallet = Some(offer.listen_wallet.clone());
                 if !offer.listen_user_pgp.trim().is_empty() {
                     sess.peer_listen_user_pgp = Some(offer.listen_user_pgp.clone());
                 }
+                if !offer.listen_route_pgp.trim().is_empty() {
+                    sess.peer_listen_route_pgp = Some(offer.listen_route_pgp.clone());
+                }
                 if !had_key {
-                    match crate::l0::identity::TemporaryIdentity::generate() {
-                        Ok(identity) => {
-                            tracing::info!(
-                                session = %offer.session_id,
-                                main_wallet = %offer.main_wallet,
-                                port = offer.port,
-                                temporary_wallet = %identity.wallet_address(),
-                                "allocated temporary duplex identity for accepted line"
-                            );
-                            sess.accept_identity = Some(identity);
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                session = %offer.session_id,
-                                error = %err,
-                                "failed to allocate temporary duplex identity"
-                            );
-                            sess.rejected = true;
-                            return;
-                        }
-                    }
                     sess.peer_attached = true;
                     sess.rejected = false;
                     tracing::info!(
@@ -802,32 +1119,16 @@ impl L0Client {
                         "duplex_offer accepted; overlay AES key stored in memory only"
                     );
                     if let Some(wire) = self.channel_wire.get(&sess.port) {
-                        if let Some(keys) = self.peers.get(&(sess.dest, sess.port)) {
+                        if !offer.listen_route_pgp.trim().is_empty() {
                             send_accept = Some((
                                 wire.clone(),
                                 offer.listen_wallet.clone(),
-                                keys.route.0.clone(),
+                                offer.listen_route_pgp.clone(),
                                 sess.clone(),
                                 offer.listen_user_pgp.clone(),
                             ));
                         }
                     }
-                } else if sess.pipe_tx.is_none() && !sess.rejected && !sess.pipe_connect_inflight {
-                    tracing::info!(
-                        session = %offer.session_id,
-                        port = sess.port,
-                        "duplex_offer observed by initiator; keeping single l0_connect owner"
-                    );
-                } else if duplex_duplicate_offer_should_ignore(sess, true) {
-                    offer_duplicate_ignored = true;
-                    tracing::debug!(
-                        session = %offer.session_id,
-                        port = sess.port,
-                        pipe_up = sess.pipe_tx.is_some(),
-                        pipe_inflight = sess.pipe_connect_inflight,
-                        rejected = sess.rejected,
-                        "duplex_offer duplicate ignored"
-                    );
                 }
                 break;
             }
@@ -836,150 +1137,148 @@ impl L0Client {
                     guard.insert(duplex_key_of(&sess), sess);
                 }
             }
-            // Same mainWallet:port may host many independent lines. If this offer
-            // did not hit a pending/local handle, open a fresh session instead of
-            // rejecting (multiline proxy / additional overlay clients).
+            // In proxy-only mode a signed mainWallet:port offer carrying a
+            // firstChunk is the one explicit remote socket event. The signer
+            // was already recovered as billingWallet by the parser; it does
+            // not need to be pre-listed as a static overlay peer.
             if !offer_matched {
-                let host_ok = self
-                    .channel_wire
-                    .get(&offer.port)
+                let matching_wire = self.channel_wire.get(&offer.port);
+                let host_ok = matching_wire
                     .map(|w| w.main_wallet.eq_ignore_ascii_case(&offer.main_wallet))
                     .unwrap_or(false);
-                if host_ok {
-                    // Mailbox offline flush can replay an older process's
-                    // duplex_offer after a live line is already up. Prefer the
-                    // live peer:port session over a stale armored offer.
-                    if duplex_stale_offer_should_skip_additional(
-                        &guard,
-                        &offer.from,
-                        offer.port,
-                        offer.timestamp,
-                    ) {
-                        tracing::info!(
-                            session = %offer.session_id,
-                            from = %offer.from,
-                            port = offer.port,
-                            offer_ts = offer.timestamp,
-                            "duplex_offer stale vs live peer:port; ignored"
-                        );
-                    } else {
-                        let dest = guard
-                            .values()
-                            .find(|s| {
-                                s.port == offer.port && s.peer_eoa.eq_ignore_ascii_case(&offer.from)
-                            })
-                            .map(|s| s.dest)
-                            .or_else(|| {
-                                self.peers
-                                    .iter()
-                                    .find(|((_, p), keys)| {
-                                        *p == offer.port
-                                            && !keys.peer_eoa.is_empty()
-                                            && keys.peer_eoa.eq_ignore_ascii_case(&offer.from)
-                                    })
-                                    .map(|((vip, _), _)| *vip)
-                            })
-                            .or_else(|| {
-                                self.peers
-                                    .keys()
-                                    .find(|(_, p)| *p == offer.port)
-                                    .map(|(vip, _)| *vip)
-                            });
-                        if let Some(dest) = dest {
-                            let Some(wire) = self.channel_wire.get(&offer.port).cloned() else {
-                                // unreachable: host_ok already checked
-                                return;
-                            };
-                            let Some(keys) = self.peers.get(&(dest, offer.port)).cloned() else {
-                                tracing::warn!(
-                                    session = %offer.session_id,
-                                    port = offer.port,
-                                    "multiline duplex_offer missing peer PGP; rejecting"
-                                );
-                                return;
-                            };
-                            // One occupy pipe per peer listen wallet. Drop conflicting
-                            // ghost sessions so their TCP EOF frees SI exclusive occupy
-                            // before this line's l0_connect (avoids sustained 409).
-                            let retired = retire_conflicting_duplex_sessions(
-                                &mut guard,
-                                &self.proxy_receivers,
-                                &offer.from,
-                                offer.port,
-                                &offer.session_id,
-                            );
-                            if retired > 0 {
-                                tracing::info!(
-                                    session = %offer.session_id,
-                                    from = %offer.from,
-                                    port = offer.port,
-                                    retired,
-                                    "retired conflicting duplex sessions for peer:port"
-                                );
-                            }
-                            let identity = match crate::l0::identity::TemporaryIdentity::generate()
-                            {
-                                Ok(identity) => identity,
+                // A shared mainWallet may expose each port through a distinct
+                // channel user-PGP wallet. New allocation is authorized only
+                // when this armor was actually decrypted by that configured
+                // port wallet. Merely carrying mainWallet + port in JSON is
+                // insufficient and temporary listeners can never allocate.
+                let arrived_on_main_wallet_port = matching_wire
+                    .zip(ingress_wallet)
+                    .map(|(wire, wallet)| eip191::eoa_eq(wallet, &wire.eoa))
+                    .unwrap_or(false);
+                let expected_port_wallet = matching_wire.map(|wire| wire.eoa.as_str());
+                let socket_identity_ok = eip191::eoa_eq(&offer.from, &offer.listen_wallet);
+                let target_ok = eip191::eoa_eq(&offer.peer_wallet, &offer.main_wallet);
+                let peer_route_ready = !offer.listen_user_pgp.trim().is_empty()
+                    && !offer.listen_route_pgp.trim().is_empty();
+                if host_ok
+                    && arrived_on_main_wallet_port
+                    && socket_identity_ok
+                    && target_ok
+                    && peer_route_ready
+                    && !offer.first_chunk.is_empty()
+                    && self.proxy_registry.mode(offer.port) == Some(ProxyMode::Duplex)
+                {
+                    // A proxy has no local application socket from which to
+                    // pre-register this line.  The initiator's socket event
+                    // is therefore represented by the authenticated
+                    // firstChunk in this offer.  Allocate exactly one
+                    // per-offer line here; subsequent offers/frames must
+                    // match this pipe_handle.
+                    if let Some(wire) = self.channel_wire.get(&offer.port).cloned() {
+                        let (identity, listen_ready) = match self
+                            .ready_identities
+                            .get(&offer.port)
+                            .and_then(|pool| pool.take())
+                        {
+                            Some(identity) => (Some(identity), true),
+                            None => match crate::l0::identity::TemporaryIdentity::generate() {
+                                Ok(identity) => (Some(identity), false),
                                 Err(err) => {
                                     tracing::warn!(
-                                        session = %offer.session_id,
+                                        port = offer.port,
                                         error = %err,
-                                        "failed to allocate temporary duplex identity"
+                                        "temporary proxy identity generation failed"
                                     );
-                                    return;
+                                    (None, false)
                                 }
-                            };
-                            let sess = DuplexSession {
+                            },
+                        };
+                        if let Some(identity) = identity {
+                            let session = DuplexSession {
                                 session_id: offer.session_id.clone(),
-                                created_at: chrono::Utc::now().timestamp().max(0) as u64,
+                                created_at: now,
                                 key: Some(offer.key),
-                                dest,
+                                dest: Ipv4Addr::UNSPECIFIED,
                                 port: offer.port,
-                                peer_eoa: offer.from.clone(),
-                                guest_up: true,
+                                peer_eoa: offer.billing_wallet.clone(),
+                                guest_up: false,
                                 peer_attached: true,
                                 rejected: false,
-                                // Match key is mainWallet:port; channel EOA is listen only.
-                                host_eoa: wire.main_wallet.clone(),
-                                peer_listen_user_pgp: if offer.listen_user_pgp.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(offer.listen_user_pgp.clone())
-                                },
+                                host_eoa: offer.main_wallet.clone(),
+                                peer_listen_user_pgp: Some(offer.listen_user_pgp.clone()),
+                                peer_listen_route_pgp: Some(offer.listen_route_pgp.clone()),
                                 peer_listen_wallet: Some(offer.listen_wallet.clone()),
                                 accept_identity: Some(identity),
                                 peer_return_attached: false,
+                                response_chunk_delivered: false,
                                 pipe_tx: None,
                                 pipe_gen: 0,
                                 pipe_connect_inflight: false,
+            pipe_cancel: None,
                             };
-                            tracing::info!(
-                                session = %offer.session_id,
-                                main_wallet = %offer.main_wallet,
-                                port = offer.port,
-                                dest = %dest,
-                                temporary_wallet = %sess
-                                    .accept_identity
-                                    .as_ref()
-                                    .map(|i| i.wallet_address().to_owned())
-                                    .unwrap_or_default(),
-                                "duplex_offer opened additional line on mainWallet:port"
-                            );
-                            guard.insert(duplex_key_of(&sess), sess.clone());
+                            let session_id = session.session_id.clone();
+                            guard.insert(duplex_key_of(&session), session.clone());
                             offer_matched = true;
-                            send_accept = Some((
-                                wire,
+                            proxy_handshake = Some((
+                                wire.clone(),
                                 offer.listen_wallet.clone(),
-                                keys.route.0.clone(),
-                                sess,
+                                offer.listen_route_pgp.clone(),
+                                session.clone(),
                                 offer.listen_user_pgp.clone(),
+                                offer.first_chunk.clone(),
+                                listen_ready,
                             ));
+                            tracing::info!(
+                                session = %session_id,
+                                port = offer.port,
+                                socket_wallet = %offer.from,
+                                billing_wallet = %offer.billing_wallet,
+                                listen_ready,
+                                "signed mainWallet:port firstChunk allocated one proxy duplex line"
+                            );
                         }
                     }
+                } else if host_ok {
+                    tracing::warn!(
+                        session = %offer.session_id,
+                        main_wallet = %offer.main_wallet,
+                        port = offer.port,
+                        listen_wallet = %offer.listen_wallet,
+                        ingress_wallet = ingress_wallet.unwrap_or("<unknown>"),
+                        expected_port_wallet = expected_port_wallet.unwrap_or("<none>"),
+                        arrived_on_main_wallet_port,
+                        socket_identity_ok,
+                        target_ok,
+                        peer_route_ready,
+                        "duplex_offer matched mainWallet:port but failed explicit new-socket checks; rejecting without allocation"
+                    );
                 }
             }
         }
         if offer_matched && offer_duplicate_ignored {
+            return;
+        }
+        if let Some((wire, target, route, sess, initiator_pipe_pgp, initial, listen_ready)) =
+            proxy_handshake
+        {
+            let session_id = sess.session_id.clone();
+            let ready = self.spawn_dynamic_accept_listen(&wire, &sess, listen_ready);
+            let Some(ready) = ready else {
+                tracing::warn!(
+                    session = %session_id,
+                    "proxy duplex handshake could not start temporary listen"
+                );
+                return;
+            };
+            self.spawn_proxy_handshake(
+                ready,
+                wire,
+                target,
+                route,
+                sess,
+                initiator_pipe_pgp,
+                initial,
+            );
             return;
         }
         if let Some((wire, target, route, sess, initiator_pipe_pgp)) = send_accept {
@@ -987,7 +1286,7 @@ impl L0Client {
             // listen before sending the accept so the initiator's subsequent
             // l0_connect is addressed to a real per-line mailbox, rather than
             // the channel EOA shared by every client on this logical port.
-            self.spawn_dynamic_accept_listen(&wire, &sess);
+            self.spawn_dynamic_accept_listen(&wire, &sess, false);
             // Chat gossip duplex_accept (control plane), then reverse occupy the
             // initiator's listenWallet so each endpoint owns a separate occupied
             // pipe bound by the same pipe_handle (RULES dedicated-pipe section).
@@ -996,6 +1295,7 @@ impl L0Client {
                 initiator_pipe_pgp,
                 sess.clone(),
                 self.duplex.clone(),
+                None,
             );
             spawn_l0_pipe(
                 wire,
@@ -1012,12 +1312,14 @@ impl L0Client {
             session = %offer.session_id,
             "duplex_offer did not match a local session; sending duplex_reject"
         );
-        if let Some(wire) = self.channel_wire.values().next() {
-            if let Some(keys) = self.peers.values().next() {
+        if let Some(wire) = self.channel_wire.get(&offer.port) {
+            if eip191::eoa_eq(&wire.main_wallet, &offer.main_wallet)
+                && !offer.listen_route_pgp.trim().is_empty()
+            {
                 send_reject = Some((
                     wire.clone(),
                     offer.listen_wallet.clone(),
-                    keys.route.0.clone(),
+                    offer.listen_route_pgp.clone(),
                     offer.key,
                     offer.session_id.clone(),
                 ));
@@ -1040,12 +1342,15 @@ impl L0Client {
                 rejected: true,
                 host_eoa: wire.eoa.clone(),
                 peer_listen_user_pgp: None,
+                peer_listen_route_pgp: Some(route.clone()),
                 peer_listen_wallet: Some(target.clone()),
                 accept_identity: None,
                 peer_return_attached: false,
+                response_chunk_delivered: false,
                 pipe_tx: None,
                 pipe_gen: 0,
                 pipe_connect_inflight: false,
+            pipe_cancel: None,
             };
             spawn_l0_pipe(
                 wire,
@@ -1059,52 +1364,377 @@ impl L0Client {
         }
     }
 
-    fn spawn_dynamic_accept_listen(&self, wire: &ChannelWire, sess: &DuplexSession) {
+    fn spawn_dynamic_accept_listen(
+        &self,
+        wire: &ChannelWire,
+        sess: &DuplexSession,
+        listen_ready: bool,
+    ) -> Option<oneshot::Receiver<()>> {
         let Some(identity) = sess.accept_identity.as_ref() else {
-            return;
+            return None;
         };
+        if listen_ready {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let _ = ready_tx.send(());
+            tracing::info!(
+                session = %sess.session_id,
+                port = sess.port,
+                temporary_wallet = %identity.wallet_address(),
+                "proxy handshake using pre-warmed temporary listen"
+            );
+            return Some(ready_rx);
+        }
         let Some(tx) = self.inbound_feed.clone() else {
             tracing::warn!(
                 session = %sess.session_id,
                 "cannot start temporary duplex listen: inbound feed is unavailable"
             );
+            return None;
+        };
+        let route_key_id = match pgp::transport_key_id_armored(&wire.route_pgp) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    session = %sess.session_id,
+                    error = %err,
+                    "cannot start temporary duplex listen: mailbox route key is invalid"
+                );
+                return None;
+            }
+        };
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let identity = identity.clone();
+        let entries = wire.listen_entries.clone();
+        let route_pgp = wire.route_pgp.clone();
+        let signer = wire.eth.clone();
+        let billing_wallet = wire.main_wallet.clone();
+        let session_id = sess.session_id.clone();
+        let port = sess.port;
+        let rpc = wire.rpc.clone();
+        tokio::spawn(async move {
+            let mut registered = false;
+            for attempt in 1..=5 {
+                match identity
+                    .register_route(
+                        "https://beamio.app/api/regiestChatRoute",
+                        &route_key_id,
+                        Some(rpc.as_str()),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        registered = true;
+                        tracing::info!(
+                            session = %session_id,
+                            port,
+                            temporary_wallet = %identity.wallet_address(),
+                            route_key_id = %route_key_id,
+                            "temporary proxy route registered"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            port,
+                            attempt,
+                            error = %err,
+                            "temporary proxy route registration failed"
+                        );
+                        tokio::time::sleep(Duration::from_secs(
+                            LISTEN_RECONNECT_SECS.saturating_mul(attempt as u64),
+                        ))
+                        .await;
+                    }
+                }
+            }
+            if !registered {
+                return;
+            }
+            // Handshake owns reverse occupy after duplex_accept. Passing a
+            // rebuild here raced spawn_proxy_handshake and 409'd the
+            // initiator mailbox as soon as this temporary SSE came up.
+            if spawn_listen_worker_with_ready(
+                entries,
+                route_pgp,
+                identity.wallet_address().to_owned(),
+                signer.clone(),
+                tx,
+                true,
+                None,
+                Some(billing_wallet),
+                Some(signer),
+                Some(identity.clone()),
+                Some(ready_tx),
+            ) {
+                tracing::info!(
+                    session = %session_id,
+                    port,
+                    temporary_wallet = %identity.wallet_address(),
+                    "started per-line temporary l0_listen"
+                );
+            } else {
+                tracing::warn!(
+                    session = %session_id,
+                    port,
+                    "temporary proxy l0_listen worker failed to start"
+                );
+            }
+        });
+        Some(ready_rx)
+    }
+
+    fn spawn_proxy_handshake(
+        &self,
+        ready: oneshot::Receiver<()>,
+        wire: ChannelWire,
+        target: String,
+        route: String,
+        sess: DuplexSession,
+        initiator_pipe_pgp: String,
+        initial: Vec<u8>,
+    ) {
+        let session_id = sess.session_id.clone();
+        let port = sess.port;
+        let Some(line) = self.proxy_registry.line(&session_id, port).ok().flatten() else {
+            tracing::warn!(
+                session = %session_id,
+                port,
+                "proxy duplex handshake has no configured upstream"
+            );
             return;
         };
-        let rebuild = L0PipeRebuild {
-            duplex: self.duplex.clone(),
-            wires: Arc::new(self.channel_wire.clone()),
-            peers: Arc::new(self.peers.clone()),
-            extras: self.pipe_extras(),
-        };
-        let started = spawn_listen_worker(
-            wire.listen_entries.clone(),
-            wire.route_pgp.clone(),
-            identity.wallet_address().to_owned(),
-            wire.eth.clone(),
-            tx,
-            true,
-            Some(rebuild),
-            Some(wire.main_wallet.clone()),
-            Some(wire.eth.clone()),
-            Some(identity.clone()),
-        );
-        if started {
-            tracing::info!(
-                session = %sess.session_id,
-                port = sess.port,
-                temporary_wallet = %identity.wallet_address(),
-                "started per-line temporary l0_listen"
-            );
+        let (to_upstream, mut from_peer) = mpsc::channel::<Vec<u8>>(64);
+        {
+            let mut receivers = self
+                .proxy_receivers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if receivers.insert(session_id.clone(), to_upstream).is_some() {
+                tracing::debug!(
+                    session = %session_id,
+                    "proxy duplex handshake receiver already exists"
+                );
+                return;
+            }
         }
+        let (from_upstream, mut to_pipe) = mpsc::channel::<Vec<u8>>(64);
+        let receiver_registry = self.proxy_receivers.clone();
+        let session_registry = self.duplex.clone();
+        let duplex = self.duplex.clone();
+        let extras = self.pipe_extras();
+        let seq = self.proxy_seq.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_cleanup = cancel.clone();
+        tokio::spawn(async move {
+            if !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(DYNAMIC_LISTEN_READY_TIMEOUT_SECS),
+                    ready,
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                tracing::warn!(
+                    session = %session_id,
+                    "temporary proxy route/listen did not become ready"
+                );
+                receiver_registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&session_id);
+                retain_duplex_except_session_id(
+                    &mut session_registry
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    &session_id,
+                );
+                return;
+            }
+
+            let (mut upstream, response) =
+                match proxy::connect_upstream_with_initial(&line, &initial).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            error = %err,
+                            "proxy duplex upstream handshake failed"
+                        );
+                        receiver_registry
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&session_id);
+                        retain_duplex_except_session_id(
+                            &mut session_registry
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            &session_id,
+                        );
+                        return;
+                    }
+                };
+
+            // Accept first. Reverse-occupy only if the return pipe is still
+            // empty — listen-up rebuild is skipped for this temp listen, so
+            // an immediate reverse occupy no longer 409s the initiator.
+            // Do not wait for a resume blob: geth/beacon stay paused until
+            // both pipes are up. Later initiator frames still reach
+            // `from_peer` and `run_proxy_stream` writes them upstream.
+            spawn_duplex_accept_chat(
+                wire.clone(),
+                initiator_pipe_pgp,
+                sess.clone(),
+                duplex.clone(),
+                Some(response),
+            );
+
+            let needs_reverse = {
+                let guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+                guard
+                    .values()
+                    .find(|session| session.session_id == session_id)
+                    .map(|session| {
+                        session.pipe_tx.is_none()
+                            && !session.pipe_connect_inflight
+                            && !session.rejected
+                    })
+                    .unwrap_or(false)
+            };
+            if needs_reverse {
+                tracing::info!(
+                    session = %session_id,
+                    "proxy reverse occupy after accept"
+                );
+                spawn_l0_pipe(
+                    wire,
+                    route,
+                    target,
+                    None,
+                    sess,
+                    duplex.clone(),
+                    extras.clone(),
+                );
+            } else {
+                tracing::info!(
+                    session = %session_id,
+                    "proxy skip reverse occupy; pipe already attached"
+                );
+                let _ = (wire, route, target, sess, extras);
+            }
+
+            let pipe_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let pipe_ready = {
+                    let guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+                    guard
+                        .values()
+                        .find(|session| session.session_id == session_id)
+                        .map(|session| session.pipe_tx.is_some() && !session.rejected)
+                        .unwrap_or(false)
+                };
+                if pipe_ready {
+                    break;
+                }
+                if tokio::time::Instant::now() >= pipe_deadline {
+                    tracing::warn!(
+                        session = %session_id,
+                        "proxy reverse occupied pipe did not become ready"
+                    );
+                    receiver_registry
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&session_id);
+                    retain_duplex_except_session_id(
+                        &mut session_registry
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                        &session_id,
+                    );
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            let forward_session = session_id.clone();
+            let forward_duplex = duplex.clone();
+            let forward_seq = seq.clone();
+            tokio::spawn(async move {
+                while let Some(bytes) = to_pipe.recv().await {
+                    let n = forward_seq.fetch_add(1, Ordering::Relaxed);
+                    if let Err(err) =
+                        try_send_proxy_frame(&forward_duplex, &forward_session, n, &bytes)
+                    {
+                        tracing::debug!(
+                            session = %forward_session,
+                            error = %err,
+                            "proxy upstream → occupied pipe failed"
+                        );
+                        break;
+                    }
+                }
+            });
+
+            if let Err(err) =
+                proxy::run_proxy_stream(&session_id, &mut upstream, &mut from_peer, &from_upstream)
+                    .await
+            {
+                tracing::warn!(
+                    session = %session_id,
+                    error = %err,
+                    "proxy duplex stream closed"
+                );
+            }
+            cancel_for_cleanup.store(true, Ordering::Release);
+            receiver_registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&session_id);
+            retain_duplex_except_session_id(
+                &mut session_registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                &session_id,
+            );
+        });
     }
 
     fn apply_duplex_accept(&mut self, accept: duplex::DuplexAccept) {
-        let mut launch: Option<(ChannelWire, String, String, DuplexSession)> = None;
         {
             let mut guard = self.duplex.lock().unwrap_or_else(|p| p.into_inner());
             for sess in guard.values_mut() {
                 if sess.session_id != accept.session_id {
                     continue;
+                }
+                if !eip191::eoa_eq(&accept.billing_wallet, &sess.peer_eoa) {
+                    tracing::warn!(
+                        session = %accept.session_id,
+                        signer = %accept.billing_wallet,
+                        expected = %sess.peer_eoa,
+                        "duplex_accept signer is not this session's proxy main wallet"
+                    );
+                    return;
+                }
+                let now = chrono::Utc::now().timestamp().max(0) as u64;
+                if duplex_offer_is_expired(accept.timestamp, now) {
+                    tracing::warn!(
+                        session = %accept.session_id,
+                        timestamp = accept.timestamp,
+                        now,
+                        "duplex_accept expired; keeping local socket paused"
+                    );
+                    return;
+                }
+                if accept.listen_user_pgp.trim().is_empty()
+                    || accept.listen_route_pgp.trim().is_empty()
+                    || eip191::eoa_eq(&accept.listen_wallet, &accept.billing_wallet)
+                {
+                    tracing::warn!(
+                        session = %accept.session_id,
+                        listen_wallet = %accept.listen_wallet,
+                        "duplex_accept lacks a distinct registered temporary route"
+                    );
+                    return;
                 }
                 if let Some(own) = sess.key {
                     if own != accept.key {
@@ -1122,42 +1752,53 @@ impl L0Client {
                 if !accept.listen_user_pgp.trim().is_empty() {
                     sess.peer_listen_user_pgp = Some(accept.listen_user_pgp.clone());
                 }
+                sess.peer_listen_route_pgp = Some(accept.listen_route_pgp.clone());
                 sess.peer_listen_wallet = Some(accept.listen_wallet.clone());
                 sess.peer_attached = true;
                 sess.rejected = false;
+                if !accept.response_chunk.is_empty() && !sess.response_chunk_delivered {
+                    if let Some(tx) = self
+                        .local_streams
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&accept.session_id)
+                        .cloned()
+                    {
+                        match tx.try_send(accept.response_chunk.clone()) {
+                            Ok(()) => {
+                                sess.response_chunk_delivered = true;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(
+                                    session = %accept.session_id,
+                                    "duplex_accept responseChunk queue is full"
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::warn!(
+                                    session = %accept.session_id,
+                                    "duplex_accept responseChunk local socket closed"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            session = %accept.session_id,
+                            "duplex_accept responseChunk has no local socket"
+                        );
+                    }
+                }
                 tracing::info!(
                     session = %accept.session_id,
                     peer_listen = %accept.listen_wallet,
-                    "duplex_accept on occupied L0 SSE"
+                    "duplex_accept queued responseChunk; occupy after local write"
                 );
-                // Chat may deliver accept before/after the L0 first-blob path;
-                // only open one return pipe.
-                if sess.pipe_tx.is_some() {
-                    break;
-                }
-                if let Some(wire) = self.channel_wire.get(&sess.port) {
-                    if let Some(keys) = self.peers.get(&(sess.dest, sess.port)) {
-                        launch = Some((
-                            wire.clone(),
-                            accept.listen_wallet.clone(),
-                            keys.route.0.clone(),
-                            sess.clone(),
-                        ));
-                    }
-                }
+                // Occupy is owned by the local TCP task after it writes
+                // responseChunk. Do not spawn here: that raced the write and
+                // left geth/beacon paused. The TCP task occupies even when
+                // the local peer has no extra resume bytes yet.
                 break;
             }
-        }
-        if let Some((wire, target, route, sess)) = launch {
-            spawn_l0_pipe(
-                wire,
-                route,
-                target,
-                None,
-                sess,
-                self.duplex.clone(),
-                self.pipe_extras(),
-            );
         }
     }
 
@@ -1470,6 +2111,27 @@ fn load_peer_pgp(
     })
 }
 
+fn inbound_secret_matches_recipients(cert: &Cert, recipients: &[String]) -> bool {
+    if recipients.is_empty() {
+        return true;
+    }
+    match pgp::transport_key_id(cert) {
+        Ok(id) => recipients.iter().any(|r| r.eq_ignore_ascii_case(&id)),
+        Err(_) => false,
+    }
+}
+
+fn insert_peer_pgp_ports(
+    peers: &mut HashMap<(Ipv4Addr, u16), PeerPgp>,
+    dest: Ipv4Addr,
+    explicit_ports: impl IntoIterator<Item = u16>,
+    keys: &PeerPgp,
+) {
+    for port in explicit_ports {
+        peers.insert((dest, port), keys.clone());
+    }
+}
+
 fn spawn_legacy_listen_into(
     cfg: &ValidatedConfig,
     routing_eoa: &str,
@@ -1567,7 +2229,10 @@ fn spawn_channel_listens_into(
     let mut spawned = 0u32;
     for ch in &cfg.l0.channels {
         match pgp::load_secret_cert(&ch.routing_key_file) {
-            Ok(cert) => user_secrets.push(SecretCert(cert)),
+            Ok(cert) => user_secrets.push(SecretCert {
+                cert,
+                wallet: Some(ch.routing_eoa.clone()),
+            }),
             Err(err) => tracing::warn!(
                 eoa = %ch.routing_eoa,
                 error = %err,
@@ -1659,6 +2324,34 @@ fn spawn_listen_worker(
     billing_eth: Option<EthSecret>,
     temporary_identity: Option<crate::l0::identity::TemporaryIdentity>,
 ) -> bool {
+    spawn_listen_worker_with_ready(
+        entries,
+        mailbox_route,
+        routing_eoa,
+        signer_eth,
+        tx,
+        l0_exclusive,
+        pipe_rebuild,
+        billing_wallet,
+        billing_eth,
+        temporary_identity,
+        None,
+    )
+}
+
+fn spawn_listen_worker_with_ready(
+    entries: Vec<String>,
+    mailbox_route: String,
+    routing_eoa: String,
+    signer_eth: EthSecret,
+    tx: mpsc::Sender<String>,
+    l0_exclusive: bool,
+    pipe_rebuild: Option<L0PipeRebuild>,
+    billing_wallet: Option<String>,
+    billing_eth: Option<EthSecret>,
+    temporary_identity: Option<crate::l0::identity::TemporaryIdentity>,
+    mut ready: Option<oneshot::Sender<()>>,
+) -> bool {
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return false;
     };
@@ -1666,55 +2359,12 @@ fn spawn_listen_worker(
         return false;
     };
     handle.spawn(async move {
-        if let Some(identity) = temporary_identity.as_ref() {
-            let route_key_id = match pgp::transport_key_id_armored(&mailbox_route) {
-                Ok(key_id) => key_id,
-                Err(err) => {
-                    tracing::warn!(
-                        eoa = %routing_eoa,
-                        error = %err,
-                        "cannot derive mailbox route key id; refusing unregistered SSE"
-                    );
-                    return;
-                }
-            };
-            let mut registered = false;
-            for attempt in 1..=5 {
-                match identity
-                    .register_route("https://beamio.app/api/regiestChatRoute", &route_key_id)
-                    .await
-                {
-                    Ok(()) => {
-                        registered = true;
-                        tracing::info!(
-                            eoa = %identity.wallet_address(),
-                            route_key_id = %route_key_id,
-                            "temporary route registered"
-                        );
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            eoa = %identity.wallet_address(),
-                            attempt,
-                            error = %err,
-                            "temporary route registration failed"
-                        );
-                        tokio::time::sleep(Duration::from_secs(
-                            LISTEN_RECONNECT_SECS.saturating_mul(attempt as u64),
-                        ))
-                        .await;
-                    }
-                }
-            }
-            if !registered {
-                tracing::warn!(
-                    eoa = %identity.wallet_address(),
-                    "temporary route registration exhausted; refusing SSE"
-                );
-                return;
-            }
-        }
+        // Dynamic duplex identities are registered by
+        // `run_dynamic_local_tcp_stream` before this worker is spawned.
+        // Registering here as well causes a replacement-fee race: the
+        // second request can be rejected with "replacement fee too low",
+        // while the worker still starts an SSE for an unconfirmed route.
+        let _ = temporary_identity;
         let mut last_failed: Option<String> = None;
         loop {
             let Some(entry) = listen::pick_listen_entry(&entries, last_failed.as_deref()) else {
@@ -1750,6 +2400,9 @@ fn spawn_listen_worker(
             match prepared {
                 Ok((url, armor)) => match listen::open_listen_sse(&client, &url, &armor).await {
                     Ok(response) => {
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(());
+                        }
                         last_failed = None;
                         if l0_exclusive {
                             if let Some(ctx) = pipe_rebuild.as_ref() {
@@ -1812,6 +2465,14 @@ fn spawn_listen_worker(
 
 /// Whether a listen SSE reconnect should spawn a fresh outbound `l0_connect`.
 fn should_rebuild_l0_pipe_after_listen_up(sess: &DuplexSession, routing_eoa: &str) -> bool {
+    if sess.dest.is_unspecified() && sess.accept_identity.is_some() {
+        return false;
+    }
+    // Spoke client first occupy is owned by `run_dynamic_local_tcp_stream`
+    // after it writes `responseChunk`. Listen-up must not race that.
+    if sess.accept_identity.is_some() && !sess.dest.is_unspecified() && sess.pipe_gen == 0 {
+        return false;
+    }
     sess.accept_identity
         .as_ref()
         .map(|identity| eip191::eoa_eq(identity.wallet_address(), routing_eoa))
@@ -1834,6 +2495,46 @@ fn duplex_key(dest: Ipv4Addr, port: u16, session_id: &str) -> DuplexKey {
 
 fn duplex_key_of(sess: &DuplexSession) -> DuplexKey {
     duplex_key(sess.dest, sess.port, &sess.session_id)
+}
+
+fn cancel_duplex_pipe(session: &DuplexSession) {
+    if let Some(cancel) = session.pipe_cancel.as_ref() {
+        cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Drop every session whose `session_id` matches and stop its occupy task.
+fn retain_duplex_except_session_id(
+    map: &mut HashMap<DuplexKey, DuplexSession>,
+    session_id: &str,
+) {
+    map.retain(|_, session| {
+        if session.session_id == session_id {
+            cancel_duplex_pipe(session);
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// Current AES key for occupy heartbeats. `Stop` when the session was
+/// retained or rejected so the pipe does not keep sending a spawn-time key.
+fn duplex_pipe_heartbeat(
+    duplex: &Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
+    dest: Ipv4Addr,
+    port: u16,
+    session_id: &str,
+) -> pipe::PipeHeartbeat {
+    let guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.get(&duplex_key(dest, port, session_id)) {
+        None => pipe::PipeHeartbeat::Stop,
+        Some(session) if session.rejected => pipe::PipeHeartbeat::Stop,
+        Some(session) => match session.key {
+            Some(key) => pipe::PipeHeartbeat::Key(key),
+            None => pipe::PipeHeartbeat::Skip,
+        },
+    }
 }
 
 fn duplex_session_by_id(
@@ -1913,6 +2614,413 @@ fn try_send_proxy_frame(
     Ok(())
 }
 
+async fn run_dynamic_local_tcp_stream(
+    stream: TcpStream,
+    duplex: Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
+    local_streams: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    dest: Ipv4Addr,
+    port: u16,
+    wire: ChannelWire,
+    peer_keys: PeerPgp,
+    inbound_feed: Option<mpsc::Sender<String>>,
+    wires: Arc<HashMap<u16, ChannelWire>>,
+    peers: Arc<HashMap<(Ipv4Addr, u16), PeerPgp>>,
+    proxy_registry: proxy::ProxyRegistry,
+    proxy_receivers: Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
+    proxy_seq: Arc<AtomicU64>,
+    ready_pool: Option<Arc<ReadyIdentityPool>>,
+) -> Result<(), L0dError> {
+    // The accepted socket event is the local connection handle.  Allocate
+    // before reading application bytes so concurrent sockets can never share
+    // a port-selected session.
+    let (mut reader, mut writer) = stream.into_split();
+    let mut first_chunk = vec![0u8; 16 * 1024];
+    let first_len = tokio::time::timeout(Duration::from_secs(15), reader.read(&mut first_chunk))
+        .await
+        .map_err(|_| L0dError::Net("local TCP first handshake read timeout".into()))??;
+    if first_len == 0 {
+        return Ok(());
+    }
+    first_chunk.truncate(first_len);
+    // This temporary wallet is listened to by this client, so its AddressPGP
+    // route must be this client's mailbox route. Registering the destination
+    // proxy route here makes the proxy's reverse l0_connect hit the wrong B
+    // and return 404 even though the offer itself was delivered.
+    let (identity, listen_already_up) = match ready_pool.as_ref().and_then(|pool| pool.take()) {
+        Some(identity) => {
+            tracing::info!(
+                eoa = %identity.wallet_address(),
+                session = %identity.session_id,
+                port,
+                "bound local TCP to a pre-warmed temporary identity"
+            );
+            (identity, true)
+        }
+        None => {
+            let identity = crate::l0::identity::TemporaryIdentity::generate()?;
+            let route_key_id = pgp::transport_key_id_armored(&wire.route_pgp)?;
+            let mut registered = false;
+            for attempt in 1..=5 {
+                match identity
+                    .register_route(
+                        "https://beamio.app/api/regiestChatRoute",
+                        &route_key_id,
+                        Some(wire.rpc.as_str()),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        registered = true;
+                        tracing::info!(
+                            eoa = %identity.wallet_address(),
+                            route_key_id = %route_key_id,
+                            "temporary route registered before duplex offer"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            eoa = %identity.wallet_address(),
+                            attempt,
+                            error = %err,
+                            "temporary route registration failed before duplex offer"
+                        );
+                        tokio::time::sleep(Duration::from_secs(
+                            LISTEN_RECONNECT_SECS.saturating_mul(attempt as u64),
+                        ))
+                        .await;
+                    }
+                }
+            }
+            if !registered {
+                return Err(L0dError::L0(
+                    "temporary route registration exhausted before duplex offer".into(),
+                ));
+            }
+            (identity, false)
+        }
+    };
+    let session_id = identity.session_id.clone();
+    let (return_tx, return_rx) = mpsc::channel::<Vec<u8>>(64);
+    {
+        let mut receivers = local_streams.lock().unwrap_or_else(|p| p.into_inner());
+        receivers.insert(session_id.clone(), return_tx);
+    }
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let session = DuplexSession {
+        session_id: session_id.clone(),
+        created_at: now,
+        key: Some(identity.aes_key),
+        dest,
+        port,
+        peer_eoa: peer_keys.peer_eoa.clone(),
+        guest_up: true,
+        peer_attached: false,
+        rejected: false,
+        host_eoa: wire.main_wallet.clone(),
+        peer_listen_user_pgp: None,
+        peer_listen_route_pgp: None,
+        peer_listen_wallet: None,
+        accept_identity: Some(identity.clone()),
+        peer_return_attached: false,
+        response_chunk_delivered: false,
+        pipe_tx: None,
+        pipe_gen: 0,
+        pipe_connect_inflight: false,
+            pipe_cancel: None,
+    };
+    duplex
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(duplex_key(dest, port, &session_id), session.clone());
+    let Some(tx) = inbound_feed.clone() else {
+        return Err(L0dError::L0(
+            "dynamic client l0_listen requires an inbound feed".into(),
+        ));
+    };
+    let extras = PipeExtras {
+        inbound_tx: Some(tx.clone()),
+        proxy_registry,
+        proxy_receivers,
+        proxy_seq,
+    };
+    if !listen_already_up {
+        let rebuild = L0PipeRebuild {
+            duplex: duplex.clone(),
+            wires,
+            peers,
+            extras: extras.clone(),
+        };
+        let (ready_tx, ready_rx) = oneshot::channel();
+        if !spawn_listen_worker_with_ready(
+            wire.listen_entries.clone(),
+            wire.route_pgp.clone(),
+            identity.wallet_address().to_owned(),
+            wire.si_eth.clone(),
+            tx,
+            true,
+            Some(rebuild),
+            Some(wire.main_wallet.clone()),
+            Some(wire.eth.clone()),
+            Some(identity.clone()),
+            Some(ready_tx),
+        ) {
+            return Err(L0dError::L0(
+                "dynamic client l0_listen failed to start".into(),
+            ));
+        }
+        if !matches!(
+            tokio::time::timeout(
+                Duration::from_secs(DYNAMIC_LISTEN_READY_TIMEOUT_SECS),
+                ready_rx,
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            local_streams
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id);
+            retain_duplex_except_session_id(
+                &mut duplex.lock().unwrap_or_else(|p| p.into_inner()),
+                &session_id,
+            );
+            return Err(L0dError::L0(
+                "dynamic client route/listen did not become ready".into(),
+            ));
+        }
+    }
+    spawn_duplex_offer(
+        wire.clone(),
+        peer_keys.user.0,
+        peer_keys.peer_eoa.clone(),
+        session,
+        duplex.clone(),
+        Some(first_chunk),
+    );
+    tracing::info!(
+        session = %session_id,
+        port,
+        temporary_wallet = %identity.wallet_address(),
+        "new local TCP connection allocated a duplex line"
+    );
+    let mut return_rx = return_rx;
+    let mut pending_resume: Vec<Vec<u8>> = Vec::new();
+    let mut read_buf = vec![0u8; 16 * 1024];
+    let mut occupy_spawned = false;
+    let mut local_eof = false;
+    let mut next_seq = 1u64;
+    let mut response_written_at: Option<tokio::time::Instant> = None;
+    let wait_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(DYNAMIC_LISTEN_READY_TIMEOUT_SECS);
+    let (key, pipe_tx) = loop {
+        if tokio::time::Instant::now() >= wait_deadline {
+            local_streams
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id);
+            retain_duplex_except_session_id(
+                &mut duplex.lock().unwrap_or_else(|p| p.into_inner()),
+                &session_id,
+            );
+            return Err(L0dError::L0(
+                "dynamic duplex did not install occupy pipe before timeout".into(),
+            ));
+        }
+        let snapshot = {
+            let guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+            guard.get(&duplex_key(dest, port, &session_id)).cloned()
+        };
+        let Some(sess) = snapshot else {
+            local_streams
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id);
+            return Err(L0dError::L0("dynamic duplex session rejected".into()));
+        };
+        if sess.rejected {
+            local_streams
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&session_id);
+            return Err(L0dError::L0("dynamic duplex session rejected".into()));
+        }
+        if let (Some(key), Some(pipe)) = (sess.key, sess.pipe_tx.clone()) {
+            break (key, pipe);
+        }
+        if !occupy_spawned && sess.peer_attached {
+            if let (Some(key), Some(target), Some(route)) = (
+                sess.key,
+                sess.peer_listen_wallet.clone(),
+                sess.peer_listen_route_pgp.clone(),
+            ) {
+                if response_written_at.is_some() {
+                    let first = if let Some(chunk) = pending_resume.first() {
+                        let framed = frame::encode(next_seq, chunk);
+                        match duplex::seal_frame(&key, &session_id, &framed) {
+                            Ok(blob) => {
+                                pending_resume.remove(0);
+                                next_seq = next_seq.saturating_add(1);
+                                Some(blob)
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    session = %session_id,
+                                    error = %err,
+                                    "failed to seal resume first blob"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    tracing::info!(
+                        session = %session_id,
+                        port,
+                        resume_first = first.is_some(),
+                        pending = pending_resume.len(),
+                        "occupying after responseChunk; local resume optional"
+                    );
+                    spawn_l0_pipe(
+                        wire.clone(),
+                        route,
+                        target,
+                        first,
+                        sess,
+                        duplex.clone(),
+                        extras.clone(),
+                    );
+                    occupy_spawned = true;
+                }
+            }
+        }
+
+        tokio::select! {
+            incoming = return_rx.recv() => {
+                let Some(incoming) = incoming else {
+                    if response_written_at.is_none() {
+                        local_streams
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&session_id);
+                        return Err(L0dError::L0(
+                            "duplex response channel closed before responseChunk".into(),
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                writer.write_all(&incoming).await?;
+                writer.flush().await?;
+                if response_written_at.is_none() {
+                    response_written_at = Some(tokio::time::Instant::now());
+                    tracing::info!(
+                        session = %session_id,
+                        port,
+                        bytes = incoming.len(),
+                        "wrote duplex_accept responseChunk to local TCP before occupy"
+                    );
+                }
+            }
+            read = reader.read(&mut read_buf), if !local_eof => {
+                let n = read?;
+                if n == 0 {
+                    local_eof = true;
+                    if response_written_at.is_none() {
+                        local_streams
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&session_id);
+                        return Err(L0dError::L0(
+                            "local TCP closed before responseChunk".into(),
+                        ));
+                    }
+                    if !occupy_spawned {
+                        tracing::info!(
+                            session = %session_id,
+                            port,
+                            "local TCP EOF after responseChunk; occupy still proceeds"
+                        );
+                    }
+                    continue;
+                }
+                pending_resume.push(read_buf[..n].to_vec());
+                tracing::info!(
+                    session = %session_id,
+                    port,
+                    bytes = n,
+                    buffered = pending_resume.len(),
+                    "buffered local TCP resume bytes before occupy"
+                );
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    };
+
+    for chunk in pending_resume {
+        tracing::info!(
+            session = %session_id,
+            port,
+            bytes = chunk.len(),
+            "local client TCP bytes entering duplex pipe"
+        );
+        let framed = frame::encode(next_seq, &chunk);
+        let blob = duplex::seal_frame(&key, &session_id, &framed)?;
+        pipe_tx
+            .send(blob)
+            .await
+            .map_err(|_| L0dError::L0("occupied duplex pipe closed".into()))?;
+        next_seq = next_seq.saturating_add(1);
+    }
+
+    let result = async {
+        let mut buf = vec![0u8; 16 * 1024];
+        let mut seq = next_seq;
+        loop {
+            tokio::select! {
+                read = reader.read(&mut buf), if !local_eof => {
+                    let n = read?;
+                    if n == 0 {
+                        break;
+                    }
+                    tracing::info!(
+                        session = %session_id,
+                        port,
+                        bytes = n,
+                        "local client TCP bytes entering duplex pipe"
+                    );
+                    let framed = frame::encode(seq, &buf[..n]);
+                    let blob = duplex::seal_frame(&key, &session_id, &framed)?;
+                    pipe_tx
+                        .send(blob)
+                        .await
+                        .map_err(|_| L0dError::L0("occupied duplex pipe closed".into()))?;
+                    seq = seq.saturating_add(1);
+                }
+                incoming = return_rx.recv() => {
+                    let Some(incoming) = incoming else { break };
+                    writer.write_all(&incoming).await?;
+                }
+            }
+        }
+        Ok::<(), L0dError>(())
+    }
+    .await;
+
+    local_streams
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&session_id);
+    let mut guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(mut session) = guard.remove(&duplex_key(dest, port, &session_id)) {
+        cancel_duplex_pipe(&session);
+        session.rejected = true;
+        drop(session.pipe_tx.take());
+    }
+    result
+}
+
 /// When this endpoint is a proxy server for `port`, attach one upstream line to
 /// the newly installed occupy pipe and drain upstream → AES frames.
 fn maybe_start_proxy_drain(
@@ -1920,7 +3028,16 @@ fn maybe_start_proxy_drain(
     duplex: Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
     session_id: String,
     port: u16,
+    cancel: Arc<AtomicBool>,
 ) {
+    if extras.proxy_registry.mode(port) != Some(ProxyMode::Duplex) {
+        tracing::debug!(
+            session = %session_id,
+            port,
+            "request/response proxy does not attach a persistent duplex drain"
+        );
+        return;
+    }
     {
         let receivers = extras
             .proxy_receivers
@@ -1955,10 +3072,33 @@ fn maybe_start_proxy_drain(
     }
     let (from_upstream, mut to_pipe) = mpsc::channel::<Vec<u8>>(64);
     let sid = session_id.clone();
+    let receiver_registry = extras.proxy_receivers.clone();
+    let session_registry = duplex.clone();
     tokio::spawn(async move {
+        tracing::info!(session = %sid, port, "proxy TCP line started");
         if let Err(err) = proxy::run_proxy_line(line, from_peer, from_upstream).await {
-            tracing::debug!(session = %sid, error = %err, "proxy line closed");
+            tracing::warn!(session = %sid, error = %err, "proxy line closed");
+        } else {
+            tracing::info!(session = %sid, "proxy TCP line closed");
         }
+        receiver_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&sid);
+        // The upstream socket is the lifetime boundary of a proxy line.  Do
+        // not leave the occupied duplex session behind after that socket has
+        // closed: clients otherwise find the stale pipe, attach a local TCP
+        // stream to it, and send frames after proxy_receivers was removed.
+        let mut sessions = session_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retain_duplex_except_session_id(&mut sessions, &sid);
+        cancel.store(true, Ordering::Release);
+        tracing::info!(
+            session = %sid,
+            port,
+            "proxy duplex session retired after upstream close"
+        );
     });
     let seq = extras.proxy_seq.clone();
     let duplex_tx = duplex;
@@ -1979,6 +3119,30 @@ fn maybe_start_proxy_drain(
     tracing::info!(session = %session_id, port, "proxy drain attached to occupied pipe");
 }
 
+fn maybe_start_proxy_drain_with_initial(
+    extras: &PipeExtras,
+    duplex: Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
+    session_id: String,
+    port: u16,
+    cancel: Arc<AtomicBool>,
+    initial: Vec<u8>,
+) {
+    maybe_start_proxy_drain(extras, duplex, session_id.clone(), port, cancel);
+    if let Some(tx) = extras
+        .proxy_receivers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&session_id)
+        .cloned()
+    {
+        if tx.try_send(initial).is_err() {
+            tracing::warn!(session = %session_id, "proxy firstChunk queue is full");
+        }
+    } else {
+        tracing::warn!(session = %session_id, "proxy firstChunk receiver unavailable");
+    }
+}
+
 /// True when `offer_timestamp` is too old (or impossibly far in the future)
 /// relative to `now`. Used before any local duplex matching so mailbox replay
 /// cannot open ghost additional-line sessions on a fresh daemon.
@@ -1990,71 +3154,13 @@ fn duplex_offer_is_expired(offer_timestamp: u64, now: u64) -> bool {
         > DUPLEX_OFFER_MAX_AGE_SECS.saturating_add(DUPLEX_OFFER_CLOCK_SKEW_SECS)
 }
 
-/// Mailbox may flush an older process's `duplex_offer` after a live peer:port
-/// line is already occupying. Skip opening another additional line when the
-/// offer timestamp is clearly older than the live session.
-fn duplex_stale_offer_should_skip_additional(
-    guard: &HashMap<DuplexKey, DuplexSession>,
-    peer_eoa: &str,
-    port: u16,
-    offer_timestamp: u64,
-) -> bool {
-    guard.values().any(|s| {
-        s.port == port
-            && s.peer_eoa.eq_ignore_ascii_case(peer_eoa)
-            && s.peer_attached
-            && !s.rejected
-            && (s.pipe_tx.is_some() || s.pipe_connect_inflight)
-            && offer_timestamp.saturating_add(DUPLEX_OFFER_CLOCK_SKEW_SECS) < s.created_at
-    })
-}
-
-/// Tear down other duplex sessions for the same peer EOA + port so their
-/// occupy TCP observes EOF and SI exclusive listen can accept the new line.
-fn retire_conflicting_duplex_sessions(
-    guard: &mut HashMap<DuplexKey, DuplexSession>,
-    proxy_receivers: &Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>,
-    peer_eoa: &str,
-    port: u16,
-    keep_session_id: &str,
-) -> usize {
-    let stale_keys: Vec<DuplexKey> = guard
-        .iter()
-        .filter(|(_, s)| {
-            s.port == port
-                && s.peer_eoa.eq_ignore_ascii_case(peer_eoa)
-                && s.session_id != keep_session_id
-        })
-        .map(|(k, _)| k.clone())
-        .collect();
-    let mut retired = 0usize;
-    for key in stale_keys {
-        if let Some(mut sess) = guard.remove(&key) {
-            sess.rejected = true;
-            sess.peer_attached = false;
-            let sid = sess.session_id.clone();
-            // Dropping the last pipe_tx Sender closes the occupy task Receiver
-            // → TCP EOF → mailbox B releases exclusive listen for this peer.
-            drop(sess.pipe_tx.take());
-            proxy_receivers
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&sid);
-            tracing::info!(
-                session = %sid,
-                peer = %peer_eoa,
-                port,
-                keep = %keep_session_id,
-                "retired conflicting duplex session"
-            );
-            retired += 1;
-        }
-    }
-    retired
-}
-
 fn duplex_duplicate_offer_should_ignore(sess: &DuplexSession, had_key: bool) -> bool {
-    had_key && (sess.pipe_tx.is_some() || sess.rejected || sess.pipe_connect_inflight)
+    // Chat and idle-L0 listens can deliver the same user-PGP offer. Once the
+    // mainWallet handler has allocated the keyed session, every non-rejected
+    // copy is idempotent—even while temporary route propagation or the first
+    // l0_connect is still pending. Rejecting that second copy tears down the
+    // valid first handshake.
+    had_key && !sess.rejected
 }
 
 fn l0_pipe_retry_secs(err: &L0dError) -> u64 {
@@ -2101,10 +3207,15 @@ fn rebuild_l0_pipes_after_listen_up(routing_eoa: &str, ctx: &L0PipeRebuild) {
         let Some(wire) = ctx.wires.get(&sess.port).cloned() else {
             continue;
         };
-        let Some(keys) = ctx.peers.get(&(sess.dest, sess.port)) else {
+        let Some(target) = sess.peer_listen_wallet.clone() else {
             continue;
         };
-        let Some(target) = sess.peer_listen_wallet.clone() else {
+        let peer_route_pgp = sess.peer_listen_route_pgp.clone().or_else(|| {
+            ctx.peers
+                .get(&(sess.dest, sess.port))
+                .map(|keys| keys.route.0.clone())
+        });
+        let Some(peer_route_pgp) = peer_route_pgp else {
             continue;
         };
         tracing::info!(
@@ -2115,7 +3226,7 @@ fn rebuild_l0_pipes_after_listen_up(routing_eoa: &str, ctx: &L0PipeRebuild) {
         );
         spawn_l0_pipe(
             wire,
-            keys.route.0.clone(),
+            peer_route_pgp,
             target,
             None,
             sess,
@@ -2206,6 +3317,7 @@ fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
                     listen_entries: listen_entries.clone(),
                     entries: cfg.l0.entries.clone(),
                     user_pub: user_pub.clone(),
+                    rpc: cfg.l0.rpc.clone(),
                 },
             );
         }
@@ -2251,6 +3363,7 @@ fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
                 listen_entries: cfg.l0.listen_entries.clone(),
                 entries: cfg.l0.entries.clone(),
                 user_pub: user_pub.clone(),
+                rpc: cfg.l0.rpc.clone(),
             },
         );
     }
@@ -2277,8 +3390,10 @@ fn spawn_duplex_runtime(
                     continue;
                 };
                 for port in peer.tcp_ports.iter().chain(peer.udp_ports.iter()) {
-                    // Ports owned by `--client` are seeded below as always-initiator.
-                    if cfg.clients.iter().any(|c| {
+                    // Explicit client endpoints own this logical port. Plain
+                    // `--client` is P1 only and must not inherit the peer
+                    // duplex seed; `--clientDuplex` is seeded below.
+                    if cfg.clients.iter().chain(cfg.client_duplex.iter()).any(|c| {
                         c.port == *port
                             && matches!(&c.host, LocatorHost::Eoa(e) if eip191::eoa_eq(e, peer_eoa))
                     }) {
@@ -2312,84 +3427,23 @@ fn spawn_duplex_runtime(
                             // Pending match compares host_eoa to offer.main_wallet.
                             host_eoa: wire.main_wallet.clone(),
                             peer_listen_user_pgp: None,
+                            peer_listen_route_pgp: None,
                             peer_listen_wallet: None,
                             accept_identity: None,
                             peer_return_attached: false,
+                            response_chunk_delivered: false,
                             pipe_tx: None,
                             pipe_gen: 0,
                             pipe_connect_inflight: false,
+            pipe_cancel: None,
                         },
                     );
                 }
             }
         }
-        // `--client web3://<mainWallet>:port` always initiates toward that
-        // mainWallet:port (independent of EOA lexicographic order).
-        for client in &cfg.clients {
-            let LocatorHost::Eoa(peer_eoa) = &client.host else {
-                tracing::warn!(
-                    target = %client.display(),
-                    "client target tag hosts are not seeded yet; use an EOA"
-                );
-                continue;
-            };
-            let Some(peer) = cfg.peers.iter().find(|p| match &p.locator.host {
-                LocatorHost::Eoa(e) => eip191::eoa_eq(e, peer_eoa),
-                LocatorHost::Tag(_) => false,
-            }) else {
-                tracing::warn!(
-                    target = %client.display(),
-                    "client target has no matching peer VIP; duplex not seeded"
-                );
-                continue;
-            };
-            let Some(wire) = wires.get(&client.port) else {
-                continue;
-            };
-            if !peers.contains_key(&(peer.vip, client.port)) {
-                tracing::warn!(
-                    target = %client.display(),
-                    vip = %peer.vip,
-                    "client target missing peer PGP for port; duplex not seeded"
-                );
-                continue;
-            }
-            let already = map.values().any(|s| {
-                s.dest == peer.vip && s.port == client.port && eip191::eoa_eq(&s.peer_eoa, peer_eoa)
-            });
-            if already {
-                continue;
-            }
-            let session_id = duplex::new_pipe_handle();
-            let key = Some(aes::generate_key());
-            tracing::info!(
-                target = %client.display(),
-                vip = %peer.vip,
-                "seeded duplex initiator from --client"
-            );
-            map.insert(
-                duplex_key(peer.vip, client.port, &session_id),
-                DuplexSession {
-                    session_id,
-                    created_at: chrono::Utc::now().timestamp().max(0) as u64,
-                    key,
-                    dest: peer.vip,
-                    port: client.port,
-                    peer_eoa: peer_eoa.clone(),
-                    guest_up: true,
-                    peer_attached: false,
-                    rejected: false,
-                    host_eoa: wire.main_wallet.clone(),
-                    peer_listen_user_pgp: None,
-                    peer_listen_wallet: None,
-                    accept_identity: None,
-                    peer_return_attached: false,
-                    pipe_tx: None,
-                    pipe_gen: 0,
-                    pipe_connect_inflight: false,
-                },
-            );
-        }
+        // `--clientDuplex` is connection-driven.  Do not seed one session per
+        // logical port here: the local TCP listener allocates a fresh
+        // temporary identity and pipe for every accepted socket.
     }
 
     let snapshot: Vec<DuplexSession> = {
@@ -2416,6 +3470,7 @@ fn spawn_duplex_runtime(
                 peer_eoa.clone(),
                 sess,
                 duplex.clone(),
+                None,
             );
         }
     }
@@ -2462,6 +3517,7 @@ fn spawn_duplex_offer(
     peer_eoa: String,
     sess: DuplexSession,
     duplex: Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
+    first_chunk: Option<Vec<u8>>,
 ) {
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return;
@@ -2473,6 +3529,17 @@ fn spawn_duplex_offer(
     let dest = sess.dest;
     let port = sess.port;
     let session_id = sess.session_id.clone();
+    let (initiator_wallet, listen_wallet, listen_user_pgp) = sess
+        .accept_identity
+        .as_ref()
+        .map(|identity| {
+            (
+                identity.wallet_address().to_owned(),
+                identity.wallet_address().to_owned(),
+                identity.user_public_armor.clone(),
+            )
+        })
+        .unwrap_or_else(|| (wire.eoa.clone(), wire.eoa.clone(), wire.user_pub.clone()));
     handle.spawn(async move {
         loop {
             match duplex_session_by_id(&duplex, dest, port, &session_id) {
@@ -2493,20 +3560,30 @@ fn spawn_duplex_offer(
             }
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
             match duplex::encode_offer_command_for_port(
-                &wire.eoa,
+                &initiator_wallet,
+                wire.eth.address(),
                 &peer_eoa,
                 &peer_eoa,
-                &wire.eoa,
-                &wire.user_pub,
+                &listen_wallet,
+                &listen_user_pgp,
+                &wire.route_pgp,
                 sess.port,
                 &session_id,
                 &key,
                 ts,
+                first_chunk.as_deref(),
             )
             .and_then(|cmd| duplex::wrap_offer_for_user_pgp(&cmd, &peer_user_pgp, &wire.eth))
             {
                 Ok(armor) => {
-                    tracing::info!(session = %session_id, "duplex_offer POST (periodic until accept)");
+                    let expected = pgp::transport_key_id_armored(&peer_user_pgp).ok();
+                    let recipients = pgp::pkesk_recipient_key_ids(&armor).unwrap_or_default();
+                    tracing::info!(
+                        session = %session_id,
+                        expected_peer_key_id = ?expected,
+                        pkesk_recipients = ?recipients,
+                        "duplex_offer POST (periodic until accept)"
+                    );
                     post_control_armor_with_retry(&entries, &armor, "duplex_offer").await;
                 }
                 Err(err) => tracing::warn!(error = %err, session = %session_id, "duplex_offer wrap refused"),
@@ -2521,6 +3598,7 @@ fn spawn_duplex_accept_chat(
     initiator_pipe_pgp: String,
     sess: DuplexSession,
     duplex: Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
+    response_chunk: Option<Vec<u8>>,
 ) {
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return;
@@ -2566,11 +3644,14 @@ fn spawn_duplex_accept_chat(
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
             match duplex::encode_accept_command(
                 &accept_wallet,
+                wire.eth.address(),
                 &accept_wallet,
                 &accept_user_pgp,
+                &wire.route_pgp,
                 &session_id,
                 &key,
                 ts,
+                response_chunk.as_deref(),
             )
             .and_then(|cmd| duplex::wrap_accept_for_user_pgp(&cmd, &initiator_pipe_pgp, &wire.eth))
             {
@@ -2699,6 +3780,7 @@ fn spawn_l0_pipe(
                 drop(tx);
                 Some(cloned)
             };
+            let cancel = Arc::new(AtomicBool::new(false));
             let gen = if oneshot_reject {
                 None
             } else {
@@ -2710,39 +3792,61 @@ fn spawn_l0_pipe(
                     return;
                 }
                 live.pipe_gen = live.pipe_gen.wrapping_add(1);
+                live.pipe_cancel = Some(cancel.clone());
                 Some(live.pipe_gen)
             };
             let duplex_up = duplex.clone();
             let session_up = session_id.clone();
             let extras_up = extras.clone();
+            // Install the proxy receiver before opening the occupied pipe.
+            // The peer may send its first duplex frame immediately after the
+            // HTTP 200 response; waiting until pipe_tx is installed creates a
+            // receive-side race where apply_duplex_frame has nowhere to queue
+            // that first payload.
+            maybe_start_proxy_drain(
+                &extras_up,
+                duplex_up.clone(),
+                session_up.clone(),
+                port,
+                cancel.clone(),
+            );
             match pipe::run_occupied_pipe(
                 &entries,
                 &connect_armor,
                 &session_id,
-                sess.key,
+                {
+                    let duplex_hb = duplex.clone();
+                    let sid_hb = session_id.clone();
+                    move || duplex_pipe_heartbeat(&duplex_hb, dest, port, &sid_hb)
+                },
                 first_blob.take(),
                 rx,
                 extras.inbound_tx.clone(),
-                || {
-                    let (Some(gen), Some(tx_install)) = (gen, tx_after_http.as_ref()) else {
-                        return;
-                    };
-                    let mut guard = duplex_up.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(live) = guard.get_mut(&duplex_key(dest, port, &session_up)) {
-                        if live.pipe_gen == gen && live.peer_attached && !live.rejected {
-                            live.pipe_tx = Some(tx_install.clone());
-                            tracing::info!(
-                                session = %session_up,
-                                port,
-                                "l0_connect HTTP 200; pipe_tx installed"
-                            );
-                            drop(guard);
-                            maybe_start_proxy_drain(
-                                &extras_up,
-                                duplex_up.clone(),
-                                session_up.clone(),
-                                port,
-                            );
+                cancel.clone(),
+                {
+                    let cancel_up = cancel.clone();
+                    move || {
+                        let (Some(gen), Some(tx_install)) = (gen, tx_after_http.as_ref()) else {
+                            return;
+                        };
+                        let mut guard = duplex_up.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(live) = guard.get_mut(&duplex_key(dest, port, &session_up)) {
+                            if live.pipe_gen == gen && live.peer_attached && !live.rejected {
+                                live.pipe_tx = Some(tx_install.clone());
+                                tracing::info!(
+                                    session = %session_up,
+                                    port,
+                                    "l0_connect HTTP 200; pipe_tx installed"
+                                );
+                                drop(guard);
+                                maybe_start_proxy_drain(
+                                    &extras_up,
+                                    duplex_up.clone(),
+                                    session_up.clone(),
+                                    port,
+                                    cancel_up.clone(),
+                                );
+                            }
                         }
                     }
                 },
@@ -2786,6 +3890,125 @@ fn spawn_l0_pipe(
             }
         }
     });
+}
+
+fn spawn_ready_identity_warmers(
+    pools: &HashMap<u16, Arc<ReadyIdentityPool>>,
+    wires: &HashMap<u16, ChannelWire>,
+    inbound_feed: Option<mpsc::Sender<String>>,
+) {
+    let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+        return;
+    };
+    let Some(inbound_tx) = inbound_feed else {
+        return;
+    };
+    for (port, pool) in pools {
+        let Some(wire) = wires.get(port).cloned() else {
+            continue;
+        };
+        let port = *port;
+        let pool = pool.clone();
+        let inbound_tx = inbound_tx.clone();
+        handle.spawn(async move {
+            loop {
+                let claimed = pool.ready_len() + pool.warming.load(Ordering::Relaxed) as usize;
+                if claimed >= READY_IDENTITY_POOL_TARGET {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                pool.warming.fetch_add(1, Ordering::Relaxed);
+                match warm_one_ready_identity(&wire, inbound_tx.clone()).await {
+                    Ok(identity) => {
+                        tracing::info!(
+                            port,
+                            temporary_wallet = %identity.wallet_address(),
+                            ready = pool.ready_len() + 1,
+                            "pre-warmed temporary identity is listen-ready"
+                        );
+                        pool.push(identity);
+                    }
+                    Err(err) => {
+                        tracing::warn!(port, error = %err, "temporary identity pre-warm failed");
+                        tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
+                    }
+                }
+                pool.warming.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+    }
+}
+
+async fn warm_one_ready_identity(
+    wire: &ChannelWire,
+    inbound_tx: mpsc::Sender<String>,
+) -> Result<crate::l0::identity::TemporaryIdentity, L0dError> {
+    let identity = crate::l0::identity::TemporaryIdentity::generate()?;
+    let route_key_id = pgp::transport_key_id_armored(&wire.route_pgp)?;
+    let mut registered = false;
+    for attempt in 1..=5 {
+        match identity
+            .register_route(
+                "https://beamio.app/api/regiestChatRoute",
+                &route_key_id,
+                Some(wire.rpc.as_str()),
+            )
+            .await
+        {
+            Ok(()) => {
+                registered = true;
+                break;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    eoa = %identity.wallet_address(),
+                    attempt,
+                    error = %err,
+                    "temporary identity pre-warm registration failed"
+                );
+                tokio::time::sleep(Duration::from_secs(
+                    LISTEN_RECONNECT_SECS.saturating_mul(attempt as u64),
+                ))
+                .await;
+            }
+        }
+    }
+    if !registered {
+        return Err(L0dError::L0(
+            "temporary identity pre-warm registration exhausted".into(),
+        ));
+    }
+    let (ready_tx, ready_rx) = oneshot::channel();
+    if !spawn_listen_worker_with_ready(
+        wire.listen_entries.clone(),
+        wire.route_pgp.clone(),
+        identity.wallet_address().to_owned(),
+        wire.si_eth.clone(),
+        inbound_tx,
+        true,
+        None,
+        Some(wire.main_wallet.clone()),
+        Some(wire.eth.clone()),
+        Some(identity.clone()),
+        Some(ready_tx),
+    ) {
+        return Err(L0dError::L0(
+            "temporary identity pre-warm listen failed to start".into(),
+        ));
+    }
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(DYNAMIC_LISTEN_READY_TIMEOUT_SECS),
+            ready_rx,
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return Err(L0dError::L0(
+            "temporary identity pre-warm listen did not become ready".into(),
+        ));
+    }
+    Ok(identity)
 }
 
 fn spawn_post_worker(entries: Vec<String>) -> Option<mpsc::Sender<PostJob>> {
@@ -2875,7 +4098,44 @@ mod tests {
             proxy_registry: proxy::ProxyRegistry::new(Vec::new()),
             proxy_receivers: Arc::new(Mutex::new(HashMap::new())),
             proxy_seq: Arc::new(AtomicU64::new(1)),
+            local_streams: Arc::new(Mutex::new(HashMap::new())),
+            ready_identities: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn explicit_peer_port_pgp_is_not_clobbered_by_same_wallet_supplement() {
+        let dest = Ipv4Addr::new(100, 64, 0, 6);
+        let geth = PeerPgp {
+            user: ArmoredCert("geth-user".into()),
+            route: ArmoredCert("geth-route".into()),
+            peer_eoa: "0x1111111111111111111111111111111111111111".into(),
+        };
+        let beacon = PeerPgp {
+            user: ArmoredCert("beacon-user".into()),
+            route: ArmoredCert("beacon-route".into()),
+            peer_eoa: "0x1111111111111111111111111111111111111111".into(),
+        };
+
+        for reverse in [false, true] {
+            let mut peers = HashMap::new();
+            let rows = if reverse {
+                vec![(4200, beacon.clone()), (8400, geth.clone())]
+            } else {
+                vec![(8400, geth.clone()), (4200, beacon.clone())]
+            };
+            for (explicit_port, keys) in rows {
+                insert_peer_pgp_ports(&mut peers, dest, [explicit_port], &keys);
+            }
+
+            assert_eq!(peers[&(dest, 8400)].user.0, "geth-user");
+            assert_eq!(peers[&(dest, 4200)].user.0, "beacon-user");
+        }
+
+        let mut only_beacon = HashMap::new();
+        insert_peer_pgp_ports(&mut only_beacon, dest, [4200], &beacon);
+        assert!(only_beacon.get(&(dest, 8400)).is_none());
+        assert_eq!(only_beacon[&(dest, 4200)].user.0, "beacon-user");
     }
 
     #[test]
@@ -2929,12 +4189,15 @@ mod tests {
                 rejected: false,
                 host_eoa: "0x1111111111111111111111111111111111111111".into(),
                 peer_listen_user_pgp: None,
+                peer_listen_route_pgp: None,
                 peer_listen_wallet: None,
                 accept_identity: None,
                 peer_return_attached: false,
+                response_chunk_delivered: false,
                 pipe_tx: None,
                 pipe_gen: 0,
                 pipe_connect_inflight: false,
+            pipe_cancel: None,
             },
         );
         let prepared = client
@@ -2968,12 +4231,15 @@ mod tests {
                 rejected: false,
                 host_eoa: "0x1111111111111111111111111111111111111111".into(),
                 peer_listen_user_pgp: None,
+                peer_listen_route_pgp: None,
                 peer_listen_wallet: Some("0x2222222222222222222222222222222222222222".into()),
                 accept_identity: None,
                 peer_return_attached: false,
+                response_chunk_delivered: false,
                 pipe_tx: Some(tx),
                 pipe_gen: 1,
                 pipe_connect_inflight: false,
+            pipe_cancel: None,
             },
         );
         let prepared = client
@@ -3013,12 +4279,15 @@ mod tests {
                 rejected: false,
                 host_eoa: "0x1111111111111111111111111111111111111111".into(),
                 peer_listen_user_pgp: None,
+                peer_listen_route_pgp: None,
                 peer_listen_wallet: None,
                 accept_identity: None,
                 peer_return_attached: false,
+                response_chunk_delivered: false,
                 pipe_tx: None,
                 pipe_gen: 0,
                 pipe_connect_inflight: false,
+            pipe_cancel: None,
             },
         );
         let json = serde_json::json!({
@@ -3057,7 +4326,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
         let mut client = L0Client {
             enabled: true,
-            user_secrets: vec![SecretCert(user)],
+            user_secrets: vec![SecretCert::unscoped(user)],
             tun_tx: Some(tx),
             routing_eoa: "0x1111111111111111111111111111111111111111".into(),
             ..L0Client::disabled()
@@ -3118,7 +4387,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
         let mut client = L0Client {
             enabled: true,
-            user_secrets: vec![SecretCert(user)],
+            user_secrets: vec![SecretCert::unscoped(user)],
             tun_tx: Some(tx),
             routing_eoa: "0x1111111111111111111111111111111111111111".into(),
             ..L0Client::disabled()
@@ -3199,7 +4468,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
         let mut client = L0Client {
             enabled: true,
-            user_secrets: vec![SecretCert(first), SecretCert(second)],
+            user_secrets: vec![SecretCert::unscoped(first), SecretCert::unscoped(second)],
             tun_tx: Some(tx),
             routing_eoa: "0x1111111111111111111111111111111111111111".into(),
             ..L0Client::disabled()
@@ -3255,6 +4524,62 @@ mod tests {
         drop(tx);
     }
 
+    #[test]
+    fn retain_duplex_stops_pipe_cancel() {
+        let dest = Ipv4Addr::new(100, 64, 0, 6);
+        let port = 4200;
+        let sid = "retain-sid";
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut sess = sample_duplex_session(true);
+        sess.session_id = sid.into();
+        sess.dest = dest;
+        sess.port = port;
+        sess.pipe_cancel = Some(cancel.clone());
+        let mut map = HashMap::new();
+        map.insert(duplex_key(dest, port, sid), sess);
+        retain_duplex_except_session_id(&mut map, sid);
+        assert!(map.is_empty());
+        assert!(cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn heartbeat_reads_current_map_key_not_spawn_snapshot() {
+        let dest = Ipv4Addr::new(100, 64, 0, 6);
+        let port = 4200;
+        let sid = "hb-sid";
+        let key_a = [1u8; aes::KEY_LEN];
+        let key_b = [2u8; aes::KEY_LEN];
+        let mut sess = sample_duplex_session(false);
+        sess.session_id = sid.into();
+        sess.dest = dest;
+        sess.port = port;
+        sess.key = Some(key_a);
+        let duplex = Arc::new(Mutex::new(HashMap::new()));
+        duplex
+            .lock()
+            .unwrap()
+            .insert(duplex_key(dest, port, sid), sess);
+        assert_eq!(
+            duplex_pipe_heartbeat(&duplex, dest, port, sid),
+            crate::l0::pipe::PipeHeartbeat::Key(key_a)
+        );
+        duplex
+            .lock()
+            .unwrap()
+            .get_mut(&duplex_key(dest, port, sid))
+            .expect("session")
+            .key = Some(key_b);
+        assert_eq!(
+            duplex_pipe_heartbeat(&duplex, dest, port, sid),
+            crate::l0::pipe::PipeHeartbeat::Key(key_b)
+        );
+        retain_duplex_except_session_id(&mut duplex.lock().unwrap(), sid);
+        assert_eq!(
+            duplex_pipe_heartbeat(&duplex, dest, port, sid),
+            crate::l0::pipe::PipeHeartbeat::Stop
+        );
+    }
+
     fn sample_duplex_session(pipe_active: bool) -> DuplexSession {
         DuplexSession {
             session_id: "sess".into(),
@@ -3268,9 +4593,11 @@ mod tests {
             rejected: false,
             host_eoa: "0x1111111111111111111111111111111111111111".into(),
             peer_listen_user_pgp: None,
+            peer_listen_route_pgp: None,
             peer_listen_wallet: Some("0x2222222222222222222222222222222222222222".into()),
             accept_identity: None,
             peer_return_attached: false,
+            response_chunk_delivered: false,
             pipe_tx: if pipe_active {
                 let (tx, _rx) = mpsc::channel(1);
                 Some(tx)
@@ -3279,6 +4606,7 @@ mod tests {
             },
             pipe_gen: 0,
             pipe_connect_inflight: false,
+            pipe_cancel: None,
         }
     }
 
@@ -3316,7 +4644,10 @@ mod tests {
         sess.pipe_connect_inflight = true;
         assert!(duplex_duplicate_offer_should_ignore(&sess, true));
         sess.pipe_connect_inflight = false;
+        assert!(duplex_duplicate_offer_should_ignore(&sess, true));
+        sess.rejected = true;
         assert!(!duplex_duplicate_offer_should_ignore(&sess, true));
+        assert!(!duplex_duplicate_offer_should_ignore(&sess, false));
     }
 
     #[test]
@@ -3332,59 +4663,6 @@ mod tests {
             now + DUPLEX_OFFER_CLOCK_SKEW_SECS + 1,
             now
         ));
-    }
-
-    #[test]
-    fn stale_offer_skipped_when_live_peer_port_newer() {
-        let dest = Ipv4Addr::new(100, 64, 0, 6);
-        let mut live = sample_duplex_session(true);
-        live.created_at = 1_700_000_100;
-        live.peer_eoa = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
-        live.port = 4200;
-        let map = HashMap::from([(duplex_key(dest, 4200, &live.session_id), live)]);
-        assert!(duplex_stale_offer_should_skip_additional(
-            &map,
-            "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa",
-            4200,
-            1_700_000_000, // older than live.created_at - skew
-        ));
-        assert!(!duplex_stale_offer_should_skip_additional(
-            &map,
-            "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa",
-            4200,
-            1_700_000_100, // same era as live
-        ));
-        assert!(!duplex_stale_offer_should_skip_additional(
-            &map,
-            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            4200,
-            1_700_000_000,
-        ));
-    }
-
-    #[test]
-    fn retire_conflicting_sessions_drops_pipe_tx_for_same_peer_port() {
-        let dest = Ipv4Addr::new(100, 64, 0, 6);
-        let peer = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut ghost = sample_duplex_session(true);
-        ghost.session_id = "ghost".into();
-        ghost.peer_eoa = peer.into();
-        ghost.port = 4200;
-        ghost.dest = dest;
-        let mut keep = sample_duplex_session(false);
-        keep.session_id = "keep".into();
-        keep.peer_eoa = peer.into();
-        keep.port = 4200;
-        keep.dest = dest;
-        let mut map = HashMap::from([
-            (duplex_key(dest, 4200, "ghost"), ghost),
-            (duplex_key(dest, 4200, "keep"), keep),
-        ]);
-        let proxy = Arc::new(Mutex::new(HashMap::new()));
-        let n = retire_conflicting_duplex_sessions(&mut map, &proxy, peer, 4200, "keep");
-        assert_eq!(n, 1);
-        assert!(map.contains_key(&duplex_key(dest, 4200, "keep")));
-        assert!(!map.contains_key(&duplex_key(dest, 4200, "ghost")));
     }
 
     #[test]
@@ -3453,6 +4731,37 @@ mod tests {
         assert!(should_rebuild_l0_pipe_after_listen_up(
             &sample_duplex_session(false),
             routing
+        ));
+    }
+
+    #[test]
+    fn rebuild_skips_proxy_handshake_temp_listen() {
+        let routing = "0x1111111111111111111111111111111111111111";
+        let mut sess = sample_duplex_session(false);
+        sess.dest = Ipv4Addr::UNSPECIFIED;
+        sess.accept_identity = Some(crate::l0::identity::TemporaryIdentity::generate().unwrap());
+        assert!(!should_rebuild_l0_pipe_after_listen_up(&sess, routing));
+    }
+
+    #[test]
+    fn rebuild_skips_spoke_first_occupy_until_resume() {
+        let mut sess = sample_duplex_session(false);
+        sess.accept_identity = Some(crate::l0::identity::TemporaryIdentity::generate().unwrap());
+        sess.pipe_gen = 0;
+        assert!(!should_rebuild_l0_pipe_after_listen_up(
+            &sess,
+            sess.accept_identity
+                .as_ref()
+                .unwrap()
+                .wallet_address()
+        ));
+        sess.pipe_gen = 1;
+        assert!(should_rebuild_l0_pipe_after_listen_up(
+            &sess,
+            sess.accept_identity
+                .as_ref()
+                .unwrap()
+                .wallet_address()
         ));
     }
 

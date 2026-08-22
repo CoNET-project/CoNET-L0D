@@ -11,13 +11,15 @@ It does **not** patch geth, Prysm `beacon-chain`, or `validator`.
 ## Dynamic proxy lines
 
 `l0.billing_eoa`/`billing_eth_key_file` identify the main paid account. A
-duplex request is addressed by `mainWallet:port` and signed by the main paid
-wallet. The server allocates the temporary communication identity only after
-matching that pair; the temporary identity is never used as the payer.
+duplex line is allocated only by an explicit new-line request addressed to
+`mainWallet:port` and signed by the main paid wallet. The temporary
+communication identity is allocated and registered during that request, before
+any offer is processed; it is never used as the payer.
 
 Each `[[l0.proxies]]` entry is an upstream `host` plus `port`. The port is the
-logical L0 port. Every accepted request must have its own temporary wallet,
-OpenPGP route identity, AES key, session/pipe handle, and occupied socket.
+logical L0 port. Every explicit new-line request must have its own temporary
+wallet, OpenPGP route identity, AES key, session/pipe handle, and occupied
+socket.
 Temporary identities are memory-only, are registered before they are used for
 routing, and are destroyed on EOF, failed HTTP status headers, timeout, or
 socket close. Multiple lines may use the same logical port, but no wallet,
@@ -28,22 +30,61 @@ configured upstream `host:port` with bounded async bidirectional copying; it
 does not use iptables DNAT and it does not save offline data. A failed line is
 isolated from other sessions on the same port.
 
-**Proxy-only server:** when `[[l0.proxies]]` is set and no `--client` / `l0.clients`
-are configured (`proxy_server_only`), the daemon **still owns TUN + iptables** so
-`--client` peers that seal **IPv4** datagrams on the occupy pipe can complete
-overlay TCP (hub VIP + listen-DNAT as needed). `[[l0.proxies]]` drains **non-IPv4**
-raw stream bytes to `host:port`. Do not stuff full IPv4 packets into the proxy
-upstream queue. Multi-port proxy (e.g. `:8400` + `:4200`) **must** use a distinct
+**Proxy-only server:** when `[[l0.proxies]]` or `[[l0.proxy_duplex]]` is set and
+no client is configured (`proxy_server_only`), the daemon does **not** create a
+TUN, route, or iptables chain. `--proxyDuplex` drains the occupied raw stream to
+its configured `host:port`; `--proxy` remains the request/response target table
+and never attaches a persistent duplex drain. Do not stuff full IPv4 packets into
+the proxy upstream queue. Multi-port proxy (e.g. `:8400` + `:4200`) **must** use a distinct
 `[[l0.channels]]` routing EOA per port: SI exclusive occupy is **one pipe per
 listen wallet**. Empty channels collapse every port onto `billing_eoa` / identity
 locator and cause sustained `l0_connect` **HTTP 409**. Inbound `duplex_offer`
-matching uses `billing_eoa` (`mainWallet:port`), not the per-port channel EOA.
+matching uses `billing_eoa` (`mainWallet:port`), not the per-port channel EOA,
+but that match is only a routing lookup. It never authorizes allocation:
+offers may attach only to a pre-registered `pipe_handle` or temporary
+`listenWallet`; unknown, stale, or ambiguous offers are rejected without
+creating a session, wallet, or `l0_connect`.
 
-**Client intercept:** `--client 'web3://<peerMainWallet>:port'` (or `l0.clients`)
-seeds an independent pending duplex line keyed by that peer EOA + port, even
-when the port is absent from `peers.*.ports`. The client still uses TUN +
-overlay VIP so local geth/beacon dial the peer VIP; AES frames on the occupy
-pipe carry IPv4 (TUN) or raw proxy bytes when the peer runs proxy mode.
+**Client endpoint:** `--client 'web3://<peerMainWallet>:port'` (or
+`l0.clients`) maps the peer to the daemon-selected local virtual endpoint
+(`local_vip:port`, for example `100.64.0.5:4000`) for request/response P1
+traffic. L0d owns the TUN and routing rules; client applications must connect
+to the printed local endpoint and do not need separate iptables rules.
+Use `--clientDuplex` (or `l0.client_duplex`) to seed an independent pending
+occupied bidirectional line. Both target types are included in local mappings,
+but only `client_duplex` enables duplex seeding.
+
+### Connection-driven duplex client handles
+
+For `--clientDuplex`, the local TCP `accept()` event is the only connection
+handle. The daemon does not pre-create one duplex session per logical port and
+does not select a session by port. Each newly accepted socket gets a fresh
+temporary wallet, OpenPGP identity, AES key, opaque `pipe_handle`, local
+return queue, and occupied `l0_connect` line. The temporary route is
+registered before the offer is posted to the peer. `regiestChatRoute` HTTP
+200 is not SI `isMyRoute`; wait until AddressPGP `searchKey` shows the
+registered `routeKeyID` on CoNET RPC, then open `l0_listen`. Wrap
+`duplex_offer` to the destination user PGP for that `mainWallet:port` and
+select the inbound decrypt secret from PKESK recipients, not listen-wallet
+list order.
+
+All bytes read from that socket stay attached to that handle until EOF or
+socket error. Bytes received from the peer are written only to the same local
+socket. Concurrent sockets connecting to the same local endpoint therefore
+create independent lines; no wallet, PGP key, AES key, queue, pipe, or upstream
+socket may be shared. The raw application stream is not prefixed with a
+conet-l0d header. Geth/Prysm bytes remain unchanged; the accepted socket and
+the encrypted `pipe_handle` provide correlation.
+
+### TUN-less Beacon stream mode
+
+When a Beacon process uses a local L0d TCP listener (for example
+`127.0.0.1:14200`), the operator startup script may set
+`L0_STREAM_ONLY=1`. This mode uses only the explicitly supplied
+`EXTRA_BEACON_PEERS`, enables `--no-discovery` and `--disable-quic`, and does
+not require TUN, iptables, DHT steering, or listen-DNAT. Explicit environment
+values are captured before host defaults are sourced and restored afterward;
+host defaults therefore cannot replace the selected local stream peer.
 
 ## Hard constraints
 
@@ -66,6 +107,15 @@ The lab spoke `.45` uses overlay VIP `100.64.0.5` and two static hubs:
 - production hub `.82`: `100.64.0.7`, geth `:8400`, beacon `:4200`;
 - lab hub `.98`: `100.64.0.6`, geth `:8400`, beacon `:4200`.
 
+Canonical static `--peer` (both hubs already `--p2p-static-id`): `scripts/l1-beacon-static-peers.env`. Do **not** fetch `.98` `:4100` `/eth/v1/node/identity` (HTTP 500 / nil ENR when `--no-discovery`). DHT sidecar `:4110` IDs are **not** beacon `--peer`. Do not wipe `network-keys` or run `restart-beacon-clean`. Do not `systemctl restart conet-node66`. Pinning the ID is not overlay join (toml + `conet-l0d` + listen-DNAT still required).
+
+```text
+--peer=/ip4/100.64.0.7/tcp/4200/p2p/16Uiu2HAmDJCHuVkXtkPrrL8YykQ9gFZnQkR9Q6WjZZUrmueohPfd
+--peer=/ip4/100.64.0.6/tcp/4200/p2p/16Uiu2HAmF1SXGHnne9DQTHGfgGQgje3cBV8pdSLJF25ajYKr2hvS
+```
+
+Public join uses the same `peer_id` with `216.225.202.82` / `198.251.77.98`. L0_ONLY allowlist refuses those public multiaddrs.
+
 This run established the following operational facts:
 
 1. Geth and beacon are separate overlay TCP planes. `100.64.0.5 → :8400 ESTAB` does not prove beacon health; always check `:4200` and Prysm `peer_count` separately.
@@ -83,7 +133,7 @@ This run established the following operational facts:
 
 Use this order, from least disruptive to most disruptive:
 
-1. Read-only: query beacon `peer_count` and `identity`, inspect `ss -tn` for overlay `:4200` and `:8400`, verify TUN VIPs, and read the `conet-l0d` logs. Verify the hub peer ID against the spoke `--peer`.
+1. Read-only: query beacon `peer_count` (`.98` `:4100` **identity** may 500 — use `scripts/l1-beacon-static-peers.env` or `beacon.log` “Running node with peer id”), inspect `ss -tn` for overlay `:4200` and `:8400`, verify TUN VIPs, and read the `conet-l0d` logs. Verify the hub peer ID against the spoke `--peer` and that env file.
 2. Re-apply `overlay-beacon-listen-dnat.sh apply` on the public-advertise hub and the spoke. This installs the local-listen DNAT/SNAT and refreshes beacon `:4200/:4300` conntrack; it must not flush geth `:8400`.
 3. If beacon remains `SYN-SENT` and L0 shows 409/404, restart only `conet-l0d`, first hub then spoke. Re-apply listen-DNAT after each TUN or beacon-PID change. Do not immediately run `overlay-dht-steer.sh apply` after a beacon restart.
 4. If 409 persists after the ordered daemon bounce, clear the stale occupy on mailbox B (SI-only, operator-authorized), wait for SI to become active, then repeat the hub-then-spoke `conet-l0d` bounce. Do not only bounce the spoke.
@@ -126,6 +176,7 @@ nodes to the requester mailbox.
 | `docs/MVP.md` / `docs/MVP.zh-CN.md` | Accepted crate MVP |
 | `docs/P1.md` / `docs/P1.zh-CN.md` | Overlay `/post` encrypt + mailbox wrap + POST; inbound decrypt + TUN write-back; EIP-191 listen worker; optional `[[l0.channels]]` per overlay port; SI gossip JSON ingest; `[l0]` default off; authorized lab may enable `[l0]`; 2026-08-18: overlay IPv4 batch + POST 32/512; `.45` advertises overlay vIP; overlay geth + beacon TCP; follow-the-chain Prysm-bound (~3.2 blocks/s); EL still `0x0`; `scripts/watch-l0-follow.sh` |
 | `docs/P2.md` / `docs/P2.zh-CN.md` | Lab overlay UDP / DHT-port comms. Drop recovery: steer apply first; authorized `.45` `restart-beacon` only after dial backoff. **2026-08-19:** beacon `connected=0` + SYN-SENT + `l0_connect` **409** → clear mailbox B SI occupy, bounce hub→spoke `conet-l0d`, flush `:4200` conntrack, then `restart-beacon` if still in dial backoff. **2026-08-20:** lab-only static overlay `--peer` (not DHT) after authorized hub+spoke `restart-beacon` → spoke `connected=1`, overlay ESTAB + AES, `head_slot`↑ / `sync_distance`↓; listen-DNAT after restart, not steer; prove geth via `geth.pid`. **~07:13Z** authorized `.98` `restart-beacon` (`--disable-quic`): overlay TCP toward `.82` accepted (conntrack); hybrid hub, not L0_ONLY / FOLLOW_OK |
+| `scripts/l1-beacon-static-peers.env` | Canonical `.82` / `.98` beacon `peer_id` and `--peer` (do not curl `.98` `:4100`). Host backups sit **outside** `beacondata`: `~/ethereum-pos-mainnet/secrets/l1-beacon-network-keys/` |
 | `docs/operator-flags.md` | geth/beacon advertise flags (not iptables) |
 | `config/conet-l0d.example.toml` | Example overlay table |
 | `systemd/conet-l0d.service` | start/stop only; no raw iptables |
@@ -200,6 +251,29 @@ PGP identities for the `l0_connect` / `l0_listen` control path. The initiator
 must not continue using the receiver's long-lived public user PGP for duplex
 traffic. Each endpoint still owns a separate occupied pipe; the two pipes are
 bound by the same `pipe_handle` only at the application layer.
+
+## firstChunk / responseChunk bootstrap
+
+On a client, each newly accepted local TCP socket is the only connection
+handle. The client pauses that socket after its first bytes, creates and
+registers exactly one temporary route, waits until its temporary `l0_listen`
+SSE is ready, and only then sends those bytes as `firstChunk` in
+`duplex_offer`. Existing handles never allocate a second line.
+
+A duplex proxy may open a line only when the signed offer's recovered
+`billingWallet`, `mainWallet:port`, explicit `--proxyDuplex` target, and
+non-empty `firstChunk` all match. It creates and registers its own temporary
+route and waits for that route's `l0_listen` SSE before connecting upstream.
+The proxy forwards `firstChunk`, pauses the upstream after its first reply,
+and returns that reply as `responseChunk` in `duplex_accept`. It
+reverse-occupies the initiator listen only if that return pipe is still
+empty, then starts upstream-to-pipe forwarding. It does **not** wait for a
+second local protocol chunk: geth / beacon often stay paused after Hello
+until both occupied pipes are up. The initiator decrypts the accept with its
+per-socket temporary PGP key, writes `responseChunk` to the paused local
+socket, and occupies immediately (an empty first AES blob is allowed). Later
+bytes use the same pipe handle and session. An unrelated, unsigned, stale, or
+ambiguous offer is rejected and cannot allocate a route.
 
 ## Main-wallet billing for temporary channels (2026-08-21)
 

@@ -19,6 +19,22 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/home/peter/ethereum-pos-mainnet}"
 NODE_DIR="${NODE_DIR:-$PROJECT_DIR/network/node-0}"
 LAB_DIR="${LAB_DIR:-/home/peter/conet-l0d-lab}"
+# Preserve explicit operator overrides before loading host defaults.  The
+# source files contain lab fallbacks and must never replace a command-line
+# stream peer selected for this restart.
+EXPLICIT_BEACON_PEERS_SET="${EXTRA_BEACON_PEERS+x}"
+EXPLICIT_BEACON_PEERS="${EXTRA_BEACON_PEERS:-}"
+EXPLICIT_OVERLAY_BEACON_PEER_SET="${L0_OVERLAY_BEACON_PEER+x}"
+EXPLICIT_OVERLAY_BEACON_PEER="${L0_OVERLAY_BEACON_PEER:-}"
+# Canonical hub beacon IDs (--peer). Do not curl .98 :4100 for identity.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/l1-beacon-static-peers.env" ]]; then
+	# shellcheck disable=SC1091
+	source "$SCRIPT_DIR/l1-beacon-static-peers.env"
+elif [[ -f "$LAB_DIR/scripts/l1-beacon-static-peers.env" ]]; then
+	# shellcheck disable=SC1091
+	source "$LAB_DIR/scripts/l1-beacon-static-peers.env"
+fi
 # Production hub overlay constants (216.225.202.82 / 100.64.0.7); override via env.
 if [[ -f "$LAB_DIR/scripts/l0-prod82-hub.env" ]]; then
 	# shellcheck disable=SC1091
@@ -92,14 +108,22 @@ if [[ -f "$L0_ONLY_ENV" ]]; then
 fi
 L0_ONLY="${L0_ONLY:-0}"
 L0_DHT="${L0_DHT:-0}"
-# Optional discv5 bootstrap. .98 gateway is loopback-only; write the ENR taken
-# from that host's localhost identity after its --p2p-static-id restart.
+# Optional discv5 bootstrap. Prefer .82 :4100 ENR (works). .98 :4100 identity
+# returns HTTP 500 when --no-discovery — do not treat that as a missing peer_id.
 # When this ENR is set, L0_DHT drops the static overlay --peer (discv5 only).
 # That is not a ban on dialing the hub public IP in the ENR: allowlist includes
 # the hub /32 so libp2p can connect(); packets must still ride L0 via steer.
 L0_DHT_BOOTSTRAP_ENR="${L0_DHT_BOOTSTRAP_ENR:-}"
 L0_DHT_IDENTITY_URL="${L0_DHT_IDENTITY_URL:-}"
 L0_DHT_NO_STATIC_PEER="${L0_DHT_NO_STATIC_PEER:-}"
+L0_STREAM_ONLY="${L0_STREAM_ONLY:-0}"
+
+if [[ -n "$EXPLICIT_BEACON_PEERS_SET" ]]; then
+	EXTRA_BEACON_PEERS="$EXPLICIT_BEACON_PEERS"
+fi
+if [[ -n "$EXPLICIT_OVERLAY_BEACON_PEER_SET" ]]; then
+	L0_OVERLAY_BEACON_PEER="$EXPLICIT_OVERLAY_BEACON_PEER"
+fi
 
 resolve_advertise_ip() {
 	if [[ -n "${ADVERTISE_IP:-}" ]]; then
@@ -150,6 +174,10 @@ l0_only_on() {
 
 l0_dht_on() {
 	[[ "${L0_DHT}" == "1" || "${L0_DHT}" == "true" || "${L0_DHT}" == "yes" ]]
+}
+
+stream_only_on() {
+	[[ "${L0_STREAM_ONLY}" == "1" || "${L0_STREAM_ONLY}" == "true" || "${L0_STREAM_ONLY}" == "yes" ]]
 }
 
 l0_dht_no_static_peer() {
@@ -479,7 +507,16 @@ start_geth() {
 
 start_beacon() {
 	local extra=()
-	if l0_only_on; then
+	if stream_only_on; then
+		# Duplex stream mode uses the local TCP bridge (for example
+		# 127.0.0.1:14200).  It intentionally has no TUN, iptables,
+		# discovery bootstrap, or DHT steering dependency.
+		BOOTSTRAP_ARGS=()
+		PEER_ARGS=()
+		load_extra_beacon_peers
+		extra+=(--disable-quic --no-discovery --p2p-max-peers=4 --min-sync-peers=1)
+		echo "Starting beacon L0_STREAM_ONLY peer=${EXTRA_BEACON_PEERS:-none} (no TUN/iptables/discovery)"
+	elif l0_only_on; then
 		require_overlay_tun
 		apply_p2p_isolate
 		BOOTSTRAP_ARGS=()

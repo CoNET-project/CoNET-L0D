@@ -18,14 +18,14 @@ locator = "web3://0x8a2b04C82B43447b69946b31BCCEa14ed29471f4/p2p/geth"
 locator = "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792/p2p/geth"
 vip = "100.64.0.7"
 tcp_ports = [8400]
-user_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-user.asc"
+user_pgp_file = "/home/peter/conet-l0d-lab/keys/82/peer-geth-user.asc"
 route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-geth-route.asc"
 
 [[peers]]
 locator = "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792/p2p/beacon"
 vip = "100.64.0.7"
 tcp_ports = [4200]
-user_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-beacon-user.asc"
+user_pgp_file = "/home/peter/conet-l0d-lab/keys/82/peer-beacon-user.asc"
 route_pgp_file = "/home/peter/conet-l0d-lab/keys/peer-beacon-route.asc"
 
 [l0]
@@ -51,8 +51,9 @@ mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route
 billing_eoa = "0x72c240E4e35caF9822E6B71BBB816db83E1534a5"
 billing_eth_key_file = "/home/peter/conet-l0d-lab/keys/udp/routing.eth"
 
-# Request .82's mainWallet:port; the proxy hub owns per-client line identity.
-clients = [
+# Request .82's mainWallet:8400 over an explicit duplex stream; the proxy hub
+# owns the per-client line identity.
+client_duplex = [
   "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792:8400",
   "web3://0x66dCB48ff905f5f5f3692f302da0A84e0265A792:4200",
 ]

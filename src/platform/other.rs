@@ -17,6 +17,14 @@ pub async fn packet_loop(_cfg: &ValidatedConfig) -> Result<(), L0dError> {
     Err(L0dError::NotLinux)
 }
 
+pub async fn stream_loop(_cfg: &ValidatedConfig) -> Result<(), L0dError> {
+    Err(L0dError::NotLinux)
+}
+
+pub async fn proxy_loop(_cfg: &ValidatedConfig) -> Result<(), L0dError> {
+    Err(L0dError::NotLinux)
+}
+
 pub fn signal_stop(_pid: u32) -> Result<(), L0dError> {
     Err(L0dError::NotLinux)
 }

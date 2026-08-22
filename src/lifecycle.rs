@@ -4,8 +4,44 @@ use crate::locator::Locator;
 use crate::netops;
 use crate::state::RuntimeState;
 use serde_json::json;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Process-wide guard for one config/state namespace.  The file itself may
+/// remain after a crash; `flock` is released by the kernel with the process.
+struct InstanceLock {
+    _file: File,
+}
+
+fn instance_lock_path(state_path: &Path) -> PathBuf {
+    let mut raw = state_path.as_os_str().to_os_string();
+    raw.push(".lock");
+    PathBuf::from(raw)
+}
+
+fn acquire_instance_lock(state_path: &Path) -> anyhow::Result<InstanceLock> {
+    let lock_path = instance_lock_path(state_path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "conet-l0d already owns state namespace {} (lock {}: {err})",
+            state_path.display(),
+            lock_path.display()
+        );
+    }
+    Ok(InstanceLock { _file: file })
+}
 
 pub fn check_config(path: &Path) -> anyhow::Result<()> {
     let cfg = load_validated(path)?;
@@ -23,6 +59,14 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
     println!("l0.listen      {}", cfg.l0.listen_entries.len());
     println!("l0.channels    {}", cfg.l0.channels.len());
     println!("l0.proxies     {}", cfg.l0.proxies.len());
+    println!(
+        "l0.clients     {} request/response, {} duplex",
+        cfg.clients.len(),
+        cfg.client_duplex.len()
+    );
+    for (target, endpoint) in cfg.client_mappings() {
+        println!("client         {target} -> {endpoint}");
+    }
     println!(
         "l0.routing_key {}",
         if cfg.l0.routing_key_file.is_some() {
@@ -130,7 +174,7 @@ pub fn status(path: &Path) -> anyhow::Result<()> {
 }
 
 pub async fn start(path: &Path) -> anyhow::Result<()> {
-    start_with_overrides(path, None, None, None, &[], &[]).await
+    start_with_overrides(path, None, None, None, &[], &[], &[], &[]).await
 }
 
 pub async fn start_with_overrides(
@@ -139,7 +183,9 @@ pub async fn start_with_overrides(
     main_wallet_pgp: Option<&Path>,
     main_wallet_key: Option<&Path>,
     proxy_specs: &[String],
+    proxy_duplex_specs: &[String],
     client_specs: &[String],
+    client_duplex_specs: &[String],
 ) -> anyhow::Result<()> {
     if !cfg!(target_os = "linux") {
         anyhow::bail!(L0dError::NotLinux);
@@ -150,43 +196,68 @@ pub async fn start_with_overrides(
         main_wallet_pgp.map(Path::to_path_buf),
         main_wallet_key.map(Path::to_path_buf),
         proxy_specs,
+        proxy_duplex_specs,
         client_specs,
+        client_duplex_specs,
     )?;
     let cfg = raw.validate()?;
-    if RuntimeState::load(&cfg.raw.state_path)?.is_some() {
-        tracing::warn!("dirty state present; tearing down first");
+    // Hold this guard for the entire daemon lifetime.  Checking the JSON state
+    // alone is racy: an earlier implementation removed an active process's
+    // state and then started a second daemon over the same listeners.
+    let _instance_lock = acquire_instance_lock(&cfg.raw.state_path)?;
+    if let Some(state) = RuntimeState::load(&cfg.raw.state_path)? {
+        if netops::process_alive(state.pid) && state.pid != std::process::id() {
+            anyhow::bail!(
+                "conet-l0d is already running with pid {} for state {}",
+                state.pid,
+                cfg.raw.state_path.display()
+            );
+        }
+        tracing::warn!(pid = state.pid, "stale state present; tearing down first");
         teardown_inner(&cfg).await?;
     }
-    // Proxy-only still owns TUN: current `--client` peers seal IPv4 datagrams
-    // on the occupy pipe. Raw `[[l0.proxies]]` drain handles non-IPv4 stream
-    // bytes only. Skipping TUN left IPv4 frames stuffing the proxy queue.
     let proxy_only = cfg.proxy_server_only();
+    let packet_mode = cfg.packet_mode_required();
     if proxy_only {
         tracing::info!(
             proxies = cfg.l0.proxies.len(),
-            "proxy-server mode: TUN + listen for IPv4 clients; raw proxy drain for non-IPv4"
+            proxy_duplex = cfg.l0.proxy_duplex.len(),
+            "proxy-server mode: no TUN or iptables; accepting L0 proxy lines"
+        );
+    } else if !packet_mode {
+        tracing::info!(
+            client_duplex = cfg.client_duplex.len(),
+            "duplex client mode: no TUN or iptables; local TCP listeners carry raw stream bytes"
         );
     }
-    netops::install(&cfg).await?;
+    for (target, endpoint) in cfg.client_mappings() {
+        tracing::info!(%target, %endpoint, "local web3 client endpoint");
+    }
+    if packet_mode {
+        netops::install(&cfg).await?;
+    }
     let state = RuntimeState::from_config(&cfg, std::process::id());
     if let Err(err) = state.write(&cfg.raw.state_path) {
-        let _ = netops::uninstall(&cfg, Some(&state)).await;
+        if packet_mode {
+            let _ = netops::uninstall(&cfg, Some(&state)).await;
+        }
         return Err(err.into());
     }
     if proxy_only {
         tracing::info!(
-            tun = %cfg.raw.tun_name,
-            vip = %cfg.local_vip,
             proxies = cfg.l0.proxies.len(),
-            "conet-l0d started (proxy-server; owns TUN + iptables)"
+            proxy_duplex = cfg.l0.proxy_duplex.len(),
+            "conet-l0d started in proxy-server mode (no TUN, route, or iptables)"
         );
-    } else {
+    } else if packet_mode {
         tracing::info!(
             tun = %cfg.raw.tun_name,
             vip = %cfg.local_vip,
             chain = %cfg.raw.iptables_chain,
             "conet-l0d started; owns TUN + iptables"
         );
+    } else {
+        tracing::info!("conet-l0d started in duplex client mode (no TUN, route, or iptables)");
     }
 
     let run = async {
@@ -194,17 +265,43 @@ pub async fn start_with_overrides(
         {
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
-                r = netops::packet_loop(&cfg) => { r?; }
+            if proxy_only {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                    r = netops::proxy_loop(&cfg) => { r?; }
+                }
+            } else if packet_mode {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                    r = netops::packet_loop(&cfg) => { r?; }
+                }
+            } else {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                    r = netops::stream_loop(&cfg) => { r?; }
+                }
             }
         }
         #[cfg(not(unix))]
         {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                r = netops::packet_loop(&cfg) => { r?; }
+            if proxy_only {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    r = netops::proxy_loop(&cfg) => { r?; }
+                }
+            } else if packet_mode {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    r = netops::packet_loop(&cfg) => { r?; }
+                }
+            } else {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    r = netops::stream_loop(&cfg) => { r?; }
+                }
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -223,7 +320,12 @@ pub async fn stop(path: &Path) -> anyhow::Result<()> {
     if let Some(state) = RuntimeState::load(&cfg.raw.state_path)? {
         if netops::process_alive(state.pid) && state.pid != std::process::id() {
             netops::signal_stop(state.pid)?;
-            wait_dead(state.pid, Duration::from_secs(5)).await;
+            if !wait_dead(state.pid, Duration::from_secs(5)).await {
+                anyhow::bail!(
+                    "conet-l0d pid {} did not stop within 5s; state was preserved",
+                    state.pid
+                );
+            }
         }
     }
     teardown_inner(&cfg).await?;
@@ -241,9 +343,19 @@ pub async fn teardown(path: &Path) -> anyhow::Result<()> {
 
 async fn teardown_inner(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     let state = RuntimeState::load(&cfg.raw.state_path)?;
-    netops::uninstall(cfg, state.as_ref()).await?;
+    let owns_network = state
+        .as_ref()
+        .map(|saved| !saved.proxy_only && cfg.packet_mode_required())
+        .unwrap_or(cfg.packet_mode_required());
+    if owns_network {
+        netops::uninstall(cfg, state.as_ref()).await?;
+    }
     RuntimeState::remove(&cfg.raw.state_path)?;
-    tracing::info!("owned TUN / route / {} removed", cfg.raw.iptables_chain);
+    if !owns_network {
+        tracing::info!("proxy-server resources removed (no TUN / route / iptables)");
+    } else {
+        tracing::info!("owned TUN / route / {} removed", cfg.raw.iptables_chain);
+    }
     Ok(())
 }
 
@@ -251,9 +363,28 @@ fn load_validated(path: &Path) -> Result<ValidatedConfig, L0dError> {
     DaemonConfig::load(path)?.validate()
 }
 
-async fn wait_dead(pid: u32, timeout: Duration) {
+async fn wait_dead(pid: u32, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while netops::process_alive(pid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    !netops::process_alive(pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{acquire_instance_lock, instance_lock_path};
+
+    #[test]
+    fn instance_lock_is_exclusive_and_survives_lock_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("runtime.json");
+
+        let first = acquire_instance_lock(&state).expect("first lock");
+        assert!(instance_lock_path(&state).exists());
+        assert!(acquire_instance_lock(&state).is_err());
+
+        drop(first);
+        acquire_instance_lock(&state).expect("lock after owner exits");
     }
 }

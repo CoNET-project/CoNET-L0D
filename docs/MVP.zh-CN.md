@@ -1,3 +1,12 @@
+## Client 与 proxy 传输模式
+
+`--client web3://<mainWallet>:<port>` 默认为 P1 请求/响应客户端；
+`--clientDuplex` 才启用持续双向 stream。`local_vip = "auto"` 时客户端
+会自动选择本地 VIP，并输出 `web3://... -> VIP:port` 映射。
+
+服务器端 `--proxy HOST:PORT` 只表示请求/响应配置，
+`--proxyDuplex HOST:PORT` 表示原始双向转发。仅 proxy 的 daemon 不创建
+TUN、路由或 iptables 链；同一逻辑端口不能同时配置两种 proxy 模式。
 # MVP — conet-l0d
 
 **成对：** [English](./MVP.md)  
@@ -33,12 +42,31 @@ PGP/AES/session。临时身份必须先登记再路由，任何传输失败时�
 逻辑端口可并发多条线路，但绝不共享线路身份或 pipe。占用管道字节转发到
 配置的 `host:port`；不保存离线数据。
 
-仅代理服务器（有 `[[l0.proxies]]`、无 `l0.clients` / `--client`）仍创建
-TUN + iptables：当前客户端在 occupy 管道上封装 IPv4。代理上游拷贝仅用于
-**非 IPv4** 流字节；IPv4 帧写入 TUN。多端口代理须为每个端口配置独立的
-`[[l0.channels]]` routing EOA（SI 独占占用）；offer 匹配仍用 `billing_eoa` 作为
-`mainWallet`。客户端用 `--client 'web3://<peerMainWallet>:port'` 向该对端
-VIP:port 播种 pending duplex 线路，同时保留 TUN 供本机 geth/beacon 拨号。
+仅代理服务器（有 `[[l0.proxies]]`、无 `l0.clients` / `--client`）不创建
+TUN 或 iptables。每个明确的新线路请求都为配置的 `host:port` 建立独立的
+原始 TCP 上游线路；同一端口的并发连接仍相互隔离。收到 offer 只能绑定
+已登记的 `pipe_handle` 或临时 `listenWallet`；未知、过期或有歧义的 offer
+必须拒绝，不得在 offer 阶段创建临时钱包、session 或新的 `l0_connect`。多端口代理须为每个端口
+配置独立的 `[[l0.channels]]` routing EOA（SI 独占占用）；offer 匹配仍用
+`billing_eoa` 作为 `mainWallet`。旧式 `--client` 继续使用 packet/TUN 路径；
+`--clientDuplex` 只有在应用实际建立本地 TCP 连接时才分配线路。
+
+`--clientDuplex` 的本地 listener 以 `accept()` 事件作为唯一连接句柄：
+每个新 socket 立即生成新的临时钱包、PGP route、AES key、返回队列和
+duplex offer。同一个 socket 在 EOF/错误前始终复用这条临时线路；第二个
+socket 即使连接同一个 `127.0.0.1:<port>` 也会得到另一条线路。L0d 不向
+Geth/Prysm 原始字节插入私有 header，socket handle 与加密的
+`pipe_handle` 负责关联。
+
+### 通过无 TUN 的 Duplex Listener 连接 Beacon
+
+当 `conet-l0d` 提供本地 duplex listener（例如 Beacon 使用
+`127.0.0.1:14200`）时，Beacon 必须连接本地 stream peer，不能连接另一客户端
+的 VIP，也不能回退到公网 ENR。实验室启动脚本支持
+`L0_STREAM_ONLY=1`：只使用显式传入的 `EXTRA_BEACON_PEERS`，增加
+`--no-discovery` 与 `--disable-quic`，并且不依赖 TUN、iptables、DHT steer
+或 listen-DNAT。显式命令行 peer 优先于主机环境默认值，避免旧的 `.98`
+peer 覆盖 `.82` stream 目标。
 
 ## 范围外（不算 MVP 失败）
 

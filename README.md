@@ -31,6 +31,22 @@ Layer Minus stays a PGP / wallet-address forwarding plane. HTTP `/post` is only 
 
 Overlay duplex is SI **`l0_listen` / `l0_connect`** plus **application JSON** on Chat gossip / occupied AES. SI does **not** implement `duplex_*`. There is **no** live SI command named `p2p_stream_*` or `listenKind: "l1p2p"`. Do not send `mining` + `listenKind: "duplex"`.
 
+For `--clientDuplex`, local TCP is connection-driven. Each
+`TcpListener.accept()` event is the sole connection handle; its explicit
+`mainWallet:port` new-line request creates a fresh temporary wallet/PGP route,
+AES key, return queue, and occupied pipe before offer handling.
+The same socket reuses that line until EOF/error; concurrent sockets on the
+same local port receive independent lines. Raw Geth/Prysm bytes are not
+prefixed with a private header; the socket handle and encrypted
+`pipe_handle` provide correlation. `--client` remains the packet/TUN
+request/response path.
+
+For a TUN-less Beacon bridge, set `L0_STREAM_ONLY=1` in the operator startup
+environment and pass the local listener peer through `EXTRA_BEACON_PEERS`.
+The script then disables discovery and QUIC and does not load public/DHT
+peers. Explicit `EXTRA_BEACON_PEERS` values win over sourced host defaults,
+preventing a stale overlay VIP from being used as the Beacon `--peer`.
+
 ## Identity (`web3://`)
 
 The URI is a **peer locator**, not an ERC-4804 content URL.

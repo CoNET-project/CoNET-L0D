@@ -5,7 +5,7 @@
 //! billing/signing identity and is never reused as the line identity.
 
 use crate::error::L0dError;
-use crate::l0::{aes, eip191::EthSecret, pgp};
+use crate::l0::{address_pgp, aes, eip191::EthSecret, pgp};
 use base64::Engine;
 use rand::{rngs::OsRng, RngCore};
 use sequoia_openpgp::cert::prelude::*;
@@ -71,6 +71,7 @@ impl TemporaryIdentity {
         &self,
         register_url: &str,
         route_key_id: &str,
+        rpc: Option<&str>,
     ) -> Result<(), L0dError> {
         let mut key = [0u8; aes::KEY_LEN];
         let digest = Sha256::digest(self.wallet.secret_bytes());
@@ -107,6 +108,10 @@ impl TemporaryIdentity {
                 status.as_u16(),
                 error
             )));
+        }
+        // HTTP 200 / ok is not SI isMyRoute. Mailbox reads AddressPGP searchKey.
+        if let Some(rpc) = rpc.filter(|url| !url.trim().is_empty()) {
+            address_pgp::wait_until_route_visible(rpc, self.wallet_address(), route_key_id).await?;
         }
         Ok(())
     }

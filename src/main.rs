@@ -40,7 +40,9 @@ async fn run() -> anyhow::Result<()> {
             main_wallet_pgp,
             main_wallet_key,
             proxy,
+            proxy_duplex,
             client,
+            client_duplex,
         } => {
             lifecycle::start_with_overrides(
                 &config,
@@ -48,7 +50,9 @@ async fn run() -> anyhow::Result<()> {
                 main_wallet_pgp.as_deref(),
                 main_wallet_key.as_deref(),
                 &proxy,
+                &proxy_duplex,
                 &client,
+                &client_duplex,
             )
             .await
         }

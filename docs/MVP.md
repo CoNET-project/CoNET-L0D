@@ -1,3 +1,14 @@
+## Client and proxy transport modes
+
+`--client web3://<mainWallet>:<port>` is the default P1 request/response
+client. `--clientDuplex` is the explicit persistent bidirectional stream mode.
+The client daemon selects a local VIP automatically when `local_vip = "auto"`
+and prints the resulting `web3://... -> VIP:port` mapping.
+
+On a server, `--proxy HOST:PORT` is request/response configuration and
+`--proxyDuplex HOST:PORT` is raw bidirectional forwarding. A proxy-only daemon
+does not create a TUN, route, or iptables chain. The same logical port cannot be
+configured in both proxy modes.
 # MVP — conet-l0d
 
 **Paired:** [中文](./MVP.zh-CN.md)  
@@ -35,13 +46,36 @@ clients may use one logical port, but never share a line identity or pipe.
 Occupied bytes are copied to the configured `host:port`; offline data is
 discarded.
 
-Proxy-only servers (`[[l0.proxies]]` and no `l0.clients` / `--client`) still
-create TUN + iptables: current clients seal IPv4 on the occupy pipe. Proxy
-upstream copy applies to **non-IPv4** stream bytes; IPv4 frames write to TUN.
+For `--clientDuplex`, the local TCP listener is connection-driven rather than
+port-driven. Every new `accept()` event is a new socket handle and the
+explicit `mainWallet:port` new-line request allocates its fresh temporary
+wallet/PGP route, AES key, local return queue, and duplex offer before offer
+processing. The same socket keeps using that line until EOF or error; a
+second socket to the same `127.0.0.1:<port>` receives a different line. L0d
+does not add a private header to Geth/Prysm bytes: the accepted socket handle
+and encrypted `pipe_handle` are the correlation mechanism.
+
+Proxy-only servers (`[[l0.proxies]]` and no `l0.clients` / `--client`) do not
+create TUN or iptables. Each explicit new-line request creates a separate
+upstream raw stream to its configured `host:port`; same-port connections remain
+isolated. An incoming `duplex_offer` is attach-only: it may bind an existing
+`pipe_handle` or temporary `listenWallet`, but an unknown, stale, or ambiguous
+offer is rejected and never creates a wallet, session, or `l0_connect`.
 Multi-port proxy must configure one `[[l0.channels]]` routing EOA per port
 (SI exclusive occupy); offer matching still uses `billing_eoa` as `mainWallet`.
-Clients use `--client 'web3://<peerMainWallet>:port'` to seed a pending duplex
-line toward that peer VIP:port while keeping TUN for local geth/beacon.
+Legacy `--client` keeps the packet/TUN path. `--clientDuplex` uses the local
+TCP listener and allocates lines only when applications actually connect.
+
+### Beacon over a TUN-less duplex listener
+
+When `conet-l0d` exposes a local duplex listener (for example
+`127.0.0.1:14200` for Beacon), the Beacon process must use the local stream
+peer, not the other client's VIP or a public ENR. The lab operator scripts
+support `L0_STREAM_ONLY=1` for this mode. It keeps only the explicitly supplied
+`EXTRA_BEACON_PEERS`, adds `--no-discovery` and `--disable-quic`, and does not
+require TUN, iptables, DHT steering, or listen-DNAT. Explicit command-line
+peer values take precedence over host environment defaults, so stale `.98`
+peers cannot replace the `.82` stream target.
 
 ## Out of scope (not a failed MVP)
 
@@ -73,3 +107,21 @@ cargo test
 ## Sync rule
 
 If this file, the whitepaper, or `RULES.md` changes, update GitBook **Applications** and **Developers** `conet-l0d` pages in the same task.
+
+## Duplex bootstrap payloads
+
+For `--clientDuplex`, a local TCP accept event creates the unique session
+handle. Its initial application bytes are carried in the control offer as
+`firstChunk`, but the offer is not sent until the per-socket temporary route is
+registered, visible on AddressPGP `searchKey` (HTTP 200 is not enough), and
+its `l0_listen` SSE is ready. A matching `--proxyDuplex`
+endpoint verifies the signed billing wallet and exact `mainWallet:port`,
+registers its own temporary route, and waits for its listen SSE before opening
+one upstream socket. It writes the first chunk, includes the first upstream
+response as `responseChunk` in `duplex_accept`, reverse-occupies the
+initiator listen only if that return pipe is still empty, then resumes the
+upstream socket. It does not wait for a second local protocol chunk. The
+initiator decrypts the accept, writes `responseChunk` to the local socket,
+and occupies immediately (an empty first AES blob is allowed). All subsequent
+bytes are framed on the established `pipe_handle`; unsigned, stale,
+ambiguous, or unmatched offers must not allocate a line.

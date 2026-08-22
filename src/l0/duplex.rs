@@ -57,20 +57,24 @@ pub fn encode_offer_command(
     peer_wallet: &str,
     listen_wallet: &str,
     listen_user_pgp: &str,
+    listen_route_pgp: &str,
     session_id: &str,
     key: &[u8; aes::KEY_LEN],
     timestamp: u64,
 ) -> Result<String, L0dError> {
     encode_offer_command_for_port(
         initiator_wallet,
+        initiator_wallet,
         peer_wallet,
         peer_wallet,
         listen_wallet,
         listen_user_pgp,
+        listen_route_pgp,
         0,
         session_id,
         key,
         timestamp,
+        None,
     )
 }
 
@@ -78,49 +82,67 @@ pub fn encode_offer_command(
 /// The server allocates a fresh temporary identity after accepting it.
 pub fn encode_offer_command_for_port(
     initiator_wallet: &str,
+    billing_wallet: &str,
     main_wallet: &str,
     peer_wallet: &str,
     listen_wallet: &str,
     listen_user_pgp: &str,
+    listen_route_pgp: &str,
     port: u16,
     session_id: &str,
     key: &[u8; aes::KEY_LEN],
     timestamp: u64,
+    first_chunk: Option<&[u8]>,
 ) -> Result<String, L0dError> {
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "command": "duplex_offer",
         "walletAddress": normalize_eoa(initiator_wallet)?,
+        "billingWallet": normalize_eoa(billing_wallet)?,
         "mainWallet": normalize_eoa(main_wallet)?,
         "peerWallet": normalize_eoa(peer_wallet)?,
         "listenWallet": normalize_eoa(listen_wallet)?,
         "listenUserPgp": listen_user_pgp,
+        "listenRoutePgp": listen_route_pgp,
         "port": port,
         "pipe_handle": session_id,
         "algorithm": "aes-256-gcm",
         "Securitykey": aes::key_to_standard_b64(key),
         "timestamp": timestamp,
     });
+    if let Some(first_chunk) = first_chunk {
+        json["firstChunk"] =
+            Value::String(base64::engine::general_purpose::STANDARD.encode(first_chunk));
+    }
     serde_json::to_string(&json).map_err(|e| L0dError::L0(e.to_string()))
 }
 
 pub fn encode_accept_command(
     responder_wallet: &str,
+    billing_wallet: &str,
     listen_wallet: &str,
     listen_user_pgp: &str,
+    listen_route_pgp: &str,
     session_id: &str,
     key: &[u8; aes::KEY_LEN],
     timestamp: u64,
+    response_chunk: Option<&[u8]>,
 ) -> Result<String, L0dError> {
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "command": "duplex_accept",
         "walletAddress": normalize_eoa(responder_wallet)?,
+        "billingWallet": normalize_eoa(billing_wallet)?,
         "listenWallet": normalize_eoa(listen_wallet)?,
         "listenUserPgp": listen_user_pgp,
+        "listenRoutePgp": listen_route_pgp,
         "pipe_handle": session_id,
         "algorithm": "aes-256-gcm",
         "Securitykey": aes::key_to_standard_b64(key),
         "timestamp": timestamp,
     });
+    if let Some(response_chunk) = response_chunk {
+        json["responseChunk"] =
+            Value::String(base64::engine::general_purpose::STANDARD.encode(response_chunk));
+    }
     serde_json::to_string(&json).map_err(|e| L0dError::L0(e.to_string()))
 }
 
@@ -190,13 +212,23 @@ pub fn seal_ping(
     aes::seal(key, text.as_bytes())
 }
 
+const AES_GCM_TAG_LEN: usize = 16;
+
 pub fn looks_like_aes_blob(raw: &str) -> bool {
     let t = raw.trim();
-    t.len() >= 32
-        && !t.starts_with('{')
-        && !t.starts_with("-----")
-        && t.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    if t.len() < 32 || t.starts_with('{') || t.starts_with("-----") {
+        return false;
+    }
+    if !t
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    {
+        return false;
+    }
+    match Engine::decode(&base64::engine::general_purpose::STANDARD, t) {
+        Ok(packed) => packed.len() > aes::NONCE_LEN + AES_GCM_TAG_LEN,
+        Err(_) => false,
+    }
 }
 
 pub fn parse_l0_occupied(payload: &str) -> bool {
@@ -273,7 +305,23 @@ pub fn wrap_app_for_user_pgp(
     });
     let text = serde_json::to_string(&envelope).map_err(|e| L0dError::L0(e.to_string()))?;
     let b64 = Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes());
-    pgp::encrypt_utf8(&b64, user_pub_armored)
+    encrypt_utf8_checked(b64.as_str(), user_pub_armored)
+}
+
+/// Encrypt to the peer user PGP and refuse armor whose PKESK is not that key.
+fn encrypt_utf8_checked(plaintext: &str, user_pub_armored: &str) -> Result<String, L0dError> {
+    let armor = pgp::encrypt_utf8(plaintext, user_pub_armored)?;
+    let expected = pgp::transport_key_id_armored(user_pub_armored)?;
+    let recipients = pgp::pkesk_recipient_key_ids(&armor)?;
+    if !recipients
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(&expected))
+    {
+        return Err(L0dError::L0(format!(
+            "user-PGP wrap PKESK recipients {recipients:?} do not include expected {expected}"
+        )));
+    }
+    Ok(armor)
 }
 
 pub fn wrap_offer_for_user_pgp(
@@ -332,11 +380,21 @@ pub fn parse_offer_plain(plain: &str) -> Result<DuplexOffer, L0dError> {
             .and_then(Value::as_str)
             .ok_or_else(|| L0dError::L0("duplex_offer missing walletAddress".into()))?,
     )?;
+    let billing_wallet = normalize_eoa(
+        v.get("billingWallet")
+            .and_then(Value::as_str)
+            .unwrap_or(&from),
+    )?;
     let main_wallet = normalize_eoa(
         v.get("mainWallet")
             .and_then(Value::as_str)
             .or_else(|| v.get("walletAddress").and_then(Value::as_str))
             .ok_or_else(|| L0dError::L0("duplex_offer missing mainWallet".into()))?,
+    )?;
+    let peer_wallet = normalize_eoa(
+        v.get("peerWallet")
+            .and_then(Value::as_str)
+            .ok_or_else(|| L0dError::L0("duplex_offer missing peerWallet".into()))?,
     )?;
     let port = u16::try_from(
         v.get("port")
@@ -349,25 +407,77 @@ pub fn parse_offer_plain(plain: &str) -> Result<DuplexOffer, L0dError> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let listen_route_pgp = v
+        .get("listenRoutePgp")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let timestamp = v
         .get("timestamp")
         .and_then(Value::as_u64)
         .ok_or_else(|| L0dError::L0("duplex_offer missing timestamp".into()))?;
+    let first_chunk = match v.get("firstChunk").and_then(Value::as_str) {
+        Some(raw) => base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .map_err(|e| L0dError::L0(format!("duplex_offer firstChunk base64: {e}")))?,
+        None => Vec::new(),
+    };
     Ok(DuplexOffer {
         session_id,
         main_wallet,
+        peer_wallet,
         port,
         key,
         listen_wallet,
         listen_user_pgp,
+        listen_route_pgp,
         from,
+        billing_wallet,
         timestamp,
+        first_chunk,
     })
 }
 
-/// Gossip inbound: raw offer JSON, signed `{ message, signMessage }`, or base64 of that wrapper.
+/// Parse only a signed `{ message, signMessage }` offer (or base64 nesting of
+/// that wrapper). The recovered signer must match `billingWallet`; raw offer
+/// JSON is not an authoritative new-line request.
 pub fn parse_offer_from_inbound_plain(plain: &str) -> Result<DuplexOffer, L0dError> {
-    parse_signed_or_raw(plain, |inner| parse_offer_plain(inner))
+    let (message, signature) = verified_signed_message(plain)?;
+    let offer = parse_offer_plain(&message)?;
+    let signer = crate::l0::eip191::recover_personal_sign(message.as_bytes(), &signature)?;
+    if !crate::l0::eip191::eoa_eq(&signer, &offer.billing_wallet) {
+        return Err(L0dError::L0(
+            "duplex_offer signature does not match billingWallet".into(),
+        ));
+    }
+    Ok(offer)
+}
+
+fn verified_signed_message(plain: &str) -> Result<(String, String), L0dError> {
+    let mut current = plain.trim().to_string();
+    for _ in 0..3 {
+        if current.starts_with('{') {
+            let value: Value = serde_json::from_str(&current)
+                .map_err(|e| L0dError::L0(format!("duplex signed wrapper: {e}")))?;
+            if let Some(message) = value.get("message").and_then(Value::as_str) {
+                let signature = value
+                    .get("signMessage")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        L0dError::L0("duplex signed wrapper missing signMessage".into())
+                    })?;
+                return Ok((message.to_string(), signature.to_string()));
+            }
+        }
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(current.trim())
+            .map_err(|_| L0dError::L0("duplex offer is not a signed wrapper".into()))?;
+        current = String::from_utf8(raw)
+            .map_err(|_| L0dError::L0("duplex signed wrapper is not UTF-8".into()))?;
+    }
+    Err(L0dError::L0(
+        "duplex offer signed wrapper nesting is too deep".into(),
+    ))
 }
 
 fn parse_signed_or_raw<T>(
@@ -404,12 +514,22 @@ fn parse_signed_or_raw<T>(
 pub struct DuplexOffer {
     pub session_id: String,
     pub main_wallet: String,
+    pub peer_wallet: String,
     pub port: u16,
     pub key: [u8; aes::KEY_LEN],
     pub listen_wallet: String,
     pub listen_user_pgp: String,
+    /// Mailbox route public key registered for `listen_wallet`. The peer must
+    /// encrypt `l0_connect` to this exact route; a static peer route is not a
+    /// valid substitute for a per-socket temporary wallet.
+    pub listen_route_pgp: String,
     pub from: String,
+    /// Main paid wallet recovered from the signed control envelope.  The
+    /// temporary `from` wallet is the per-socket mailbox identity and cannot
+    /// be used to select a statically configured peer.
+    pub billing_wallet: String,
     pub timestamp: u64,
+    pub first_chunk: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -417,7 +537,11 @@ pub struct DuplexAccept {
     pub session_id: String,
     pub listen_wallet: String,
     pub listen_user_pgp: String,
+    pub listen_route_pgp: String,
+    pub billing_wallet: String,
+    pub timestamp: u64,
     pub key: [u8; aes::KEY_LEN],
+    pub response_chunk: Vec<u8>,
 }
 
 pub fn parse_duplex_frame_json(payload: &str) -> Option<(String, String)> {
@@ -438,43 +562,83 @@ pub fn parse_duplex_ping_json(payload: &str) -> Option<String> {
     v.get("pipe_handle")?.as_str().map(str::to_string)
 }
 
-/// App-layer accept on the initiator's session listen SSE (not an SI event).
-pub fn parse_accept(payload: &str) -> Option<DuplexAccept> {
-    parse_signed_or_raw(payload, |inner| {
-        let v: Value = serde_json::from_str(inner.trim())
-            .map_err(|e| L0dError::L0(format!("duplex_accept: {e}")))?;
-        if v.get("command").and_then(Value::as_str) != Some("duplex_accept") {
-            return Err(L0dError::L0("not duplex_accept".into()));
-        }
-        let session_id = v
-            .get("pipe_handle")
+pub(crate) fn parse_accept_plain(plain: &str) -> Result<DuplexAccept, L0dError> {
+    let v: Value = serde_json::from_str(plain.trim())
+        .map_err(|e| L0dError::L0(format!("duplex_accept: {e}")))?;
+    if v.get("command").and_then(Value::as_str) != Some("duplex_accept") {
+        return Err(L0dError::L0("not duplex_accept".into()));
+    }
+    let session_id = v
+        .get("pipe_handle")
+        .and_then(Value::as_str)
+        .ok_or_else(|| L0dError::L0("duplex_accept missing pipe_handle".into()))?
+        .to_string();
+    let listen_wallet = normalize_eoa(
+        v.get("listenWallet")
             .and_then(Value::as_str)
-            .ok_or_else(|| L0dError::L0("duplex_accept missing pipe_handle".into()))?
-            .to_string();
-        let listen_wallet = normalize_eoa(
-            v.get("listenWallet")
-                .and_then(Value::as_str)
-                .or_else(|| v.get("walletAddress").and_then(Value::as_str))
-                .ok_or_else(|| L0dError::L0("duplex_accept missing listenWallet".into()))?,
-        )?;
-        let key = aes::key_from_standard_b64(
-            v.get("Securitykey")
-                .and_then(Value::as_str)
-                .ok_or_else(|| L0dError::L0("duplex_accept missing Securitykey".into()))?,
-        )?;
-        let listen_user_pgp = v
-            .get("listenUserPgp")
+            .or_else(|| v.get("walletAddress").and_then(Value::as_str))
+            .ok_or_else(|| L0dError::L0("duplex_accept missing listenWallet".into()))?,
+    )?;
+    let wallet = normalize_eoa(
+        v.get("walletAddress")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        Ok(DuplexAccept {
-            session_id,
-            listen_wallet,
-            listen_user_pgp,
-            key,
-        })
+            .ok_or_else(|| L0dError::L0("duplex_accept missing walletAddress".into()))?,
+    )?;
+    let billing_wallet = normalize_eoa(
+        v.get("billingWallet")
+            .and_then(Value::as_str)
+            .unwrap_or(&wallet),
+    )?;
+    let key = aes::key_from_standard_b64(
+        v.get("Securitykey")
+            .and_then(Value::as_str)
+            .ok_or_else(|| L0dError::L0("duplex_accept missing Securitykey".into()))?,
+    )?;
+    let listen_user_pgp = v
+        .get("listenUserPgp")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let listen_route_pgp = v
+        .get("listenRoutePgp")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let timestamp = v
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| L0dError::L0("duplex_accept missing timestamp".into()))?;
+    let response_chunk = match v.get("responseChunk").and_then(Value::as_str) {
+        Some(raw) => base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .map_err(|e| L0dError::L0(format!("duplex_accept responseChunk base64: {e}")))?,
+        None => Vec::new(),
+    };
+    Ok(DuplexAccept {
+        session_id,
+        listen_wallet,
+        listen_user_pgp,
+        listen_route_pgp,
+        billing_wallet,
+        timestamp,
+        key,
+        response_chunk,
     })
-    .ok()
+}
+
+/// Parse only a signed app-layer accept on the initiator's temporary listen
+/// SSE. The recovered signer must equal `billingWallet`; unsigned/raw accepts
+/// cannot attach a peer route or release a paused local socket.
+pub fn parse_accept_from_inbound_plain(plain: &str) -> Result<DuplexAccept, L0dError> {
+    let (message, signature) = verified_signed_message(plain)?;
+    let accept = parse_accept_plain(&message)?;
+    let signer = crate::l0::eip191::recover_personal_sign(message.as_bytes(), &signature)?;
+    if !crate::l0::eip191::eoa_eq(&signer, &accept.billing_wallet) {
+        return Err(L0dError::L0(
+            "duplex_accept signature does not match billingWallet".into(),
+        ));
+    }
+    Ok(accept)
 }
 
 pub fn parse_reject(payload: &str) -> Option<String> {
@@ -520,14 +684,17 @@ mod tests {
         let initiator = "0x1111111111111111111111111111111111111111";
         let cmd = encode_offer_command_for_port(
             initiator,
+            initiator,
             main,
             main,
             initiator,
             "",
+            "route-pgp",
             8400,
             &new_pipe_handle(),
             &key,
             1,
+            None,
         )
         .unwrap();
         let offer = parse_offer_plain(&cmd).unwrap();
@@ -542,10 +709,13 @@ mod tests {
         let cmd = encode_accept_command(
             "0x1111111111111111111111111111111111111111",
             "0x1111111111111111111111111111111111111111",
+            "0x1111111111111111111111111111111111111111",
             "",
+            "route-pgp",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &key,
             1,
+            None,
         )
         .unwrap();
         assert!(cmd.contains("duplex_accept"));
@@ -580,6 +750,7 @@ mod tests {
             "0x2222222222222222222222222222222222222222",
             eth.address(),
             &user_pub,
+            &user_pub,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             &key,
             9,
@@ -604,6 +775,7 @@ mod tests {
             "0x2222222222222222222222222222222222222222",
             eth.address(),
             "",
+            "route-pgp",
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             &key,
             3,
@@ -616,15 +788,18 @@ mod tests {
         let accept = encode_accept_command(
             eth.address(),
             eth.address(),
+            eth.address(),
             "",
+            "route-pgp",
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             &key,
             4,
+            None,
         )
         .unwrap();
         let sign_a = eth.personal_sign(accept.as_bytes()).unwrap();
         let wrap_a = serde_json::json!({ "message": accept, "signMessage": sign_a }).to_string();
-        let got = parse_accept(&wrap_a).expect("accept");
+        let got = parse_accept_from_inbound_plain(&wrap_a).expect("accept");
         assert_eq!(
             got.session_id,
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
@@ -640,6 +815,69 @@ mod tests {
     }
 
     #[test]
+    fn signed_offer_separates_socket_wallet_from_billing_wallet() {
+        let billing = test_eth();
+        let recipient = generate_test_cert();
+        let recipient_pub = public_cert_armored(&recipient).unwrap();
+        let socket_wallet = "0x1111111111111111111111111111111111111111";
+        let key = aes::generate_key();
+        let cmd = encode_offer_command_for_port(
+            socket_wallet,
+            billing.address(),
+            "0x2222222222222222222222222222222222222222",
+            "0x2222222222222222222222222222222222222222",
+            socket_wallet,
+            "",
+            "route-pgp",
+            8400,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &key,
+            8,
+            Some(b"hello"),
+        )
+        .unwrap();
+        let armor = wrap_offer_for_user_pgp(&cmd, &recipient_pub, &billing).unwrap();
+        let plain = decrypt_utf8(&armor, &recipient).unwrap();
+        let offer = parse_offer_from_inbound_plain(&plain).unwrap();
+        assert_eq!(offer.from, socket_wallet);
+        assert_eq!(offer.listen_wallet, socket_wallet);
+        assert_eq!(offer.billing_wallet, billing.address());
+        assert_eq!(offer.first_chunk, b"hello");
+    }
+
+    #[test]
+    fn signed_offer_rejects_billing_wallet_not_matching_signer() {
+        let signer = test_eth();
+        let key = aes::generate_key();
+        let cmd = encode_offer_command_for_port(
+            signer.address(),
+            signer.address(),
+            "0x2222222222222222222222222222222222222222",
+            "0x2222222222222222222222222222222222222222",
+            signer.address(),
+            "",
+            "route-pgp",
+            8400,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &key,
+            9,
+            Some(b"hello"),
+        )
+        .unwrap();
+        let mut value: Value = serde_json::from_str(&cmd).unwrap();
+        value["billingWallet"] =
+            Value::String("0x3333333333333333333333333333333333333333".to_string());
+        let message = serde_json::to_string(&value).unwrap();
+        let signature = signer.personal_sign(message.as_bytes()).unwrap();
+        let wrapper = serde_json::json!({
+            "message": message,
+            "signMessage": signature,
+        })
+        .to_string();
+        assert!(parse_offer_from_inbound_plain(&wrapper).is_err());
+    }
+
+    #[test]
     fn seal_frame_is_aes_blob_not_pgp() {
         let key = aes::generate_key();
         let blob = seal_frame(&key, "aa", b"L0D1xxxx").unwrap();
@@ -649,6 +887,18 @@ mod tests {
         let (sid, payload) = parse_duplex_frame_json(&plain).unwrap();
         assert_eq!(sid, "aa");
         assert!(!payload.contains("Securitykey"));
+    }
+
+    #[test]
+    fn looks_like_aes_blob_rejects_short_or_invalid() {
+        assert!(!looks_like_aes_blob("{"));
+        assert!(!looks_like_aes_blob("-----BEGIN PGP"));
+        assert!(!looks_like_aes_blob(&"A".repeat(32)));
+        assert!(!looks_like_aes_blob("not base64!!!______________"));
+        let key = aes::generate_key();
+        let ping = seal_ping(&key, "pipe-handle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1).unwrap();
+        assert!(looks_like_aes_blob(&ping));
+        assert!(ping.len() > 32);
     }
 
     #[test]

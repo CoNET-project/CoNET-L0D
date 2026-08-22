@@ -1,7 +1,39 @@
+## Client 与 proxy 传输分流
+
+客户端有两种明确传输：`--client` 使用 P1 请求/响应路径，
+`--clientDuplex` 使用加密的持续 duplex pipe。L0d 会自动选择并打印
+本地 VIP，客户端不需要额外配置防火墙或 iptables。
+
+## 以 socket 为边界的 duplex 握手
+
+本地 TCP socket 事件是唯一的连接句柄。新 socket 读取首段应用数据后
+保持暂停；发起端创建并登记该 socket 专属的临时钱包/PGP route，等待临时
+`l0_listen` SSE 就绪后，才把数据作为 `firstChunk` 放入
+`duplex_offer`。只有 EIP-191 签名者与 `billingWallet` 一致，且 offer
+明确匹配 main wallet/port 及 `--proxyDuplex` 端口时，proxy 才能创建
+临时线路。proxy 先登记自己的临时 route 并等待 listen SSE 就绪，再创建
+上游 TCP client、发送 `firstChunk`，取得首段响应后暂停上游，把响应作为
+`responseChunk` 放入 `duplex_accept`。仅当返程 pipe 仍空时，proxy 才反向
+占用发起端 listen，然后开始向上游与 pipe 转发。它**不等**下一协议块：
+geth / beacon 在 Hello 之后常常保持暂停，直到两条占用管道都起来。
+发起端用该 socket 的临时 PGP 私钥解密 accept，把 `responseChunk` 写回本地
+socket 后立刻 occupy（允许空的首个 AES blob）。后续数据只复用同一个
+不透明 `pipe_handle`；未签名、过期、未匹配或不明确的 offer 不得创建临时线路。
+
+服务器端同样分流：`--proxy` 是请求/响应配置，
+`--proxyDuplex` 是持续原始 stream。仅 proxy 模式有意不依赖网络配置：
+不创建 TUN、路由或 iptables 链。两种 proxy 配置之间的逻辑端口必须唯一。
+
+`--clientDuplex` 按连接事件分配线路。本地 `TcpListener.accept()` 事件
+就是唯一的本地连接句柄：每个新 socket 都生成新的临时钱包/PGP route、
+AES key、透明 `pipe_handle`、返回队列和占用线路。同一个 socket 在 EOF
+或错误前始终复用该线路；即使连接同一个本地端口，第二个 socket 也会
+获得另一条线路。L0d 不在 Geth/Prysm 原始字节前插入私有 header，而由
+socket handle 与加密的 `pipe_handle` 负责关联。
 # conet-l0d — 在 Layer Minus 上的 L1 overlay
 
 **成对译本：** [English](./conet-l0d.md)  
-**Revision：** 2026-08-20（slot 关键指标发表门槛 vs 公网 P2P；多 Guardian / 多 Mailbox 路径多样性；SI `l0_listen` / `l0_connect` 占用管道；应用层 duplex；可选按端口 `[[l0.channels]]`；实验室 overlay TCP/UDP；不是生产 discv5 产品）  
+**Revision：** 2026-08-22（proxy 握手在 accept 后即可反向占用，不等 resume 首包；客户端写回 `responseChunk` 后立刻 occupy；`regiestChatRoute` HTTP 200 后等待 AddressPGP `searchKey`；入站按 PKESK 选解密密钥；SSE/返程 pipe 就绪门闸；按连接 socket 句柄分配 duplex 线路；每连接临时身份；slot 关键指标发表门槛 vs 公网 P2P；多 Guardian / 多 Mailbox 路径多样性；SI `l0_listen` / `l0_connect` 占用管道；应用层 duplex；可选按端口 `[[l0.channels]]`；实验室 overlay TCP/UDP；不是生产 discv5 产品）
 **公开操作说明：** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **公开开发说明：** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -228,10 +260,16 @@ writer。对端观察到 EOF 后必须停止向该管道实例继续写入。
 
 ## 14. 临时通道由主钱包计费（2026-08-21）
 
-当 proxy 请求以 `mainWallet:port` 寻址时，`conet-l0d` 为该线路生成仅存在于
-进程内存的临时通信钱包与 OpenPGP 身份，并在发送该身份的第一条 mailbox
-命令前，通过现有 AddressPGP 注册接口登记临时用户 PGP 与 route key。临时
-钱包因此可以被路由，但绝不是付款方。
+当明确的新线路请求以 `mainWallet:port` 寻址时，`conet-l0d` 才为该线路生成
+仅存在于进程内存的临时通信钱包与 OpenPGP 身份，并在处理任何 offer 前，
+通过现有 AddressPGP 注册接口登记临时用户 PGP 与 route key。
+`regiestChatRoute` 的 HTTP 200 只表示入队成功：mailbox 仍读 AddressPGP
+的 `searchKey`，因此 daemon 必须等到 CoNET RPC 上能看到该 `routeKeyID`
+后才打开 `l0_listen`。临时钱包因此可以被路由，但绝不是付款方。
+
+`duplex_offer` 加密给该 `mainWallet:port` 的目标 **user** PGP。接收端按
+消息 PKESK 收件人选择解密密钥，不得按 listen 钱包列表顺序逐个试解。
+若恢复出的 `ingress_wallet` 不是该端口配置的 routing EOA，必须拒绝 offer。
 
 Mailbox 命令的 `walletAddress` 保留临时钱包，另携带配置的付费账户
 `billingWallet`，并由付费账户制作 EIP-191 签名。CoNET-SI 使用
@@ -239,7 +277,9 @@ Mailbox 命令的 `walletAddress` 保留临时钱包，另携带配置的付费�
 并将 hop 用量记到计费钱包。没有 `billingWallet` 时，SI 保留旧规则：签名
 恢复地址必须等于 `walletAddress`。
 
-每条 proxy 线路拥有独立的临时钱包、PGP 登记、AES 密钥、occupied pipe、
-opaque handle 与上游 socket。多个 client 可以共享逻辑端口，但不得共享
-上述任何身份或传输资源。登记或计费失败必须 fail-closed，不能静默使用
-未登记的临时路由。
+每个明确的新线路请求拥有独立的临时钱包、PGP 登记、AES 密钥、occupied
+pipe、opaque handle 与上游 socket。多个 client 可以共享逻辑端口，但不得
+共享上述任何身份或传输资源。收到 `duplex_offer` 只能绑定已经登记的
+`pipe_handle` 或临时 `listenWallet`；未知、过期或有歧义的 offer 必须拒绝，
+不得分配身份、创建 session 或发起新的 `l0_connect`。登记或计费失败必须
+fail-closed，不能静默使用未登记的临时路由。

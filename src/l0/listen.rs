@@ -18,6 +18,7 @@ use crate::error::L0dError;
 use crate::l0::eip191::EthSecret;
 use crate::l0::{eip191, envelope, pgp, post};
 use base64::Engine;
+use reqwest::header::CONTENT_TYPE;
 use sequoia_openpgp::Cert;
 use serde_json::Value;
 use std::time::Duration;
@@ -262,7 +263,11 @@ pub fn prepare_l0_listen_post_with_billing(
         billing_eth,
         billing_wallet,
     )?;
-    let armor = wrap_listen_for_post_as(&cmd, route_pub_armored, billing_eth)?;
+    // `encode_signed_listen_plaintext_with_billing` already returns the
+    // base64-encoded SI wrapper. Do not pass it through
+    // `wrap_listen_for_post_as`, which expects the unsigned JSON command and
+    // would attempt to parse the base64 string as JSON.
+    let armor = pgp::encrypt_utf8(&cmd, route_pub_armored)?;
     let url = post::post_url(entry)?;
     Ok((url, armor))
 }
@@ -304,7 +309,12 @@ pub fn listen_http_client() -> Result<reqwest::Client, L0dError> {
         .map_err(|e| L0dError::L0(format!("listen http client: {e}")))
 }
 
-/// POST listen armor. Require HTTP 2xx. Do not treat a non-2xx as a live SSE.
+/// POST listen armor. Require both HTTP 2xx and an actual SSE response.
+///
+/// SI intentionally returns a finite `text/html` JSON body for protocol-level
+/// failures such as `not_my_route`.  Treating that 200 response as ready lets a
+/// temporary duplex line connect its upstream before AddressPGP propagation
+/// has made the listen route usable.
 pub async fn open_listen_sse(
     client: &reqwest::Client,
     url: &str,
@@ -325,6 +335,34 @@ pub async fn open_listen_sse(
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(L0dError::L0(format!("listen POST HTTP {status}")));
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let media_type = content_type.split(';').next().map(str::trim).unwrap_or("");
+    if !media_type.eq_ignore_ascii_case("text/event-stream") {
+        let detail = tokio::time::timeout(Duration::from_secs(3), response.text())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let detail: String = detail.trim().chars().take(256).collect();
+        return Err(L0dError::L0(format!(
+            "listen POST expected text/event-stream, got {}{}",
+            if content_type.is_empty() {
+                "missing Content-Type"
+            } else {
+                &content_type
+            },
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        )));
     }
     if response.content_length() == Some(0) {
         return Err(L0dError::L0("listen POST returned empty body".into()));
@@ -444,7 +482,7 @@ fn extract_armors_from_frame(frame: &str) -> Vec<String> {
     let trimmed = payload.trim();
     if trimmed.starts_with('{')
         && (crate::l0::duplex::parse_duplex_frame_json(trimmed).is_some()
-            || crate::l0::duplex::parse_accept(trimmed).is_some()
+            || crate::l0::duplex::parse_accept_plain(trimmed).is_ok()
             || crate::l0::duplex::parse_reject(trimmed).is_some()
             || crate::l0::duplex::parse_l0_occupied(trimmed)
             || trimmed.contains("\"duplex_offer\""))
@@ -741,15 +779,23 @@ mod tests {
 
     #[test]
     fn aes_sse_does_not_complete_on_keepalive_nlnl() {
-        let half = "A".repeat(32);
+        let key = crate::l0::aes::generate_key();
+        let blob = crate::l0::duplex::seal_ping(
+            &key,
+            "pipe-handle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+        )
+        .unwrap();
+        assert!(blob.len() > 32);
+        let (half, rest) = blob.split_at(32);
         let mut buf = format!("data: {half}\n: keepalive\n\n");
         assert!(drain_sse_armors(&mut buf).is_empty());
-        assert!(buf.contains(&half));
+        assert!(buf.contains(half));
         assert!(!buf.contains("keepalive"));
-        buf.push_str("BBBB\r\n\r\n");
+        buf.push_str(&format!("{rest}\r\n\r\n"));
         let drained = drain_sse_armors(&mut buf);
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0], format!("{half}BBBB"));
+        assert_eq!(drained[0], blob);
         assert!(buf.is_empty());
     }
 
@@ -851,7 +897,10 @@ mod tests {
             .and(path("/post"))
             .and(body_string_contains("\"data\""))
             .and(body_string_contains("BEGIN PGP MESSAGE"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(armor_to_sse(&inbound)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(armor_to_sse(&inbound), "text/event-stream; charset=utf-8"),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -905,7 +954,10 @@ mod tests {
             .and(path("/post"))
             .and(body_string_contains("\"data\""))
             .and(body_string_contains("BEGIN PGP MESSAGE"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound)))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                armor_to_si_gossip(&inbound),
+                "text/event-stream; charset=utf-8",
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -962,18 +1014,20 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/post"))
             .and(body_string_contains("BEGIN PGP MESSAGE"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound_a)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                armor_to_si_gossip(&inbound_a),
+                "text/event-stream; charset=utf-8",
+            ))
             .expect(1)
             .mount(&server_a)
             .await;
         Mock::given(method("POST"))
             .and(path("/post"))
             .and(body_string_contains("BEGIN PGP MESSAGE"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(armor_to_si_gossip(&inbound_b)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                armor_to_si_gossip(&inbound_b),
+                "text/event-stream; charset=utf-8",
+            ))
             .expect(1)
             .mount(&server_b)
             .await;
@@ -1061,5 +1115,35 @@ mod tests {
             .await
             .expect_err("404 must not be treated as SSE");
         assert!(err.to_string().contains("HTTP 404"));
+    }
+
+    #[tokio::test]
+    async fn listen_http_200_protocol_error_is_not_sse_ready() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/post"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"ok":false,"error":"not_my_route"}"#,
+                "text/html; charset=utf-8",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let route = generate_test_cert();
+        let route_pub = public_cert_armored(&route).unwrap();
+        let eth = test_eth();
+        let (url, armor) =
+            prepare_listen_post(eth.address(), 1, &route_pub, &server.uri(), &eth).unwrap();
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let client = listen_http_client().unwrap();
+        let err = run_listen_once(&client, &url, &armor, &tx)
+            .await
+            .expect_err("finite 200 error body must not open the SSE gate");
+        assert!(err.to_string().contains("expected text/event-stream"));
+        assert!(err.to_string().contains("not_my_route"));
     }
 }

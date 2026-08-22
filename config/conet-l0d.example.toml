@@ -3,7 +3,8 @@
 
 tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
-local_vip = "100.64.0.5"
+# `auto` selects an unused-looking VIP in overlay_cidr (normally .5).
+local_vip = "auto"
 iptables_chain = "CONET_L0D"
 state_path = "/run/conet-l0d/state.json"
 # Optional: never capture this uid (Prysm validator).
@@ -74,17 +75,31 @@ tcp_ports = [4200]
 # Server-side dynamic proxy. The upstream port is also the logical L0 port.
 # Every incoming request receives a new temporary wallet/PGP/AES/session.
 # Temporary identities are memory-only and are registered before routing.
-# When proxies are set and clients is empty (proxy_server_only), start still
-# owns TUN (IPv4 duplex from --client peers). Proxies drain non-IPv4 only.
+# When proxies are set and clients are empty (proxy_server_only), no TUN,
+# route, or iptables resource is created. `proxy` is request/response; duplex
+# lines are declared separately with `proxy_duplex`.
 # [[l0.proxies]]
 # host = "127.0.0.1"
 # port = 8400
 #
-# Client intercept toward a peer mainWallet:port (TUN still required).
-# Seeds pending duplex even when the port is absent from peers.*.ports.
+# [[l0.proxy_duplex]]
+# host = "127.0.0.1"
+# port = 4200
+#
+# Client endpoint toward a peer mainWallet:port.
+# The daemon advertises local_vip:port (for example 100.64.0.5:4000) and
+# maps packets sent there to the configured web3 target. No extra iptables
+# rules are needed; L0d owns the TUN/routing rules.
+# `--client` is the request/response client mode. Duplex channel seeding is
+# configured separately by the `--client-duplex` CLI option.
 # clients = [
 #   "web3://0x<mainWallet>:8400",
 #   "web3://0x<mainWallet>:4200",
+# ]
+#
+# Duplex clients use a separate setting:
+# client_duplex = [
+#   "web3://0x<mainWallet>:4000",
 # ]
 #
 # Per-peer public key files (lab override; do not log contents):

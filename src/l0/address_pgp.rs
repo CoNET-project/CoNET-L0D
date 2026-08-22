@@ -16,7 +16,6 @@ pub struct SearchKey {
     pub route_online: bool,
 }
 
-#[allow(dead_code)]
 pub fn search_key_selector() -> [u8; 4] {
     let mut hasher = Keccak::v256();
     hasher.update(b"searchKey(address)");
@@ -25,7 +24,6 @@ pub fn search_key_selector() -> [u8; 4] {
     [out[0], out[1], out[2], out[3]]
 }
 
-#[allow(dead_code)]
 pub fn encode_search_key_call(eoa: &str) -> Result<String, L0dError> {
     let hex = eoa
         .strip_prefix("0x")
@@ -42,7 +40,6 @@ pub fn encode_search_key_call(eoa: &str) -> Result<String, L0dError> {
     Ok(format!("0x{}", hex::encode(data)))
 }
 
-#[allow(dead_code)]
 pub fn decode_search_key_result(hex_data: &str) -> Result<SearchKey, L0dError> {
     let raw = hex_data.trim().trim_start_matches("0x");
     let data = hex::decode(raw).map_err(|e| L0dError::L0(format!("searchKey hex: {e}")))?;
@@ -88,6 +85,99 @@ fn read_string(data: &[u8], offset: usize) -> Result<String, L0dError> {
     }
     String::from_utf8(data[start..end].to_vec())
         .map_err(|_| L0dError::L0("searchKey string is not UTF-8".into()))
+}
+
+/// Compare AddressPGP `routeKeyID` values (ignore `0x` and case).
+pub fn route_key_id_eq(on_chain: &str, expected: &str) -> bool {
+    let a = on_chain
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_ascii_uppercase();
+    let b = expected
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_ascii_uppercase();
+    !a.is_empty() && !b.is_empty() && a == b
+}
+
+/// Live `searchKey(eoa)` on `l0.rpc`. Does not log armored keys.
+pub async fn search_key(rpc: &str, eoa: &str) -> Result<SearchKey, L0dError> {
+    let call = encode_search_key_call(eoa)?;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{"to": ADDRESS_PGP, "data": call}, "latest"]
+    });
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|e| L0dError::L0(format!("AddressPGP RPC client: {e}")))?;
+    let response = client
+        .post(rpc)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| L0dError::L0(format!("AddressPGP RPC: {e}")))?;
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| L0dError::L0(format!("AddressPGP RPC JSON: {e}")))?;
+    if let Some(err) = value.get("error") {
+        return Err(L0dError::L0(format!("AddressPGP RPC error: {err}")));
+    }
+    let result = value
+        .get("result")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| L0dError::L0("AddressPGP searchKey returned no result".into()))?;
+    decode_search_key_result(result)
+}
+
+/// `regiestChatRoute` HTTP 200 is not enough: SI `isMyRoute` reads chain.
+pub async fn wait_until_route_visible(
+    rpc: &str,
+    eoa: &str,
+    expected_route_key_id: &str,
+) -> Result<(), L0dError> {
+    const ATTEMPTS: u32 = 24;
+    const SLEEP_SECS: u64 = 2;
+    for attempt in 1..=ATTEMPTS {
+        match search_key(rpc, eoa).await {
+            Ok(key) if route_key_id_eq(&key.route_pgp_key_id, expected_route_key_id) => {
+                tracing::info!(
+                    eoa,
+                    route_key_id = %expected_route_key_id,
+                    attempt,
+                    "AddressPGP searchKey route is visible"
+                );
+                return Ok(());
+            }
+            Ok(key) => {
+                tracing::info!(
+                    eoa,
+                    attempt,
+                    on_chain_route = %key.route_pgp_key_id,
+                    expected_route = %expected_route_key_id,
+                    "AddressPGP searchKey not yet matching; waiting"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    eoa,
+                    attempt,
+                    error = %err,
+                    "AddressPGP searchKey poll failed"
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(SLEEP_SECS)).await;
+    }
+    Err(L0dError::L0(format!(
+        "AddressPGP searchKey did not show route {expected_route_key_id} for {eoa} after {ATTEMPTS} polls"
+    )))
 }
 
 #[cfg(test)]
@@ -145,5 +235,13 @@ mod tests {
         assert_eq!(parsed.route_pgp_key_id, "route-id");
         assert!(parsed.route_online);
         assert_eq!(parsed.user_public_key_armored, "USER-ARMOR");
+    }
+
+    #[test]
+    fn route_key_id_eq_ignores_prefix_and_case() {
+        assert!(route_key_id_eq("0ad95da2e8bb7a0d", "0AD95DA2E8BB7A0D"));
+        assert!(route_key_id_eq("0x0AD95DA2E8BB7A0D", "0ad95da2e8bb7a0d"));
+        assert!(!route_key_id_eq("", "0AD95DA2E8BB7A0D"));
+        assert!(!route_key_id_eq("0AD95DA2E8BB7A0D", "9977E9A45187DD80"));
     }
 }

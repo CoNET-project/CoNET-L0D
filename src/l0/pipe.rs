@@ -14,6 +14,7 @@ use crate::l0::aes;
 use crate::l0::duplex;
 use crate::l0::post;
 use rustls::pki_types::ServerName;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -27,24 +28,42 @@ pub const PIPE_DATA_TIMEOUT: Duration = Duration::from_secs(120);
 pub const PIPE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 use tokio_rustls::TlsConnector;
 
+/// Live duplex-map lookup for occupy-pipe heartbeats. Do **not** freeze
+/// `sess.key` at `spawn_l0_pipe`: retain / rekey would keep sending pings
+/// with a dead key (`duplex AES blob did not open`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeHeartbeat {
+    /// Seal `duplex_ping` with this key (current map value).
+    Key([u8; aes::KEY_LEN]),
+    /// Session is still live but has no AES key yet; skip this beat.
+    Skip,
+    /// Session was retained / rejected; stop the occupy task.
+    Stop,
+}
+
 /// Opens occupied TCP, waits for HTTP 2xx, then calls `on_up` **before** the
 /// first AES blob. `on_up` is where the crate may install `pipe_tx` so TUN
 /// frames are not queued onto a pipe that never got 200.
 ///
 /// When `inbound_tx` is set, AES lines read from the occupied TCP (peer return
 /// path) are forwarded into the same listen inbound queue as SSE AES blobs.
-pub async fn run_occupied_pipe<F>(
+///
+/// `heartbeat_of` is invoked on each beat (and on the 100ms poll) so the pipe
+/// always uses the current duplex-map key, or exits when the session is gone.
+pub async fn run_occupied_pipe<F, H>(
     entries: &[String],
     connect_armor: &str,
     expected_session_id: &str,
-    heartbeat_key: Option<[u8; aes::KEY_LEN]>,
+    mut heartbeat_of: H,
     mut first: Option<String>,
     mut rx: mpsc::Receiver<String>,
     inbound_tx: Option<mpsc::Sender<String>>,
+    cancel: Arc<AtomicBool>,
     mut on_up: F,
 ) -> Result<(), L0dError>
 where
     F: FnMut(),
+    H: FnMut() -> PipeHeartbeat,
 {
     if entries.is_empty() {
         return Err(L0dError::L0(
@@ -66,23 +85,39 @@ where
                 let mut heartbeat = Box::pin(sleep(PIPE_HEARTBEAT_INTERVAL));
                 loop {
                     tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            if cancel.load(Ordering::Acquire)
+                                || matches!(heartbeat_of(), PipeHeartbeat::Stop)
+                            {
+                                return Ok(());
+                            }
+                        }
                         blob = rx.recv() => {
                             match blob {
                                 Some(b) => write_blob_line(&mut stream, &b).await?,
                                 None => return Ok(()),
                             }
                         }
-                        _ = &mut heartbeat, if heartbeat_key.is_some() => {
-                            let key = heartbeat_key.as_ref().expect("heartbeat key");
-                            let ping = duplex::seal_ping(
-                                key,
-                                expected_session_id,
-                                chrono::Utc::now().timestamp().max(0) as u64,
-                            )?;
-                            write_blob_line(&mut stream, &ping).await?;
-                            heartbeat
-                                .as_mut()
-                                .reset(Instant::now() + PIPE_HEARTBEAT_INTERVAL);
+                        _ = &mut heartbeat => {
+                            match heartbeat_of() {
+                                PipeHeartbeat::Stop => return Ok(()),
+                                PipeHeartbeat::Skip => {
+                                    heartbeat
+                                        .as_mut()
+                                        .reset(Instant::now() + PIPE_HEARTBEAT_INTERVAL);
+                                }
+                                PipeHeartbeat::Key(key) => {
+                                    let ping = duplex::seal_ping(
+                                        &key,
+                                        expected_session_id,
+                                        chrono::Utc::now().timestamp().max(0) as u64,
+                                    )?;
+                                    write_blob_line(&mut stream, &ping).await?;
+                                    heartbeat
+                                        .as_mut()
+                                        .reset(Instant::now() + PIPE_HEARTBEAT_INTERVAL);
+                                }
+                            }
                         }
                         line = read_pipe_line(&mut reader, &mut line_buf) => {
                             match line? {

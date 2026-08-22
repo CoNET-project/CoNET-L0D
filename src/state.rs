@@ -11,6 +11,10 @@ pub struct RuntimeState {
     pub local_vip: String,
     pub iptables_chain: String,
     pub started_at: String,
+    #[serde(default)]
+    pub proxy_only: bool,
+    #[serde(default)]
+    pub client_mappings: Vec<String>,
 }
 
 impl RuntimeState {
@@ -22,6 +26,12 @@ impl RuntimeState {
             local_vip: cfg.local_vip.to_string(),
             iptables_chain: cfg.raw.iptables_chain.clone(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            proxy_only: cfg.proxy_server_only(),
+            client_mappings: cfg
+                .client_mappings()
+                .into_iter()
+                .map(|(target, endpoint)| format!("{target} -> {endpoint}"))
+                .collect(),
         }
     }
 

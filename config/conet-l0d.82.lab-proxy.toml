@@ -1,5 +1,5 @@
-# Lab: production hub .82 as **proxy-server** L0 (TUN + proxies; apply listen-DNAT).
-# IPv4 duplex from clients → TUN; non-IPv4 → [[l0.proxies]] upstream.
+# Lab: production hub .82 as **proxy-server** L0 (no TUN/iptables).
+# Each duplex line is delivered directly to its configured upstream.
 # Upstream targets = local geth :8400 + beacon :4200.
 # Billing / offer match = mainWallet 0x66dC…; each accepted client line gets
 # a fresh temporary listen identity.  The proxy can therefore multiplex .45
@@ -89,13 +89,13 @@ listen_entries = [
   "http://20ab90fe82d0e9e3.conet.network",
 ]
 
-# Proxies: raw-byte drain for non-IPv4. Hub still owns TUN for IPv4 clients.
-# geth binds *:8400 → 127.0.0.1 OK. Lab beacon binds public IP only for :4200
+# Duplex proxies: raw bidirectional forwarding. geth binds *:8400 → 127.0.0.1 OK.
+# Lab beacon binds public IP only for :4200
 # (ss: 216.225.202.82:4200), so do not use 127.0.0.1:4200; use listen-DNAT.
-[[l0.proxies]]
+[[l0.proxy_duplex]]
 host = "127.0.0.1"
 port = 8400
 
-[[l0.proxies]]
+[[l0.proxy_duplex]]
 host = "216.225.202.82"
 port = 4200

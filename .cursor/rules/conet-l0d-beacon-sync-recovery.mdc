@@ -41,7 +41,7 @@ alwaysApply: true
 1. **只读确认**
    - Spoke：`curl -s http://127.0.0.1:4100/eth/v1/node/peer_count`
    - `ss -tn \| grep -E '100.64|:4200|:8400'`
-   - Hub：`curl -s http://127.0.0.1:4100/eth/v1/node/identity` → `peer_id` 须等于 spoke `--peer` / static multiaddr
+   - Hub `peer_id`：对照 crate `scripts/l1-beacon-static-peers.env`（`.82` `16Uiu2HAmDJCHuVkXtkPrrL8YykQ9gFZnQkR9Q6WjZZUrmueohPfd`，`.98` `16Uiu2HAmF1SXGHnne9DQTHGfgGQgje3cBV8pdSLJF25ajYKr2hvS`）。`.82` `:4100` identity 可用；**勿** curl `.98` `:4100` identity（`--no-discovery` 时 HTTP 500 / nil ENR）。DHT `:4110` id **不是** beacon `--peer`
    - `conet-l0d.log`：`duplex_offer accepted`、`:4200` AES、是否刷屏 `409`
 2. **Steer / DNAT / conntrack（不重启 EL/CL）**
    - Spoke：`overlay-dht-steer.sh apply`（若使用 public-ENR / hub 公网拨号再 DNAT 到 overlay）
@@ -101,6 +101,6 @@ alwaysApply: true
 ## 5. 相关
 
 - GitBook：`developers/l1-node.md`（overlay 部署 + recovery）、`applications/conet-l0d.md`、`developers/conet-l0d.md`
-- Crate：`RULES.md`、`docs/P1.md`、`docs/P2.md`、`scripts/overlay-*.sh`、`scripts/start-geth-beacon-only.sh`
+- Crate：`RULES.md`、`docs/P1.md`、`docs/P2.md`、`scripts/l1-beacon-static-peers.env`、`scripts/overlay-*.sh`、`scripts/start-geth-beacon-only.sh`
 - SI 舰队：`conet-si-fleet-update-restart.mdc`（滚动后若 lab 409，按本守则 §3.3–3.4）
 - 链重启总则：`critical-chain-infra-restart-requires-approval.mdc`

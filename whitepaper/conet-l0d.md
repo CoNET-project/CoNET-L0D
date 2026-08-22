@@ -1,7 +1,44 @@
+## Client and proxy transport split
+
+The client surface has two explicit transports. `--client` uses the P1
+request/response path; `--clientDuplex` uses the encrypted persistent duplex
+pipe. Client applications use the automatically selected local VIP printed by
+L0d, rather than configuring an additional firewall or iptables rule.
+
+The server surface mirrors this split: `--proxy` is request/response
+configuration and `--proxyDuplex` is a persistent raw stream. Proxy-only mode
+is intentionally network-independent: it does not create a TUN, route, or
+iptables chain. Logical ports are unique across both proxy mode lists.
+
+For `--clientDuplex`, duplex allocation is connection-driven. The local
+`TcpListener.accept()` event is the sole local connection handle: each new
+socket gets a new temporary wallet/PGP route, AES key, opaque `pipe_handle`,
+return queue, and occupied line. The same socket keeps that line until EOF or
+error, while another socket on the same local port gets another line. L0d
+does not prepend a private header to Geth/Prysm bytes; the socket handle and
+encrypted `pipe_handle` provide correlation.
+
+The initial application bytes are read from a new socket while that socket is
+paused. The initiator creates and registers its per-socket temporary wallet/PGP
+route and waits for its temporary listen SSE before sending those bytes as
+`firstChunk`. A proxy may allocate a temporary line only when the EIP-191
+signer matches `billingWallet` and the offer explicitly matches the configured
+main wallet and `--proxyDuplex` port. The proxy registers its own temporary
+route and waits for its listen SSE before opening the configured upstream TCP
+client. It forwards `firstChunk`, pauses after the first upstream bytes,
+returns them as `responseChunk` in `duplex_accept`. The proxy
+reverse-occupies the initiator listen only if that return pipe is still
+empty, then starts upstream-to-pipe forwarding. It does not wait for a second
+local protocol chunk: geth / beacon often stay paused after Hello until both
+occupied pipes are live. The initiator decrypts that accept with its
+temporary PGP key, writes the response, and occupies immediately (an empty
+first AES blob is allowed). Subsequent bytes reuse the same opaque handle;
+unsigned, stale, unmatched, or ambiguous offers must not allocate a temporary
+line.
 # conet-l0d — L1 overlay on Layer Minus
 
 **Paired translation:** [简体中文](./conet-l0d.zh-CN.md)  
-**Revision:** 2026-08-20 (slot-critical publication gate vs public P2P; multi-Guardian / multi-Mailbox path diversity; SI `l0_listen` / `l0_connect` occupancy pipe; application duplex; optional per-port `[[l0.channels]]`; lab overlay TCP/UDP; not a production discv5 product)  
+**Revision:** 2026-08-22 (proxy handshake reverse-occupies after accept without waiting for a resume blob; client occupies immediately after writing `responseChunk`; AddressPGP `searchKey` wait after `regiestChatRoute` HTTP 200; PKESK-selected inbound decrypt; ready-gated socket duplex bootstrap; connection-driven socket handles; per-connection temporary identities; slot-critical publication gate vs public P2P; multi-Guardian / multi-Mailbox path diversity; SI `l0_listen` / `l0_connect` occupancy pipe; application duplex; optional per-port `[[l0.channels]]`; lab overlay TCP/UDP; not a production discv5 product)
 **Public operator guide:** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **Public developer guide:** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -243,11 +280,20 @@ existing retry/backoff and occupancy limits.
 
 ## 14. Main-wallet billing for temporary channels (2026-08-21)
 
-For a proxy request addressed to `mainWallet:port`, `conet-l0d` creates a
-fresh, process-memory-only communication wallet and OpenPGP identity for that
-line. It registers the temporary user PGP and route key with the existing
-AddressPGP registration API before sending the identity's first mailbox
-command. The temporary wallet is therefore routable, but is never the payer.
+For an explicit new-line request addressed to `mainWallet:port`, `conet-l0d`
+creates a fresh, process-memory-only communication wallet and OpenPGP identity
+for that line. It registers the temporary user PGP and route key with the
+existing AddressPGP registration API before any offer is processed. HTTP 200
+from `regiestChatRoute` is queue admission only: the mailbox still reads
+`searchKey` on AddressPGP, so the daemon waits until that `routeKeyID` is
+visible on CoNET RPC before opening `l0_listen`. The temporary wallet is
+therefore routable, but is never the payer.
+
+A `duplex_offer` is OpenPGP-encrypted to the destination **user** PGP for
+that `mainWallet:port`. The receiver selects the decrypt secret from the
+message PKESK recipients and must not try every listen wallet in list order.
+If the recovered `ingress_wallet` is not the configured routing EOA for that
+port, the offer is rejected.
 
 The mailbox command keeps the temporary wallet in `walletAddress` and carries
 the configured paid account in `billingWallet`. Its EIP-191 signature is made
@@ -257,9 +303,12 @@ subject, and charges hop usage to the billing wallet. If `billingWallet` is
 absent, SI preserves the legacy rule that the signer must recover to
 `walletAddress`.
 
-Every accepted proxy line has an independent temporary wallet, PGP
+Every explicit new-line request has an independent temporary wallet, PGP
 registration, AES key, occupied pipe, opaque handle, and upstream socket.
 Multiple clients may share a logical proxy port without sharing any of these
-identities or transport resources. Registration or billing failure is
+identities or transport resources. A received `duplex_offer` is attach-only:
+it may match an already registered `pipe_handle` or temporary `listenWallet`.
+Unknown, stale, or ambiguous offers are rejected without allocation or a new
+`l0_connect`. Registration or billing failure is
 fail-closed; it must not silently fall back to an unregistered temporary
 route.

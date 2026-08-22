@@ -26,7 +26,9 @@ impl ForwardStats {
         self.ipv4_packets += 1;
         let known = cfg.overlay_ports();
         let locator = match overlay_channel_port(frame, &known) {
-            Some(_port) if dest == cfg.local_vip => Some(cfg.identity.clone()),
+            Some(port) if dest == cfg.local_vip => cfg
+                .lookup_client_target(dest, port)
+                .or_else(|| Some(cfg.identity.clone())),
             Some(port) => cfg.lookup_peer(dest, port).map(|p| p.locator.clone()),
             None => None,
         };

@@ -11,6 +11,10 @@ PROJECT_DIR="${PROJECT_DIR:-/home/peter/ethereum-pos-mainnet}"
 NODE_DIR="${NODE_DIR:-$PROJECT_DIR/network/node-0}"
 PUBLIC_IP="${PUBLIC_IP:-198.251.77.98}"
 CHAIN_ID="${CHAIN_ID:-224422}"
+# Host env files provide defaults only.  Keep an explicit stream peer passed
+# by the operator so a stale DHT/overlay peer cannot replace it.
+EXPLICIT_BEACON_PEERS_SET="${EXTRA_BEACON_PEERS+x}"
+EXPLICIT_BEACON_PEERS="${EXTRA_BEACON_PEERS:-}"
 L0_ONLY="${L0_ONLY:-0}"
 OVERLAY_CIDR="${OVERLAY_CIDR:-100.64.0.0/10}"
 OVERLAY_VIP="${OVERLAY_VIP:-100.64.0.6}"
@@ -56,6 +60,15 @@ EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-}"
 # DHT-over-L0 toward production hub .82 (steer dest 216.225.202.82:4300/:4200 → 100.64.0.7).
 # This host MUST stay a public discv5 hub for .45: do NOT last-wins allowlist /32, do NOT L0_ONLY isolate.
 LAB_DIR="${LAB_DIR:-/home/peter/conet-l0d-lab}"
+_L1_PEERS_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/l1-beacon-static-peers.env"
+if [[ -f "$_L1_PEERS_LOCAL" ]]; then
+	# shellcheck disable=SC1090
+	source "$_L1_PEERS_LOCAL"
+elif [[ -f "$LAB_DIR/scripts/l1-beacon-static-peers.env" ]]; then
+	# shellcheck disable=SC1090
+	source "$LAB_DIR/scripts/l1-beacon-static-peers.env"
+fi
+unset _L1_PEERS_LOCAL
 L0_DHT_ENV="${L0_DHT_ENV:-$LAB_DIR/run/l0-dht-82.env}"
 if [[ -f "$L0_DHT_ENV" ]]; then
 	# shellcheck disable=SC1090
@@ -66,7 +79,12 @@ L0_DHT_HUB_PUBLIC_IP="${L0_DHT_HUB_PUBLIC_IP:-216.225.202.82}"
 L0_DHT_HUB_OVERLAY_VIP="${L0_DHT_HUB_OVERLAY_VIP:-100.64.0.7}"
 L0_DHT_STEER_CHAIN="${L0_DHT_STEER_CHAIN:-CONET_L0D_DHT_STEER}"
 L0_DHT_BOOTSTRAP_ENR="${L0_DHT_BOOTSTRAP_ENR:-}"
-L0_OVERLAY_BEACON_PEERS="${L0_OVERLAY_BEACON_PEERS:-/ip4/100.64.0.7/tcp/4200/p2p/16Uiu2HAmDJCHuVkXtkPrrL8YykQ9gFZnQkR9Q6WjZZUrmueohPfd}"
+# Pinned .82 production beacon (scripts/l1-beacon-static-peers.env). Do not curl this host :4100 for identity.
+L0_OVERLAY_BEACON_PEERS="${L0_OVERLAY_BEACON_PEERS:-${L1_BEACON_OVERLAY_PEER_82:-/ip4/100.64.0.7/tcp/4200/p2p/16Uiu2HAmDJCHuVkXtkPrrL8YykQ9gFZnQkR9Q6WjZZUrmueohPfd}}"
+L0_STREAM_ONLY="${L0_STREAM_ONLY:-0}"
+if [[ -n "$EXPLICIT_BEACON_PEERS_SET" ]]; then
+	EXTRA_BEACON_PEERS="$EXPLICIT_BEACON_PEERS"
+fi
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 require_file() { [[ -f "$1" ]] || die "Missing file: $1"; }
@@ -252,7 +270,15 @@ start_geth() {
 start_beacon() {
 	echo "Starting beacon advertise=$ADVERTISE_IP (no validator, RPC 127.0.0.1; remote VA retired)"
 	local -a extra=()
-	if [[ "$L0_ONLY" == "1" || "$L0_ONLY" == "true" || "$L0_ONLY" == "yes" ]]; then
+	if [[ "$L0_STREAM_ONLY" == "1" || "$L0_STREAM_ONLY" == "true" || "$L0_STREAM_ONLY" == "yes" ]]; then
+		# The beacon dials the local L0d TCP bridge.  This mode is deliberately
+		# independent of TUN, iptables, public ENRs, and DHT steering.
+		BOOTSTRAP_ARGS=()
+		PEER_ARGS=()
+		load_extra_beacon_peers
+		extra+=(--no-discovery --disable-quic)
+		echo "L0_STREAM_ONLY=1: beacon uses explicit local stream peer(s), no TUN/iptables/discovery"
+	elif [[ "$L0_ONLY" == "1" || "$L0_ONLY" == "true" || "$L0_ONLY" == "yes" ]]; then
 		ADVERTISE_IP="$OVERLAY_VIP"
 		EXTRA_BEACON_PEERS="$L0_OVERLAY_BEACON_PEERS"
 		extra+=(--no-discovery --disable-quic)
@@ -263,7 +289,8 @@ start_beacon() {
 		extra+=(--disable-quic)
 		echo "L0_DHT=1 toward $L0_DHT_HUB_PUBLIC_IP (steer → $L0_DHT_HUB_OVERLAY_VIP); public discv5 hub kept; --disable-quic"
 	fi
-	if [[ "$L0_ONLY" != "1" && "$L0_ONLY" != "true" && "$L0_ONLY" != "yes" ]]; then
+	if [[ "$L0_STREAM_ONLY" != "1" && "$L0_STREAM_ONLY" != "true" && "$L0_STREAM_ONLY" != "yes" \
+		&& "$L0_ONLY" != "1" && "$L0_ONLY" != "true" && "$L0_ONLY" != "yes" ]]; then
 		load_bootstrap_args
 	fi
 	load_colo_args

@@ -18,6 +18,14 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     platform::packet_loop(cfg).await
 }
 
+pub async fn stream_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
+    platform::stream_loop(cfg).await
+}
+
+pub async fn proxy_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
+    platform::proxy_loop(cfg).await
+}
+
 pub fn signal_stop(pid: u32) -> Result<(), L0dError> {
     platform::signal_stop(pid)
 }

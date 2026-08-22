@@ -40,10 +40,20 @@ pub enum Command {
         /// Proxy target, repeatable as host:port. The port is the L0 logical port.
         #[arg(long = "proxy", value_name = "HOST:PORT")]
         proxy: Vec<String>,
+        /// Persistent bidirectional proxy target, repeatable as host:port.
+        #[arg(long = "proxyDuplex", alias = "proxy-duplex", value_name = "HOST:PORT")]
+        proxy_duplex: Vec<String>,
         /// Client target, repeatable as web3://<wallet|tag.web3>:<port>.
-        /// OS intercept + temporary-wallet duplex toward that mainWallet:port.
+        /// Local request/response endpoint toward that mainWallet:port.
         #[arg(long = "client", value_name = "web3://HOST:PORT")]
         client: Vec<String>,
+        /// Duplex client target, repeatable as web3://<wallet|tag.web3>:<port>.
+        #[arg(
+            long = "clientDuplex",
+            alias = "client-duplex",
+            value_name = "web3://HOST:PORT"
+        )]
+        client_duplex: Vec<String>,
     },
     /// Run the application gateway without creating a TUN or changing iptables
     Gateway {

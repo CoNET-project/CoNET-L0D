@@ -89,7 +89,6 @@ pub fn encrypt_utf8(plaintext: &str, recipient_armored: &str) -> Result<String, 
 
 /// RFC 4880 PKESK v3 recipient key IDs (16 hex, uppercase). Empty if wildcard-only.
 /// SI `getEncryptionKeyIDs()[0].toHex().toUpperCase()` uses the same 8-byte id.
-#[allow(dead_code)]
 pub fn pkesk_recipient_key_ids(armor: &str) -> Result<Vec<String>, L0dError> {
     refuse_plaintext_data(armor)?;
     let mut ppr = PacketParser::from_bytes(armor.as_bytes())
@@ -99,7 +98,7 @@ pub fn pkesk_recipient_key_ids(armor: &str) -> Result<Vec<String>, L0dError> {
         if let Packet::PKESK(ref pkesk) = pp.packet {
             let id = pkesk.recipient();
             if !id.is_wildcard() {
-                ids.push(id.to_hex());
+                ids.push(id.to_hex().to_uppercase());
             }
         }
         let (_packet, next) = pp
@@ -192,7 +191,12 @@ pub fn decrypt_utf8(armor: &str, secret: &Cert) -> Result<String, L0dError> {
                     Ok(pair) => pair,
                     Err(_) => continue,
                 };
+                let my_id = ka.keyid().to_hex();
                 for pkesk in pkesks {
+                    let rec = pkesk.recipient();
+                    if !rec.is_wildcard() && !rec.to_hex().eq_ignore_ascii_case(&my_id) {
+                        continue;
+                    }
                     if pkesk
                         .decrypt(&mut pair, sym_algo)
                         .map(|(algo, session)| decrypt(algo, &session))
@@ -297,7 +301,9 @@ mod tests {
             .for_transport_encryption()
             .map(|k| k.keyid().to_hex())
             .collect();
-        assert!(ids.iter().any(|id| expected.contains(id)));
+        assert!(ids
+            .iter()
+            .any(|id| expected.iter().any(|e| e.eq_ignore_ascii_case(id))));
         assert!(ids
             .iter()
             .all(|id| id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit())));

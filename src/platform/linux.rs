@@ -77,9 +77,6 @@ pub async fn uninstall(
 }
 
 pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
-    // Proxy-only still runs the TUN loop so IPv4 duplex frames from `--client`
-    // peers can complete overlay TCP (see apply_duplex_frame). Raw proxy drain
-    // remains attached for non-IPv4 stream bytes.
     let fd = open_tun(&cfg.raw.tun_name)?;
     let std_file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
     let writer_std = std_file
@@ -89,6 +86,7 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     let mut writer = tokio::fs::File::from_std(writer_std);
     let mut buf = vec![0u8; 2048];
     let mut stats = ForwardStats::new(cfg);
+    stats.l0.spawn_local_tcp_listeners(cfg);
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(TUN_WRITE_QUEUE);
     stats.l0.attach_tun_writer(tx);
     let mut inbound_rx = stats.l0.take_inbound_rx();
@@ -122,6 +120,55 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
         }
     }
     Ok(())
+}
+
+/// Duplex-only client mode: no TUN or iptables, only local TCP listeners.
+pub async fn stream_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
+    let mut stats = ForwardStats::new(cfg);
+    stats.l0.spawn_local_tcp_listeners(cfg);
+    let mut inbound_rx = stats.l0.take_inbound_rx();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(OVERLAY_FLUSH_IDLE_MS)) => {
+                stats.l0.flush_pending_overlay();
+            }
+            armor = recv_inbound_armor(&mut inbound_rx) => {
+                match armor {
+                    Some(armor) => {
+                        if let Err(err) = stats.l0.apply_inbound_armor(&armor) {
+                            tracing::warn!(error = %err, "duplex stream inbound armor refused");
+                        }
+                    }
+                    None => inbound_rx = None,
+                }
+            }
+        }
+    }
+}
+
+/// Proxy mode deliberately has no local TUN, route, or iptables dependency.
+/// Only the encrypted listen/control stream is consumed here; duplex proxy
+/// sessions attach their raw byte drain in `maybe_start_proxy_drain`.
+pub async fn proxy_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
+    let mut stats = ForwardStats::new(cfg);
+    let mut inbound_rx = stats.l0.take_inbound_rx();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(OVERLAY_FLUSH_IDLE_MS)) => {
+                stats.l0.flush_pending_overlay();
+            }
+            armor = recv_inbound_armor(&mut inbound_rx) => {
+                match armor {
+                    Some(armor) => {
+                        if let Err(err) = stats.l0.apply_inbound_armor(&armor) {
+                            tracing::warn!(error = %err, "proxy inbound armor refused");
+                        }
+                    }
+                    None => inbound_rx = None,
+                }
+            }
+        }
+    }
 }
 
 async fn recv_inbound_armor(rx: &mut Option<mpsc::Receiver<String>>) -> Option<String> {

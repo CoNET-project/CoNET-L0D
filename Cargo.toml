@@ -44,8 +44,6 @@ icu_provider = "=2.1.1"
 icu_locale_core = "=2.1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
