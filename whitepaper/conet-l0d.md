@@ -38,7 +38,7 @@ line.
 # conet-l0d — L1 overlay on Layer Minus
 
 **Paired translation:** [简体中文](./conet-l0d.zh-CN.md)  
-**Revision:** 2026-08-22 (proxy handshake reverse-occupies after accept without waiting for a resume blob; client occupies immediately after writing `responseChunk`; AddressPGP `searchKey` wait after `regiestChatRoute` HTTP 200; PKESK-selected inbound decrypt; ready-gated socket duplex bootstrap; connection-driven socket handles; per-connection temporary identities; slot-critical publication gate vs public P2P; multi-Guardian / multi-Mailbox path diversity; SI `l0_listen` / `l0_connect` occupancy pipe; application duplex; optional per-port `[[l0.channels]]`; lab overlay TCP/UDP; not a production discv5 product)
+**Revision:** 2026-08-24 (proxy handshake reverse-occupies after accept without waiting for a resume blob; client occupies immediately after writing `responseChunk`; AddressPGP `searchKey` wait after `regiestChatRoute` HTTP 200; PKESK-selected inbound decrypt; ready-gated socket duplex bootstrap; connection-driven socket handles; per-connection temporary identities; slot-critical publication gate vs public P2P; multi-Guardian / multi-Mailbox path diversity; SI `l0_listen` / `l0_connect` occupancy pipe; application duplex; optional per-port `[[l0.channels]]`; lab overlay TCP/UDP; not a production discv5 product)
 **Public operator guide:** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **Public developer guide:** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -277,6 +277,22 @@ successfully been established, a bidirectional client may issue a new
 `l0_connect`. The replacement uses a fresh request and fresh `pipe_handle`;
 stale `pipe_tx` state must not be reused. Reconnect remains bounded by the
 existing retry/backoff and occupancy limits.
+
+### Session role vs logical port (no global upstream by port)
+
+Each duplex line already has an independent `pipe_handle`. **Do not** attach
+local geth/beacon upstream merely because `session.port` matches a configured
+`[[l0.proxy_duplex]]` port.
+
+`maybe_start_proxy_drain` may dial the local upstream **only** for sessions
+allocated by the inbound proxy handshake (`mainWallet:port` + `firstChunk`)
+with `DuplexLineRole::Proxy`. Sessions from `--clientDuplex` /
+`l0.client_duplex` are `DuplexLineRole::Peer` and must not open that upstream
+even when the remote application port is `:8400` / `:4200`.
+
+One daemon may run client and proxy together. Client local listen ports must
+be free OS ports (`web3://<billing_eoa>:8400@18400`, `:4200@14200`). Dialed
+`mainWallet` is the peer `billing_eoa`, never a per-port channel `routing_eoa`.
 
 ## 14. Main-wallet billing for temporary channels (2026-08-21)
 

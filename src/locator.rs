@@ -15,7 +15,11 @@ pub struct Locator {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientTarget {
     pub host: LocatorHost,
+    /// Remote application port carried in duplex offers (`mainWallet:port`).
     pub port: u16,
+    /// Optional local TCP listen port (`web3://host:port@local`). When `None`,
+    /// the daemon tries `port` then `port + 10000`.
+    pub local_bind: Option<u16>,
 }
 
 impl ClientTarget {
@@ -41,9 +45,24 @@ impl ClientTarget {
                 "client target host is empty or contains ':'".into(),
             ));
         }
-        let port: u16 = port_raw
-            .parse()
-            .map_err(|_| L0dError::Locator(format!("client target port is invalid: {port_raw}")))?;
+        let (port_part, local_bind) = if let Some((app_port, bind_raw)) = port_raw.split_once('@') {
+            let local: u16 = bind_raw.parse().map_err(|_| {
+                L0dError::Locator(format!(
+                    "client target local bind port is invalid: {bind_raw}"
+                ))
+            })?;
+            if local == 0 {
+                return Err(L0dError::Locator(
+                    "client target local bind port 0 is not allowed".into(),
+                ));
+            }
+            (app_port, Some(local))
+        } else {
+            (port_raw, None)
+        };
+        let port: u16 = port_part.parse().map_err(|_| {
+            L0dError::Locator(format!("client target port is invalid: {port_part}"))
+        })?;
         if port == 0 {
             return Err(L0dError::Locator(
                 "client target port 0 is not allowed".into(),
@@ -52,6 +71,7 @@ impl ClientTarget {
         Ok(Self {
             host: parse_host(host_raw)?,
             port,
+            local_bind,
         })
     }
 
@@ -64,9 +84,13 @@ impl ClientTarget {
     }
 
     pub fn display(&self) -> String {
-        match &self.host {
+        let base = match &self.host {
             LocatorHost::Eoa(eoa) => format!("web3://{eoa}:{}", self.port),
             LocatorHost::Tag(tag) => format!("web3://{tag}.web3:{}", self.port),
+        };
+        match self.local_bind {
+            Some(local) => format!("{base}@{local}"),
+            None => base,
         }
     }
 
@@ -239,6 +263,20 @@ mod tests {
     #[test]
     fn reject_short_hex() {
         assert!(Locator::parse("web3://0x1111/p2p/geth").is_err());
+    }
+
+    #[test]
+    fn parse_client_eoa_port_with_local_bind() {
+        let t = ClientTarget::parse(
+            "web3://0x1111111111111111111111111111111111111111:8400@18400",
+        )
+        .unwrap();
+        assert_eq!(t.port, 8400);
+        assert_eq!(t.local_bind, Some(18400));
+        assert_eq!(
+            t.display(),
+            "web3://0x1111111111111111111111111111111111111111:8400@18400"
+        );
     }
 
     #[test]

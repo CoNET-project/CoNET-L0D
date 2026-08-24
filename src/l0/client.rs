@@ -207,9 +207,21 @@ impl PipeExtras {
     }
 }
 
+/// Per-line role. Proxy upstream drain is attached only for `Proxy` lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuplexLineRole {
+    /// Overlay peer / `--clientDuplex` initiator or acceptor. Never dials local
+    /// `proxy_duplex` upstream merely because `session.port` matches a proxy port.
+    Peer,
+    /// Created by inbound proxy `mainWallet:port` + firstChunk handshake.
+    Proxy,
+}
+
 #[derive(Clone)]
 struct DuplexSession {
     session_id: String,
+    /// Set at construction; `Proxy` only for proxy-handshake allocations.
+    role: DuplexLineRole,
     created_at: u64,
     key: Option<[u8; aes::KEY_LEN]>,
     dest: Ipv4Addr,
@@ -597,6 +609,8 @@ impl L0Client {
                 Ipv4Addr::UNSPECIFIED
             };
             let port = target.port;
+            let preferred_local = target.local_bind.unwrap_or(port);
+            let explicit_local_bind = target.local_bind.is_some();
             let duplex = self.duplex.clone();
             let local_streams = self.local_streams.clone();
             let Some(wire) = self.channel_wire.get(&port).cloned() else {
@@ -635,10 +649,21 @@ impl L0Client {
                 // Keep the requested port when possible; otherwise expose a
                 // deterministic stream endpoint at port + 10000 and print it
                 // for the application to use.
-                let (listener, local_port) = match TcpListener::bind((bind, port)).await {
-                    Ok(listener) => (listener, port),
+                let (listener, local_port) = match TcpListener::bind((bind, preferred_local)).await {
+                    Ok(listener) => (listener, preferred_local),
                     Err(first_err) => {
-                        let fallback_port = port.checked_add(10_000).unwrap_or(0);
+                        let fallback_port = if explicit_local_bind {
+                            tracing::warn!(
+                                bind = %bind,
+                                preferred_local,
+                                target_port = port,
+                                error = %first_err,
+                                "explicit local bind failed"
+                            );
+                            return;
+                        } else {
+                            port.checked_add(10_000).unwrap_or(0)
+                        };
                         match TcpListener::bind((bind, fallback_port)).await {
                             Ok(listener) => (listener, fallback_port),
                             Err(second_err) => {
@@ -1196,6 +1221,7 @@ impl L0Client {
                         if let Some(identity) = identity {
                             let session = DuplexSession {
                                 session_id: offer.session_id.clone(),
+                                role: DuplexLineRole::Proxy,
                                 created_at: now,
                                 key: Some(offer.key),
                                 dest: Ipv4Addr::UNSPECIFIED,
@@ -1332,6 +1358,7 @@ impl L0Client {
                 .and_then(|json| aes::seal(&key, json.as_bytes()).ok());
             let dummy = DuplexSession {
                 session_id,
+                role: DuplexLineRole::Peer,
                 created_at: 0,
                 key: Some(key),
                 dest: Ipv4Addr::UNSPECIFIED,
@@ -2709,6 +2736,7 @@ async fn run_dynamic_local_tcp_stream(
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     let session = DuplexSession {
         session_id: session_id.clone(),
+        role: DuplexLineRole::Peer,
         created_at: now,
         key: Some(identity.aes_key),
         dest,
@@ -3037,6 +3065,35 @@ fn maybe_start_proxy_drain(
             "request/response proxy does not attach a persistent duplex drain"
         );
         return;
+    }
+    // Lines are independent by pipe_handle; do not treat `port` as a global
+    // "this daemon is proxying" switch. Only sessions allocated by the proxy
+    // mainWallet:port handshake may dial local upstream.
+    let role = {
+        let guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .values()
+            .find(|session| session.session_id == session_id)
+            .map(|session| session.role)
+    };
+    match role {
+        Some(DuplexLineRole::Proxy) => {}
+        Some(DuplexLineRole::Peer) => {
+            tracing::debug!(
+                session = %session_id,
+                port,
+                "skip proxy drain; peer/client duplex line shares port with proxy_duplex"
+            );
+            return;
+        }
+        None => {
+            tracing::debug!(
+                session = %session_id,
+                port,
+                "skip proxy drain; session not in map yet"
+            );
+            return;
+        }
     }
     {
         let receivers = extras
@@ -3416,6 +3473,7 @@ fn spawn_duplex_runtime(
                         duplex_key(peer.vip, *port, &session_id),
                         DuplexSession {
                             session_id,
+                            role: DuplexLineRole::Peer,
                             created_at: chrono::Utc::now().timestamp().max(0) as u64,
                             key,
                             dest: peer.vip,
@@ -4179,6 +4237,7 @@ mod tests {
             duplex_key(dest, 8400, &sid),
             DuplexSession {
                 session_id: sid.clone(),
+                role: DuplexLineRole::Peer,
                 created_at: 0,
                 key: Some(key),
                 dest,
@@ -4221,6 +4280,7 @@ mod tests {
             duplex_key(dest, 8400, &sid),
             DuplexSession {
                 session_id: sid.clone(),
+                role: DuplexLineRole::Peer,
                 created_at: 0,
                 key: Some(key),
                 dest,
@@ -4269,6 +4329,7 @@ mod tests {
             duplex_key(dest, 8400, sid),
             DuplexSession {
                 session_id: sid.to_string(),
+                role: DuplexLineRole::Peer,
                 created_at: 0,
                 key: Some(key),
                 dest,
@@ -4583,6 +4644,7 @@ mod tests {
     fn sample_duplex_session(pipe_active: bool) -> DuplexSession {
         DuplexSession {
             session_id: "sess".into(),
+            role: DuplexLineRole::Peer,
             created_at: 0,
             key: Some([7u8; aes::KEY_LEN]),
             dest: Ipv4Addr::new(100, 64, 0, 6),
@@ -4608,6 +4670,14 @@ mod tests {
             pipe_connect_inflight: false,
             pipe_cancel: None,
         }
+    }
+
+    #[test]
+    fn proxy_drain_allowed_only_for_proxy_role() {
+        let mut peer = sample_duplex_session(false);
+        assert_eq!(peer.role, DuplexLineRole::Peer);
+        peer.role = DuplexLineRole::Proxy;
+        assert_eq!(peer.role, DuplexLineRole::Proxy);
     }
 
     #[test]

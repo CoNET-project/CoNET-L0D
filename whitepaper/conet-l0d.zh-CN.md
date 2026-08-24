@@ -33,7 +33,7 @@ socket handle 与加密的 `pipe_handle` 负责关联。
 # conet-l0d — 在 Layer Minus 上的 L1 overlay
 
 **成对译本：** [English](./conet-l0d.md)  
-**Revision：** 2026-08-22（proxy 握手在 accept 后即可反向占用，不等 resume 首包；客户端写回 `responseChunk` 后立刻 occupy；`regiestChatRoute` HTTP 200 后等待 AddressPGP `searchKey`；入站按 PKESK 选解密密钥；SSE/返程 pipe 就绪门闸；按连接 socket 句柄分配 duplex 线路；每连接临时身份；slot 关键指标发表门槛 vs 公网 P2P；多 Guardian / 多 Mailbox 路径多样性；SI `l0_listen` / `l0_connect` 占用管道；应用层 duplex；可选按端口 `[[l0.channels]]`；实验室 overlay TCP/UDP；不是生产 discv5 产品）
+**Revision：** 2026-08-24（proxy 握手在 accept 后即可反向占用，不等 resume 首包；客户端写回 `responseChunk` 后立刻 occupy；`regiestChatRoute` HTTP 200 后等待 AddressPGP `searchKey`；入站按 PKESK 选解密密钥；SSE/返程 pipe 就绪门闸；按连接 socket 句柄分配 duplex 线路；每连接临时身份；slot 关键指标发表门槛 vs 公网 P2P；多 Guardian / 多 Mailbox 路径多样性；SI `l0_listen` / `l0_connect` 占用管道；应用层 duplex；可选按端口 `[[l0.channels]]`；实验室 overlay TCP/UDP；不是生产 discv5 产品）
 **公开操作说明：** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
 **公开开发说明：** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -257,6 +257,21 @@ writer。对端观察到 EOF 后必须停止向该管道实例继续写入。
 双向 client 只有在自己的聆听 SSE 已终止、并且新的 listen 已成功建立后，
 才可以发起新的 `l0_connect`。新连接必须使用新的请求和新的 `pipe_handle`；
 不得复用旧的 `pipe_tx`。重连仍受现有 retry/backoff 与占用上限约束。
+
+### 会话角色与逻辑端口（禁止按 port 全局挂上游）
+
+每条 duplex 线路已有独立 `pipe_handle`。**不得**仅因 `session.port` 与
+`[[l0.proxy_duplex]]` 相同，就把任意占用 pipe 接到本机 geth/beacon。
+
+实现要求：仅当会话由入站 proxy 握手（`mainWallet:port` + `firstChunk`）
+分配、角色为 `DuplexLineRole::Proxy` 时，才允许 `maybe_start_proxy_drain`
+连接本地上游。`--clientDuplex` / `l0.client_duplex` 产生的会话为
+`DuplexLineRole::Peer`，即使目标应用口是 `:8400` / `:4200` 也不得误挂
+本机 proxy 上游。
+
+同一 daemon 可同时配置 client 与 proxy：client 本地 listen 必须使用空闲
+端口（`web3://<billing_eoa>:8400@18400`、`:4200@14200`）；对外拨号的
+`mainWallet` 必须是对端 `billing_eoa`，不是 channel `routing_eoa`。
 
 ## 14. 临时通道由主钱包计费（2026-08-21）
 

@@ -272,7 +272,7 @@ impl ValidatedConfig {
                         } else {
                             Ipv4Addr::UNSPECIFIED
                         },
-                        target.port
+                        target.local_bind.unwrap_or(target.port)
                     ),
                 )
             })

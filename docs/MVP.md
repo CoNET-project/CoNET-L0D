@@ -12,7 +12,7 @@ configured in both proxy modes.
 # MVP — conet-l0d
 
 **Paired:** [中文](./MVP.zh-CN.md)  
-**Revision:** 2026-08-21 (dynamic proxy lines, main-wallet billing, per-line temporary identities)
+**Revision:** 2026-08-24 (`DuplexLineRole` gates proxy upstream; `web3://…:port@local`; dynamic proxy lines, main-wallet billing, per-line temporary identities)
 
 Public how-to: [Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -54,6 +54,17 @@ processing. The same socket keeps using that line until EOF or error; a
 second socket to the same `127.0.0.1:<port>` receives a different line. L0d
 does not add a private header to Geth/Prysm bytes: the accepted socket handle
 and encrypted `pipe_handle` are the correlation mechanism.
+
+**Role gate:** `maybe_start_proxy_drain` attaches local upstream only for
+`DuplexLineRole::Proxy` sessions (inbound proxy handshake). `client_duplex`
+sessions are `Peer` and must not dial local geth/beacon just because they
+share a logical port with `proxy_duplex`.
+
+**Local bind:** `l0.client_duplex` accepts `web3://<billing>:8400@18400`
+(and `:4200@14200`). `@local` is an explicit listen port; without it the
+daemon tries `port` then `port+10000`. Dialed `mainWallet` must be the peer
+`billing_eoa`.
+
 
 Proxy-only servers (`[[l0.proxies]]` and no `l0.clients` / `--client`) do not
 create TUN or iptables. Each explicit new-line request creates a separate

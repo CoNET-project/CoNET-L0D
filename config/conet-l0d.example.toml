@@ -99,8 +99,12 @@ tcp_ports = [4200]
 #
 # Duplex clients use a separate setting:
 # client_duplex = [
-#   "web3://0x<mainWallet>:4000",
+#   # app port 8400/4200 with free local listens when geth/beacon own those ports:
+#   "web3://0x<mainWallet>:8400@18400",
+#   "web3://0x<mainWallet>:4200@14200",
 # ]
+# Dial mainWallet = peer billing_eoa. Proxy drain attaches only to Proxy-role
+# sessions; client_duplex lines stay Peer even on the same logical app port.
 #
 # Per-peer public key files (lab override; do not log contents):
 # user_pgp_file = "/etc/conet-l0d/peer-user.asc"

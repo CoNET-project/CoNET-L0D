@@ -10,7 +10,7 @@ TUN、路由或 iptables 链；同一逻辑端口不能同时配置两种 proxy 
 # MVP — conet-l0d
 
 **成对：** [English](./MVP.md)  
-**Revision：** 2026-08-21（动态代理线路、主钱包计费、每线路临时身份）
+**Revision：** 2026-08-24（动态代理线路、主钱包计费、每线路临时身份）
 
 公开 how-to：[Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
 
@@ -57,6 +57,15 @@ duplex offer。同一个 socket 在 EOF/错误前始终复用这条临时线路�
 socket 即使连接同一个 `127.0.0.1:<port>` 也会得到另一条线路。L0d 不向
 Geth/Prysm 原始字节插入私有 header，socket handle 与加密的
 `pipe_handle` 负责关联。
+
+**角色门控：** `maybe_start_proxy_drain` 仅对 `DuplexLineRole::Proxy`（入站
+proxy 握手分配的线路）连接本地上游。`client_duplex` 线路为 `Peer`，即使
+逻辑口与 `proxy_duplex` 相同也不得误挂本机 geth/beacon。
+
+**本地口：** `l0.client_duplex` 支持 `web3://<billing>:8400@18400`（及
+`:4200@14200`）。`@local` 为显式本机 listen；省略时先尝试 `port`，失败再
+`port+10000`。拨号 `mainWallet` 必须是对端 `billing_eoa`。
+
 
 ### 通过无 TUN 的 Duplex Listener 连接 Beacon
 

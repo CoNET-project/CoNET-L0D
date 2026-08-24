@@ -50,9 +50,12 @@ creating a session, wallet, or `l0_connect`.
 (`local_vip:port`, for example `100.64.0.5:4000`) for request/response P1
 traffic. L0d owns the TUN and routing rules; client applications must connect
 to the printed local endpoint and do not need separate iptables rules.
-Use `--clientDuplex` (or `l0.client_duplex`) to seed an independent pending
-occupied bidirectional line. Both target types are included in local mappings,
-but only `client_duplex` enables duplex seeding.
+Use `--clientDuplex` (or `l0.client_duplex`) for connection-driven
+bidirectional lines. Spec form: `web3://<billingMainWallet>:<appPort>` or
+`web3://<billingMainWallet>:<appPort>@<localListenPort>` when the app port is
+already occupied by local geth/beacon (lab default `@18400` / `@14200`).
+Both target types are included in local mappings, but only `client_duplex`
+opens local TCP listeners and allocates per-`accept()` lines.
 
 ### Connection-driven duplex client handles
 
@@ -75,6 +78,27 @@ create independent lines; no wallet, PGP key, AES key, queue, pipe, or upstream
 socket may be shared. The raw application stream is not prefixed with a
 conet-l0d header. Geth/Prysm bytes remain unchanged; the accepted socket and
 the encrypted `pipe_handle` provide correlation.
+
+
+### Session role vs logical port (proxy drain)
+
+Every duplex line already has an independent `pipe_handle` / session map key
+`(dest, port, session_id)`. **Do not** treat `session.port` as a global
+"this daemon is proxying" switch.
+
+`maybe_start_proxy_drain` may attach a local upstream TCP to
+`[[l0.proxy_duplex]]` **only** when the session was allocated by the inbound
+proxy handshake (`mainWallet:port` + `firstChunk`) and therefore carries
+`DuplexLineRole::Proxy`. Sessions created by `--clientDuplex` /
+`l0.client_duplex` are `DuplexLineRole::Peer` and must never dial local
+geth/beacon merely because they reuse the same logical application port
+(for example client → hub `:4200` while this host also exposes
+`proxy_duplex` for `:4200`).
+
+A single daemon **may** run `client_duplex` and `proxy_duplex` together
+(spoke + optional second hub). Local listen ports for clients must be free
+OS ports (`web3://<billing>:8400@18400`, `@14200`, …). Offer matching still
+uses `billing_eoa` as `mainWallet`, never the per-port channel `routing_eoa`.
 
 ### TUN-less Beacon stream mode
 
