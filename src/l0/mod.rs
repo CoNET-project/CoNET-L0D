@@ -20,5 +20,6 @@ pub mod pgp;
 pub mod pipe;
 pub mod post;
 pub mod proxy;
+pub mod si_pool;
 
 pub use client::L0Client;

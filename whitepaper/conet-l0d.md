@@ -334,3 +334,6 @@ adapter. Layer Minus supplies private wallet-addressed transport;
 `web3://` defines how applications name and exchange data; `conet-l0d`
 provides the Linux runtime; and browser or native clients provide the
 cross-platform user experience.
+
+### GuardianNodesInfoV6 SI selection
+The default SI transport is an on-chain pool. The daemon pages GuardianNodesInfoV6 through the configured RPC, randomizes candidates, performs a bounded TCP port-80 qualification, and cools failures before retrying. Static entries are optional for pool-off deployments. This transport selection is independent of duplex line roles: a pure clientDuplex spoke avoids a permanent Chat SSE while preserving its exclusive `l0_listen` ownership.

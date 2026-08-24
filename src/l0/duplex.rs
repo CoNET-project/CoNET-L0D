@@ -1,6 +1,7 @@
 //! Application-layer duplex on the L0 exclusive occupancy pipe.
 //!
-//! SI implements **`l0_listen` / `l0_connect`** (or `mining` + `listenKind: "l0"`):
+//! SI implements **`l0_listen` / `l0_connect`** only
+//! (not the retired `mining` + `listenKind: "l0"`):
 //! idle L0 SSE may still receive user-PGP gossip; the first `l0_connect` occupies
 //! the SSE, SI pipes remaining TCP, then rejects later inflows (409).
 //! Application JSON `duplex_offer` / `duplex_accept` / `duplex_reject` /

@@ -67,6 +67,10 @@ fn default_route_register_url() -> String {
     "https://beamio.app/api/regiestChatRoute".into()
 }
 
+fn default_si_pool_from_contract() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L0Config {
     #[serde(default)]
@@ -79,6 +83,9 @@ pub struct L0Config {
     pub entries: Vec<String>,
     #[serde(default)]
     pub listen_entries: Vec<String>,
+    /// Discover qualified SI hosts from GuardianNodesInfoV6; static entries are optional fallbacks.
+    #[serde(default = "default_si_pool_from_contract")]
+    pub si_pool_from_contract: bool,
     pub routing_eoa: Option<String>,
     #[serde(default)]
     pub routing_key_file: Option<PathBuf>,
@@ -147,6 +154,7 @@ impl Default for L0Config {
             address_pgp: default_address_pgp(),
             entries: Vec::new(),
             listen_entries: Vec::new(),
+            si_pool_from_contract: true,
             routing_eoa: None,
             routing_key_file: None,
             routing_eth_key_file: None,
@@ -309,6 +317,7 @@ pub struct L0Settings {
     pub address_pgp: String,
     pub entries: Vec<String>,
     pub listen_entries: Vec<String>,
+    pub si_pool_from_contract: bool,
     pub routing_eoa: Option<String>,
     /// OpenPGP secret cert for inbound user-PGP decrypt. Unused when `[l0]` is off.
     pub routing_key_file: Option<PathBuf>,
@@ -855,6 +864,7 @@ impl DaemonConfig {
                 address_pgp,
                 entries: self.l0.entries.clone(),
                 listen_entries: self.l0.listen_entries.clone(),
+                si_pool_from_contract: self.l0.si_pool_from_contract,
                 routing_eoa,
                 routing_key_file: self.l0.routing_key_file.clone(),
                 routing_eth_key_file: self.l0.routing_eth_key_file.clone(),

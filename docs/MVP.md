@@ -216,3 +216,6 @@ The MVP is accepted when:
 5. browser/native client interoperability;
 6. replay, reconnect, close, and failure-path tests;
 7. optional L1 research profiles after the application path is stable.
+
+## GuardianNodesInfoV6 SI pool
+L0 defaults to `si_pool_from_contract = true`. It pages GuardianNodesInfoV6 through the configured RPC, selects a random TCP-`:80`-qualified SI, and cools down failed entries. Static entries are optional fallbacks. This does not change the current duplex line roles or multi-remote local-bind semantics.

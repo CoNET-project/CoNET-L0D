@@ -308,3 +308,6 @@ Linux 运行时提供：
 持久抽象是应用协议，而不是某个操作系统 adapter。Layer Minus 提供私密的钱包地址化传输；
 `web3://` 定义应用如何命名和交换数据；`conet-l0d` 提供 Linux 运行时；
 浏览器或原生客户端提供跨平台用户体验。
+
+### GuardianNodesInfoV6 SI 选择
+默认 SI 传输使用链上池：daemon 通过配置 RPC 分页读取 GuardianNodesInfoV6，随机选择候选节点、对 TCP 80 做有限资格检查，并冷却失败节点后重试。静态 entries 仅供关闭池的部署使用。该选择与 duplex 线路角色独立：纯 clientDuplex spoke 不建立常驻 Chat SSE，但保留独占的 `l0_listen` 所有权。

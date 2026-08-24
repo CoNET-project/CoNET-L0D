@@ -11,6 +11,7 @@ use crate::config::{ProxyMode, ValidatedConfig};
 use crate::error::L0dError;
 use crate::l0::aes;
 use crate::l0::eip191::EthSecret;
+use crate::l0::si_pool::SiPool;
 use crate::l0::{duplex, eip191, envelope, frame, listen, pgp, pipe, post, proxy};
 use crate::locator::{client_bind_candidates, Locator, LocatorHost};
 use crate::packet::overlay_channel_port;
@@ -169,6 +170,8 @@ struct ChannelWire {
     listen_entries: Vec<String>,
     /// Outbound entries A ≠ B for `l0_connect` occupancy pipes.
     entries: Vec<String>,
+    /// GuardianNodesInfoV6 qualified SI pool, preferred over static entries.
+    si_pool: Option<Arc<SiPool>>,
     /// Own session-listen user PGP (channel EOA in crate MVP).
     user_pub: String,
     /// CoNET L1 RPC used after `regiestChatRoute` HTTP 200 to wait for searchKey.
@@ -458,15 +461,39 @@ impl L0Client {
             }
         }
 
-        let post_tx = if cfg.l0.enabled && !cfg.l0.entries.is_empty() {
-            spawn_post_worker(cfg.l0.entries.clone())
+        let si_pool = if cfg.l0.enabled && cfg.l0.si_pool_from_contract {
+            match SiPool::new(&cfg.l0.rpc) {
+                Ok(pool) => {
+                    let warm = Arc::clone(&pool);
+                    tokio::spawn(async move {
+                        match warm.refresh().await {
+                            Ok(nodes) => tracing::info!(
+                                nodes,
+                                "SI pool initial refresh from GuardianNodesInfoV6"
+                            ),
+                            Err(error) => tracing::warn!(%error, "SI pool initial refresh failed"),
+                        }
+                    });
+                    pool.spawn_refresh_loop();
+                    Some(pool)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "SI pool disabled: failed to create");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let post_tx = if cfg.l0.enabled && (si_pool.is_some() || !cfg.l0.entries.is_empty()) {
+            spawn_post_worker(si_pool.clone(), cfg.l0.entries.clone())
         } else {
             None
         };
 
         let (inbound_tx, inbound_rx_ch) = mpsc::channel::<listen::InboundChunk>(LISTEN_QUEUE);
         let mut user_secrets = Vec::new();
-        let channel_wire = load_channel_wires(cfg);
+        let channel_wire = load_channel_wires(cfg, si_pool.clone());
         let duplex = Arc::new(Mutex::new(HashMap::new()));
         let proxy_receivers = Arc::new(Mutex::new(HashMap::new()));
         let proxy_seq = Arc::new(AtomicU64::new(1));
@@ -514,6 +541,7 @@ impl L0Client {
                     inbound_tx.clone(),
                     Some(pipe_rebuild.clone()),
                     listen_owners.clone(),
+                    si_pool.clone(),
                 )
             } else {
                 spawn_channel_listens_into(
@@ -522,6 +550,7 @@ impl L0Client {
                     inbound_tx.clone(),
                     Some(pipe_rebuild.clone()),
                     listen_owners.clone(),
+                    si_pool.clone(),
                 )
             };
             spawn_duplex_runtime(cfg, &channel_wire, &peers, duplex.clone(), post_tx.clone());
@@ -1567,6 +1596,7 @@ impl L0Client {
         let (ready_tx, ready_rx) = oneshot::channel();
         let identity = identity.clone();
         let entries = wire.listen_entries.clone();
+        let si_pool = wire.si_pool.clone();
         let route_pgp = wire.route_pgp.clone();
         let signer = wire.eth.clone();
         let billing_wallet = wire.main_wallet.clone();
@@ -1619,6 +1649,7 @@ impl L0Client {
             // initiator mailbox as soon as this temporary SSE came up.
             if spawn_listen_worker_with_ready(
                 entries,
+                si_pool,
                 route_pgp,
                 identity.wallet_address().to_owned(),
                 signer.clone(),
@@ -2311,8 +2342,10 @@ fn spawn_legacy_listen_into(
     tx: mpsc::Sender<listen::InboundChunk>,
     pipe_rebuild: Option<L0PipeRebuild>,
     owners: listen::ListenOwnerRegistry,
+    si_pool: Option<Arc<SiPool>>,
 ) -> bool {
-    if !has_secret || routing_eoa.is_empty() || cfg.l0.listen_entries.is_empty() {
+    let has_si = si_pool.is_some() || !cfg.l0.listen_entries.is_empty();
+    if !has_secret || routing_eoa.is_empty() || !has_si {
         return false;
     }
     let Some(path) = cfg.l0.mailbox_route_pgp_file.as_ref() else {
@@ -2349,21 +2382,27 @@ fn spawn_legacy_listen_into(
             return false;
         }
     };
-    let chat = spawn_listen_worker(
-        cfg.l0.listen_entries.clone(),
-        route.clone(),
-        routing_eoa.to_string(),
-        eth.clone(),
-        tx.clone(),
-        false,
-        None,
-        None,
-        None,
-        None,
-        owners.clone(),
-    );
+    let skip_chat = cfg.l0.proxies.is_empty()
+        && cfg.l0.proxy_duplex.is_empty()
+        && !cfg.client_duplex.is_empty();
+    let chat = !skip_chat
+        && spawn_listen_worker(
+            cfg.l0.listen_entries.clone(),
+            si_pool.clone(),
+            route.clone(),
+            routing_eoa.to_string(),
+            eth.clone(),
+            tx.clone(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            owners.clone(),
+        );
     let l0 = spawn_listen_worker(
         cfg.l0.listen_entries.clone(),
+        si_pool,
         route,
         routing_eoa.to_string(),
         eth,
@@ -2384,6 +2423,7 @@ fn spawn_channel_listens_into(
     tx: mpsc::Sender<listen::InboundChunk>,
     pipe_rebuild: Option<L0PipeRebuild>,
     owners: listen::ListenOwnerRegistry,
+    si_pool: Option<Arc<SiPool>>,
 ) -> bool {
     // Billing key is for duplex control only. Mailbox listen/connect must be
     // signed by the channel wallet until SI fleets ship `billingWallet`.
@@ -2415,11 +2455,8 @@ fn spawn_channel_listens_into(
                 "P1: channel routing_key_file was not loaded; inbound decrypt for that wallet stays off"
             ),
         }
-        if ch.listen_entries.is_empty() {
-            tracing::warn!(
-                eoa = %ch.routing_eoa,
-                "P1: channel listen_entries empty; that SSE stays off"
-            );
+        if si_pool.is_none() && ch.listen_entries.is_empty() {
+            tracing::warn!(eoa = %ch.routing_eoa, "P1: channel listen_entries empty and SI pool disabled; that SSE stays off");
             continue;
         }
         let eth = match eip191::load_eth_secret(&ch.routing_eth_key_file) {
@@ -2453,23 +2490,30 @@ fn spawn_channel_listens_into(
                 continue;
             }
         };
-        if spawn_listen_worker(
-            ch.listen_entries.clone(),
-            route.clone(),
-            ch.routing_eoa.clone(),
-            eth.clone(),
-            tx.clone(),
-            false,
-            None,
-            None,
-            None,
-            None,
-            owners.clone(),
-        ) {
+        let skip_chat = cfg.l0.proxies.is_empty()
+            && cfg.l0.proxy_duplex.is_empty()
+            && !cfg.client_duplex.is_empty();
+        if !skip_chat
+            && spawn_listen_worker(
+                ch.listen_entries.clone(),
+                si_pool.clone(),
+                route.clone(),
+                ch.routing_eoa.clone(),
+                eth.clone(),
+                tx.clone(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                owners.clone(),
+            )
+        {
             spawned += 1;
         }
         if spawn_listen_worker(
             ch.listen_entries.clone(),
+            si_pool.clone(),
             route,
             ch.routing_eoa.clone(),
             eth,
@@ -2492,6 +2536,7 @@ fn spawn_channel_listens_into(
 
 fn spawn_listen_worker(
     entries: Vec<String>,
+    si_pool: Option<Arc<SiPool>>,
     mailbox_route: String,
     routing_eoa: String,
     signer_eth: EthSecret,
@@ -2505,6 +2550,7 @@ fn spawn_listen_worker(
 ) -> bool {
     spawn_listen_worker_with_ready(
         entries,
+        si_pool,
         mailbox_route,
         routing_eoa,
         signer_eth,
@@ -2522,6 +2568,7 @@ fn spawn_listen_worker(
 
 fn spawn_listen_worker_with_ready(
     entries: Vec<String>,
+    si_pool: Option<Arc<SiPool>>,
     mailbox_route: String,
     routing_eoa: String,
     signer_eth: EthSecret,
@@ -2573,14 +2620,12 @@ fn spawn_listen_worker_with_ready(
             if task_owner.is_cancelled() {
                 break;
             }
-            let Some(entry) = listen::pick_listen_entry(&entries, last_failed.as_deref()) else {
-                tracing::warn!(
-                    eoa = %routing_eoa,
-                    "P1 listen: listen_entries empty; worker idle"
-                );
-                tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
-                continue;
-            };
+            let entry = if let Some(pool) = si_pool.as_ref() { match pool.acquire(last_failed.as_deref()).await {
+                Ok(entry) => entry,
+                Err(error) => { tracing::warn!(eoa = %routing_eoa, %error, "P1 listen: SI pool acquire failed; worker idle"); tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await; continue; }
+            }} else { let Some(entry) = listen::pick_listen_entry(&entries, last_failed.as_deref()) else {
+                tracing::warn!(eoa = %routing_eoa, "P1 listen: listen_entries empty; worker idle"); tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await; continue;
+            }; entry.to_string() };
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
             let prepared = if l0_exclusive {
                 match (billing_wallet.as_deref(), billing_eth.as_ref()) {
@@ -2589,24 +2634,24 @@ fn spawn_listen_worker_with_ready(
                         wallet,
                         ts,
                         &mailbox_route,
-                        entry,
+                        &entry,
                         eth,
                     ),
                     _ => listen::prepare_l0_listen_post(
                         &routing_eoa,
                         ts,
                         &mailbox_route,
-                        entry,
+                        &entry,
                         &signer_eth,
                     ),
                 }
             } else {
-                listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, entry, &signer_eth)
+                listen::prepare_listen_post(&routing_eoa, ts, &mailbox_route, &entry, &signer_eth)
             };
             match prepared {
                 Ok((url, armor)) => match listen::open_listen_sse(&client, &url, &armor).await {
                     Ok(response) => {
-                        task_owner.set_entry(entry);
+                        task_owner.set_entry(&entry);
                         if let Some(ready) = ready.take() {
                             let _ = ready.send(());
                         }
@@ -2646,7 +2691,8 @@ fn spawn_listen_worker_with_ready(
                                     error = %err,
                                     "listen SSE failed"
                                 );
-                                last_failed = Some(entry.to_string());
+                                last_failed = Some(entry.clone());
+                                if let Some(pool) = si_pool.as_ref() { pool.mark_failed(&entry).await; }
                             }
                         }
                     }
@@ -2657,12 +2703,14 @@ fn spawn_listen_worker_with_ready(
                             error = %err,
                             "listen SSE failed"
                         );
-                        last_failed = Some(entry.to_string());
+                        last_failed = Some(entry.clone());
+                                if let Some(pool) = si_pool.as_ref() { pool.mark_failed(&entry).await; }
                     }
                 },
                 Err(err) => {
                     tracing::warn!(eoa = %routing_eoa, error = %err, "listen wrap refused");
-                    last_failed = Some(entry.to_string());
+                    last_failed = Some(entry.clone());
+                                if let Some(pool) = si_pool.as_ref() { pool.mark_failed(&entry).await; }
                 }
             }
             tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await;
@@ -2962,6 +3010,7 @@ async fn run_dynamic_local_tcp_stream(
         let (ready_tx, ready_rx) = oneshot::channel();
         if !spawn_listen_worker_with_ready(
             wire.listen_entries.clone(),
+            wire.si_pool.clone(),
             wire.route_pgp.clone(),
             identity.wallet_address().to_owned(),
             wire.si_eth.clone(),
@@ -3507,7 +3556,10 @@ fn clear_l0_pipe_after_listen_timeout(routing_eoa: &str, ctx: Option<&L0PipeRebu
     }
 }
 
-fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
+fn load_channel_wires(
+    cfg: &ValidatedConfig,
+    si_pool: Option<Arc<SiPool>>,
+) -> HashMap<u16, ChannelWire> {
     let mut out = HashMap::new();
     if !cfg.l0.channels.is_empty() {
         for ch in &cfg.l0.channels {
@@ -3559,6 +3611,7 @@ fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
                     si_eth: channel_eth,
                     listen_entries: listen_entries.clone(),
                     entries: cfg.l0.entries.clone(),
+                    si_pool: si_pool.clone(),
                     user_pub: user_pub.clone(),
                     rpc: cfg.l0.rpc.clone(),
                 },
@@ -3605,6 +3658,7 @@ fn load_channel_wires(cfg: &ValidatedConfig) -> HashMap<u16, ChannelWire> {
                 si_eth: eth.clone(),
                 listen_entries: cfg.l0.listen_entries.clone(),
                 entries: cfg.l0.entries.clone(),
+                si_pool: si_pool.clone(),
                 user_pub: user_pub.clone(),
                 rpc: cfg.l0.rpc.clone(),
             },
@@ -3728,13 +3782,23 @@ fn wire_post_entries(wire: &ChannelWire) -> Vec<String> {
     }
 }
 
-async fn post_control_armor_with_retry(entries: &[String], armor: &str, label: &'static str) {
+async fn post_control_armor_with_retry(
+    entries: &[String],
+    si_pool: Option<&Arc<SiPool>>,
+    armor: &str,
+    label: &'static str,
+) {
     let Ok(client) = post::http_client() else {
         tracing::warn!(label, "duplex control POST: no HTTP client");
         return;
     };
     loop {
-        match post::send_via_entries(&client, entries, armor).await {
+        let result = if let Some(pool) = si_pool {
+            post::send_via_pool(&client, pool, armor).await
+        } else {
+            post::send_via_entries(&client, entries, armor).await
+        };
+        match result {
             Ok((status, entry)) if (200..300).contains(&status) => {
                 tracing::info!(status, entry, label, "duplex control POST accepted");
                 return;
@@ -3831,7 +3895,7 @@ fn spawn_duplex_offer(
                         pkesk_recipients = ?recipients,
                         "duplex_offer POST (periodic until accept)"
                     );
-                    post_control_armor_with_retry(&entries, &armor, "duplex_offer").await;
+                    post_control_armor_with_retry(&entries, wire.si_pool.as_ref(), &armor, "duplex_offer").await;
                 }
                 Err(err) => tracing::warn!(error = %err, session = %session_id, "duplex_offer wrap refused"),
             }
@@ -3910,7 +3974,7 @@ fn spawn_duplex_accept_chat(
                         session = %session_id,
                         "duplex_accept POST (periodic until l0_connect pipe up)"
                     );
-                    post_control_armor_with_retry(&entries, &armor, "duplex_accept").await;
+                    post_control_armor_with_retry(&entries, wire.si_pool.as_ref(), &armor, "duplex_accept").await;
                 }
                 Err(err) => tracing::warn!(error = %err, session = %session_id, "duplex_accept Chat wrap refused"),
             }
@@ -3974,11 +4038,12 @@ fn spawn_l0_pipe(
         live.pipe_connect_inflight = true;
         true
     };
-    let entries = if wire.entries.is_empty() {
+    let static_entries = if wire.entries.is_empty() {
         wire.listen_entries.clone()
     } else {
         wire.entries.clone()
     };
+    let si_pool = wire.si_pool.clone();
     let duplex_for_guard = duplex.clone();
     handle.spawn(async move {
         struct PipeConnectInflightGuard {
@@ -4010,6 +4075,9 @@ fn spawn_l0_pipe(
         };
         let mut first_blob = first;
         loop {
+            let entries = if let Some(pool) = si_pool.as_ref() { match pool.acquire(None).await {
+                Ok(entry) => vec![entry], Err(error) => { tracing::warn!(session = %session_id, %error, "l0_connect SI pool acquire failed; retrying"); tokio::time::sleep(Duration::from_secs(LISTEN_RECONNECT_SECS)).await; continue; }
+            }} else { static_entries.clone() };
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
             let Ok(connect_armor) = listen::wrap_l0_connect_for_post(
                 &listen_wallet,
@@ -4236,6 +4304,7 @@ async fn warm_one_ready_identity(
     let (ready_tx, ready_rx) = oneshot::channel();
     if !spawn_listen_worker_with_ready(
         wire.listen_entries.clone(),
+        wire.si_pool.clone(),
         wire.route_pgp.clone(),
         identity.wallet_address().to_owned(),
         wire.si_eth.clone(),
@@ -4270,13 +4339,17 @@ async fn warm_one_ready_identity(
     Ok(identity)
 }
 
-fn spawn_post_worker(entries: Vec<String>) -> Option<mpsc::Sender<PostJob>> {
+fn spawn_post_worker(
+    si_pool: Option<Arc<SiPool>>,
+    entries: Vec<String>,
+) -> Option<mpsc::Sender<PostJob>> {
     let handle = tokio::runtime::Handle::try_current().ok()?;
     let client = post::http_client().ok()?;
     let (tx, mut rx) = mpsc::channel::<PostJob>(POST_QUEUE);
     handle.spawn(async move {
         let client = Arc::new(client);
         let entries = Arc::new(entries);
+        let si_pool = si_pool;
         let sem = Arc::new(Semaphore::new(POST_CONCURRENCY));
         while let Some(job) = rx.recv().await {
             let Ok(permit) = sem.clone().acquire_owned().await else {
@@ -4288,9 +4361,15 @@ fn spawn_post_worker(entries: Vec<String>) -> Option<mpsc::Sender<PostJob>> {
             };
             let client = client.clone();
             let entries = entries.clone();
+            let si_pool = si_pool.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                match post::send_via_entries(&client, &entries, &job.armor).await {
+                let result = if let Some(pool) = si_pool.as_ref() {
+                    post::send_via_pool(&client, pool, &job.armor).await
+                } else {
+                    post::send_via_entries(&client, &entries, &job.armor).await
+                };
+                match result {
                     Ok((status, entry)) => tracing::debug!(
                         status,
                         entry,
@@ -4836,7 +4915,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tx = spawn_post_worker(vec![server.uri()]).expect("worker");
+        let tx = spawn_post_worker(None, vec![server.uri()]).expect("worker");
         let armor = "-----BEGIN PGP MESSAGE-----\n\nxxxx\n-----END PGP MESSAGE-----\n";
         let started = Instant::now();
         for _ in 0..4 {

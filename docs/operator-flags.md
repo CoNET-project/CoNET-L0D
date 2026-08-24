@@ -106,3 +106,6 @@ The August 2026 experiment used overlay endpoints `100.64.0.5` and
   proof that the application transport failed.
 - Record the actual local endpoint, wallet destination, enode, and Prysm peer
   ID for every experiment.
+
+## SI pool
+`l0.si_pool_from_contract` defaults to `true`. It permits empty static `entries` and `listen_entries`, using GuardianNodesInfoV6 via `l0.rpc`; set it to `false` to operate only with static entries.

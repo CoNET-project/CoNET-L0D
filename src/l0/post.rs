@@ -4,8 +4,10 @@
 
 use crate::error::L0dError;
 use crate::l0::pgp;
+use crate::l0::si_pool::SiPool;
 use serde_json::{json, Value};
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Walk the reqwest/hyper chain. SI mimic-404 is a status; this is connect/IO/reset.
@@ -41,6 +43,48 @@ pub fn http_client() -> Result<reqwest::Client, L0dError> {
 
 /// Try each configured entry once. Fail-closed if the list is empty or every POST fails.
 /// Same host list as `[l0].entries`; this is not a listen fallback onto `listen_entries`.
+
+/// Pick a qualified SI from the on-chain pool and POST. Retries a few hosts.
+pub async fn send_via_pool(
+    client: &reqwest::Client,
+    pool: &Arc<SiPool>,
+    armor: &str,
+) -> Result<(u16, String), L0dError> {
+    let mut last_err = L0dError::L0("P1 POST /post failed via SI pool".into());
+    let mut exclude: Option<String> = None;
+    for _ in 0..5 {
+        let entry = match pool.acquire(exclude.as_deref()).await {
+            Ok(e) => e,
+            Err(err) => {
+                last_err = err;
+                break;
+            }
+        };
+        let url = match post_url(&entry) {
+            Ok(url) => url,
+            Err(err) => {
+                pool.mark_failed(&entry).await;
+                exclude = Some(entry);
+                last_err = err;
+                continue;
+            }
+        };
+        match send(client, &url, armor).await {
+            Ok(status) => return Ok((status, entry)),
+            Err(err) => {
+                last_err = err;
+                pool.mark_failed(&entry).await;
+                let msg = last_err.to_string();
+                exclude = Some(entry);
+                if msg.contains("timed out") || msg.contains("timeout") {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
 pub async fn send_via_entries(
     client: &reqwest::Client,
     entries: &[String],

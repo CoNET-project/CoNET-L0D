@@ -55,6 +55,7 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
     println!("l0.address_pgp {}", cfg.l0.address_pgp);
     println!("l0.entries     {}", cfg.l0.entries.len());
     println!("l0.listen      {}", cfg.l0.listen_entries.len());
+    println!("l0.si_pool     {}", cfg.l0.si_pool_from_contract);
     println!("l0.channels    {}", cfg.l0.channels.len());
     println!("l0.proxies     {}", cfg.l0.proxies.len());
     println!("l0.client_duplex {}", cfg.client_duplex.len());

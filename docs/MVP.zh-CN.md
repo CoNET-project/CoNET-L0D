@@ -199,3 +199,6 @@ conet-l0d teardown --config /etc/conet-l0d.toml
 5. 浏览器/原生客户端互操作；
 6. replay、reconnect、close 与失败路径测试；
 7. 应用路径稳定后再添加可选 L1 研究 profile。
+
+## GuardianNodesInfoV6 SI 池
+L0 默认启用 `si_pool_from_contract = true`：通过配置的 RPC 分页读取 GuardianNodesInfoV6，随机选择 TCP `:80` 可达的 SI，并对失败节点冷却。静态 entries 仅作可选回退；该机制不改变现有 duplex 角色或多远端本地绑定语义。

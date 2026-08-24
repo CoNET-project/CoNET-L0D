@@ -2,7 +2,8 @@
 //!
 //! Two listen kinds:
 //! - Chat: EIP-191-sign `mining` + `listenKind: chat` (offers, P1 gossip).
-//! - L0 exclusive: EIP-191-sign `l0_listen` or `mining` + `listenKind: l0`.
+//! - L0 exclusive: EIP-191-sign `l0_listen` + `listenKind: l0` only
+//!   (do not send retired `mining` + `listenKind: l0`).
 //! Both wrap `base64({ message, signMessage })` to **this host's** mailbox B
 //! route PGP, `POST { "data" }` to entry **C**, and read the stream.
 //!

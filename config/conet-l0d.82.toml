@@ -54,17 +54,10 @@ route_pgp_file = "/home/peter/conet-l0d-lab/keys/spoke-98/peer-udp-route.asc"
 [l0]
 enabled = true
 rpc = "https://rpc1.conet.network"
+si_pool_from_contract = true
 address_pgp = "0x684b0ac760cEE9c9b85de36d69746420648Cf9e2"
-entries = [
-  "http://20ab90fe82d0e9e3.conet.network",
-  "http://f8117e1568eeaed7.conet.network",
-  "http://ae85a2aeec768225.conet.network",
-]
-listen_entries = [
-  "http://f8117e1568eeaed7.conet.network",
-  "http://ae85a2aeec768225.conet.network",
-  "http://20ab90fe82d0e9e3.conet.network",
-]
+entries = []  # unused when si_pool_from_contract
+listen_entries = []  # unused when si_pool_from_contract  # unused when si_pool_from_contract
 routing_eoa = "0x66dCB48ff905f5f5f3692f302da0A84e0265A792"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
@@ -76,11 +69,7 @@ routing_eoa = "0x66dCB48ff905f5f5f3692f302da0A84e0265A792"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/geth/routing.eth"
 mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/geth/self-mailbox-route.asc"
-listen_entries = [
-  "http://f8117e1568eeaed7.conet.network",
-  "http://ae85a2aeec768225.conet.network",
-  "http://20ab90fe82d0e9e3.conet.network",
-]
+listen_entries = []  # unused when si_pool_from_contract  # unused when si_pool_from_contract
 
 [[l0.channels]]
 port = 4200
@@ -88,11 +77,7 @@ routing_eoa = "0x3048925d768694D4b95524DFB71b38e812D705Dd"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/beacon/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/beacon/routing.eth"
 mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/beacon/self-mailbox-route.asc"
-listen_entries = [
-  "http://f8117e1568eeaed7.conet.network",
-  "http://ae85a2aeec768225.conet.network",
-  "http://20ab90fe82d0e9e3.conet.network",
-]
+listen_entries = []  # unused when si_pool_from_contract  # unused when si_pool_from_contract
 
 [[l0.channels]]
 port = 4300
@@ -100,8 +85,4 @@ routing_eoa = "0x49928729045d55357DC3071802C0E77a930959D3"
 routing_key_file = "/home/peter/conet-l0d-lab/keys/udp/routing.key"
 routing_eth_key_file = "/home/peter/conet-l0d-lab/keys/udp/routing.eth"
 mailbox_route_pgp_file = "/home/peter/conet-l0d-lab/keys/udp/self-mailbox-route.asc"
-listen_entries = [
-  "http://f8117e1568eeaed7.conet.network",
-  "http://ae85a2aeec768225.conet.network",
-  "http://20ab90fe82d0e9e3.conet.network",
-]
+listen_entries = []  # unused when si_pool_from_contract  # unused when si_pool_from_contract

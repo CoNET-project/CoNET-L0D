@@ -297,3 +297,6 @@ cargo build --release
 
 Keep `cargo fmt --check`, `cargo clippy --all-targets --all-features`, and tests
 green. Tests use local mocks/wiremock and must not contact production services.
+
+## SI pool discovery
+With `l0.si_pool_from_contract = true` (the default), use GuardianNodesInfoV6 discovery rather than requiring static SI URLs. Pool acquisition qualifies TCP `:80`, randomizes candidates, and applies a failure cooldown. Static lists are used only when the pool is disabled or unavailable; do not reintroduce a Chat mining SSE for a pure `--clientDuplex` spoke.

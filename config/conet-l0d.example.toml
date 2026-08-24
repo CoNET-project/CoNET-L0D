@@ -20,6 +20,8 @@ route_register_url = "https://beamio.app/api/regiestChatRoute"
 # from the destination mailbox B.
 entries = []
 listen_entries = []
+# Discover GuardianNodesInfoV6 SI entries through rpc; static lists may stay empty.
+si_pool_from_contract = true
 
 # Main paid account for signed mailbox commands.
 # billing_eoa = "0x<main-paid-wallet>"

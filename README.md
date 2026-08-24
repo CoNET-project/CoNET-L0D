@@ -230,3 +230,6 @@ contracts. The crate never restarts geth, beacon, or validator.
 ## License
 
 [MIT](LICENSE) © 2026 CoNET / Beamio
+
+### SI contract pool
+`[l0].si_pool_from_contract` defaults to `true`: L0 discovers GuardianNodesInfoV6 pages through the configured RPC, randomly qualifies TCP port 80 candidates, and cools down failures. Static `entries` and `listen_entries` remain optional fallbacks. Client-duplex-only spokes skip the permanent Chat mining SSE; they retain their per-line L0 listen ownership and current duplex role behavior.
