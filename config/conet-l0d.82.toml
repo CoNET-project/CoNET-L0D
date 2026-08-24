@@ -1,14 +1,12 @@
 # Production L0 hub on 216.225.202.82 — inbound overlay for geth/beacon/udp.
-# Existing EL/CL bind public IP; overlay VIP 100.64.0.7 via TUN + DNAT.
+# Existing EL/CL bind public IP; lab routing maps overlay endpoint 100.64.0.7.
 # Do not bind geth/beacon RPC to local_vip.
 # Geth keeps public advertise (`--nat any` / public enode @216.225.202.82:8400).
 # Other overlay geth dial `enode://f1e249c9…@100.64.0.7:8400` (scripts/l0-prod82-hub.env).
 # Each new spoke needs its own [[peers]] row (per-port user PGP; do not reuse hub self-user.asc).
 
-tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
 local_vip = "100.64.0.7"
-iptables_chain = "CONET_L0D"
 state_path = "/home/peter/conet-l0d-lab/run/state.json"
 
 [identity]

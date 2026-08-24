@@ -20,7 +20,8 @@ Mailbox path is **healthy** in this window: zero application-layer loss on both 
 
 Overlay TCP quality is **high latency + reordering**, not missing bytes. Overlay RTT is ~475–750 ms versus ~40–55 ms on `.98` public peers (mailbox A/B/C hop + batching).
 
-The only kernel drop signal is **`.98` TUN `tx_dropped=937`** (qlen 500). Spoke TUN drops are 0.
+The only kernel endpoint drop signal is **`.98` `tx_dropped=937`** (qlen
+500). The spoke endpoint reports zero drops.
 
 Do **not** treat as overlay loss: `.45` isolate INPUT DROP (L0_ONLY public P2P), or EL `eth_blockNumber=0x0` (CL lag; `Processing blocks` ~3.2/s).
 
@@ -29,11 +30,11 @@ Do **not** treat as overlay loss: `.45` isolate INPUT DROP (L0_ONLY public P2P),
 | Source | Type |
 | --- | --- |
 | `conet-l0d.log` since last `conet-l0d started` | live logs |
-| `ip -s link show conet-l0` | TUN RX/TX |
+| recorded local overlay endpoint counters | inbound / outbound bytes and drops |
 | `ss -tni state established` overlay sockets | TCP RTT / retrans / reorder |
 | `sudo ss -tnp` listen SSE to C:80 | listen workers |
 | geth `net_peerCount`, beacon `/eth/v1/node/peer_count` + `/syncing` | client health |
-| iptables isolate INPUT | public P2P DROP (not TUN) |
+| host-isolation INPUT counters | rejected public P2P traffic |
 
 `flushed for POST` is **enqueue**, not HTTP 2xx. Inbound queued / POST accepted are **debug** and stay 0 at default `RUST_LOG=info`. Failures are inferred from warn counters.
 
@@ -46,12 +47,14 @@ Do **not** treat as overlay loss: `.45` isolate INPUT DROP (L0_ONLY public P2P),
 | flushed frame bytes | 291,854 | 4,446,511 | envelope bytes in flushed batches |
 | POST failed / refused | 0 / 0 | 0 / 0 | HTTP or dest lookup fail |
 | queue-full out / in | 0 / 0 | 0 / 0 | would drop before POST / write-back |
-| TUN write-back failed | 0 | 0 | inbound decrypt then TUN write |
+| overlay write-back failed | 0 | 0 | inbound decrypt then local delivery |
 | armor refused | 0 | 0 | listen SSE payload rejected |
 | listen SSE failed / reconnect | 0 / 0 | 0 / 0 | C→B listen workers |
 | batch seq gaps | 0 | 0 | no missing flushed seq |
 
-Listen SSE: `.45` 3 ESTAB to C:80 (one per channel). `.98` 4 ESTAB (expected 3); one had Send-Q 7144 — mailbox backpressure, not a TUN drop.
+Listen SSE: `.45` 3 ESTAB to C:80 (one per channel). `.98` 4 ESTAB
+(expected 3); one had Send-Q 7144 — mailbox backpressure, not a local
+endpoint drop.
 
 ## Traffic by overlay port (flushed packets)
 
@@ -102,26 +105,34 @@ Beacon sync stream: `.98` sent **1,667,798** bytes; `.45` acked the **same**. Re
 | `.98` `:4200` ← `100.64.0.5:4200` overlay inbound | 750 / 463 ms | 0 / 1 of 1,540 segs | 1,669,246 / 1,667,798 / 10,576 | reordering 29, reord_seen 345 |
 | `.98` public beacon (sample `.50:4210`) | 47 / 44 ms | 0 / 69 of 484k segs | 192 MB / 192 MB / 187 MB | public path, not overlay |
 
-After DNAT, `.45` `ss` may show hub **public** `:4200`. That is the original dest, not a leaked public path. Overlay proof is TUN VIP + isolate DROP on unsteered public P2P.
+After DNAT, `.45` `ss` may show hub **public** `:4200`. That is the original
+destination, not a leaked public path. The lab proof used matching overlay
+destination traffic plus host-isolation counters for unsteered public P2P.
 
-## TUN correlation
+## Endpoint counter correlation
 
-Linux TUN **TX** = kernel → l0d (outbound POST). TUN **RX** = l0d write-back (inbound). Hub outbound bytes match spoke inbound bytes.
+The recorded local endpoint **outbound** counter represents bytes entering
+`conet-l0d` for POST; the **inbound** counter represents local write-back.
+Hub outbound bytes match spoke inbound bytes.
 
 | Path | Source | Dest | Delta |
 | --- | ---: | ---: | --- |
-| Hub → spoke (beacon-heavy) | `.98` TUN TX 4.42 MB / 5,740 pkt | `.45` TUN RX 4.42 MB / 5,755 pkt | +15 pkt on spoke RX |
-| Spoke → hub | `.45` TUN TX 0.59 MB / 6,365 pkt | `.98` TUN RX 0.51 MB / 6,356 pkt | bytes off ~80 KB; pkt −9 |
-| `.98` TUN tx_dropped | 937 | qlen 500 fq_codel | 13.6% of 5,740+937 attempted TX |
-| `.45` TUN drops / errors | 0 | 0 | spoke is not queue-bound |
+| Hub → spoke (beacon-heavy) | `.98` outbound 4.42 MB / 5,740 pkt | `.45` inbound 4.42 MB / 5,755 pkt | +15 pkt on spoke inbound |
+| Spoke → hub | `.45` outbound 0.59 MB / 6,365 pkt | `.98` inbound 0.51 MB / 6,356 pkt | bytes off ~80 KB; pkt −9 |
+| `.98` `tx_dropped` | 937 | qlen 500 fq_codel | 13.6% of 5,740+937 attempted outbound frames |
+| `.45` endpoint drops / errors | 0 | 0 | spoke is not queue-bound |
 
-`.45` flushed packets 2,793 vs TUN TX 6,365: unknown-port packets fail-closed at **debug** (not in info logs) and never POST. `.98` flushed 5,736 vs TUN TX 5,740 — almost all hub overlay frames were classified.
+`.45` flushed packets 2,793 versus 6,365 recorded outbound frames:
+unknown-port traffic fails closed at **debug** (not in info logs) and is
+never posted. `.98` flushed 5,736 versus 5,740 outbound frames, so almost all
+hub overlay frames were classified.
 
 UDP `:4300` conntrack `UNREPLIED=2` on both ends (discv5 probes).
 
 ## Do not treat as overlay loss
 
-`.45` isolate INPUT DROP (L0_ONLY public P2P; never enters TUN):
+`.45` host-isolation INPUT DROP (L0_ONLY public P2P; never enters the local
+overlay data path):
 
 | Rule | Packets | Bytes |
 | --- | ---: | ---: |
@@ -136,7 +147,7 @@ EL `eth_blockNumber=0x0` on `.45` is CL lag (`sync_distance` 167,206). Overlay a
 
 ## Next quality lever (not a restart)
 
-1. Hub TUN qlen / l0d read rate (937 `tx_dropped`, likely UDP).
+1. Hub local endpoint queue / `conet-l0d` read rate (937 `tx_dropped`, likely UDP).
 2. Overlay RTT / reorder from mailbox hops.
 3. Not a missing listen SSE, not POST fail, not isolate DROP, not EL `0x0`.
 

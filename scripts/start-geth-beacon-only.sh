@@ -3,6 +3,9 @@
 # Does NOT start validator. Does NOT wipe datadir. Does NOT geth init.
 # Do not run leftover 06_restart_node22445.sh start (that script starts validator).
 #
+# Standing .45 join (L0_STREAM_ONLY via $LAB_DIR/run/l0-stream.env):
+# geth + beacon MUST reach both .82 (127.0.0.1:18400/:14200) and .98
+# (public :8400/:4200). Do not enable l0-dual-hub.env TUN mesh.
 # L0_ONLY=1 (or $LAB_DIR/run/l0-only.env): no public bootnodes,
 # --nodiscover / beacon --no-discovery (unless L0_DHT=1), overlay bootnode/peer to .98 only,
 # INPUT+OUTPUT isolate chain CONET_L0D_P2P_ISOLATE* (never touch CONET_L0D).
@@ -78,10 +81,9 @@ LAB_98_ENODE="${LAB_98_ENODE:-enode://006561987aaeea06a6f2c54d37656a4acccd0c1e16
 HUB_BOOTNODES="${HUB_BOOTNODES:-enode://e5fe89d9ad924db6e4699480242a12fccba2c00e35772db706e46190c0ded9bb2b7e0d996826f5e46d369e01336213ef263c5038f94552e5f5e6e8ec76573a3f@38.102.126.30:8400,enode://d9243095bca94720f88d38c93ae4ccefc8b67651c66b4c93c915f845f6abfd39a091465db02db32b1a5b8061566c1558d2e6842f75620bf533480bab8a180168@38.102.126.50:8400,enode://5cf9a159e641318cda27e6bc1b4185667c0cdb1b54c3df5b8626eacbacea93af64c243dbdd09b40c62ba24792d0afc571cf17cbc47a5ed5a6207f27054c01d65@216.225.202.23:8400,enode://8e09d44bb4c29543a172e53dd8a74677a2a63d3d98a3d530f9d8b6f6bd6802a542f5b79d509ff737a9a764a66ab44a81403597cb50e350178ddd91f487e28f2d@216.225.202.22:8400,enode://dc0624c81896cdec036af7096886b1629a288b4824a467038df645c5c6b0f7fe75e13758ea80c0c37ba6245b221680db1fb553d564e54b55410eb6063bb64ca0@216.225.197.3:8400,enode://f1e249c97ce861441b3bd4832213cc634dd5c23d1a8722cd9c1aea28492779f6b64e012e8d97d56006d69be5224903ea5a787d8af68e9542db82ac1f76491dd5@216.225.202.82:8400}"
 EXECUTION_BOOTNODES="${EXECUTION_BOOTNODES:-${HUB_BOOTNODES},${LAB_98_ENODE}}"
 
-# Optional *extra* static --peer (comma-separated). Primary overlay peer is
-# L0_OVERLAY_BEACON_PEER (from l0-prod82-hub.env → .82 VIP). Default empty:
-# do NOT auto-add .98 public/VIP — SI exclusive occupy + isolate make dual-hub
-# dial backoff. Enable via l0-dual-hub.env or export EXTRA_BEACON_PEERS=...
+# Optional *extra* static --peer (comma-separated). Standing .45 stream-only
+# join loads both hubs from l0-stream.env (must win over l0-prod82 overlay VIPs).
+# Do NOT enable l0-dual-hub.env TUN mesh. EXTRA_BEACON_PEERS uses IFS=','.
 EXTRA_BEACON_PEERS="${EXTRA_BEACON_PEERS:-}"
 
 # Fallbacks only if l0-prod82-hub.env is missing (legacy .98-as-hub lab).
@@ -105,6 +107,16 @@ TUN_IFACE="${TUN_IFACE:-conet-l0}"
 if [[ -f "$L0_ONLY_ENV" ]]; then
 	# shellcheck disable=SC1090
 	source "$L0_ONLY_ENV"
+fi
+# Standing .45: stream-only dual-hub (.82 local listener + .98 public).
+# Must source after l0-prod82-hub.env (overlay VIPs) so this file wins.
+L0_STREAM_ENV="${L0_STREAM_ENV:-$LAB_DIR/run/l0-stream.env}"
+if [[ ! -f "$L0_STREAM_ENV" && -f "$SCRIPT_DIR/l0-stream.env" ]]; then
+	L0_STREAM_ENV="$SCRIPT_DIR/l0-stream.env"
+fi
+if [[ -f "$L0_STREAM_ENV" ]]; then
+	# shellcheck disable=SC1090
+	source "$L0_STREAM_ENV"
 fi
 L0_ONLY="${L0_ONLY:-0}"
 L0_DHT="${L0_DHT:-0}"
@@ -457,6 +469,18 @@ add_geth_overlay_peers() {
 	done < <(l0_overlay_enode_list)
 }
 
+add_geth_bootnode_peers() {
+	local IFS=','
+	local enode
+	for enode in $EXECUTION_BOOTNODES; do
+		enode="${enode//[[:space:]]/}"
+		[[ -n "$enode" ]] || continue
+		curl -s "http://127.0.0.1:${GETH_HTTP_PORT}" -H 'content-type: application/json' \
+			-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"admin_addPeer\",\"params\":[\"$enode\"]}" \
+			>/dev/null || true
+	done
+}
+
 start_geth() {
 	local bootnodes extra=()
 	if l0_only_on; then
@@ -502,6 +526,8 @@ start_geth() {
 	wait_for_port 127.0.0.1 "$GETH_HTTP_PORT" geth-http 30 || true
 	if l0_only_on; then
 		add_geth_overlay_peers
+	elif stream_only_on; then
+		add_geth_bootnode_peers
 	fi
 }
 

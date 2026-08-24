@@ -109,8 +109,8 @@ pub async fn packet_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
             }
             armor = recv_inbound_armor(&mut inbound_rx) => {
                 match armor {
-                    Some(armor) => {
-                        if let Err(err) = stats.l0.apply_inbound_armor(&armor) {
+                    Some(chunk) => {
+                        if let Err(err) = stats.l0.apply_inbound_chunk(chunk) {
                             tracing::warn!(error = %err, "P1 inbound armor from listen refused");
                         }
                     }
@@ -134,8 +134,8 @@ pub async fn stream_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
             }
             armor = recv_inbound_armor(&mut inbound_rx) => {
                 match armor {
-                    Some(armor) => {
-                        if let Err(err) = stats.l0.apply_inbound_armor(&armor) {
+                    Some(chunk) => {
+                        if let Err(err) = stats.l0.apply_inbound_chunk(chunk) {
                             tracing::warn!(error = %err, "duplex stream inbound armor refused");
                         }
                     }
@@ -159,8 +159,8 @@ pub async fn proxy_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
             }
             armor = recv_inbound_armor(&mut inbound_rx) => {
                 match armor {
-                    Some(armor) => {
-                        if let Err(err) = stats.l0.apply_inbound_armor(&armor) {
+                    Some(chunk) => {
+                        if let Err(err) = stats.l0.apply_inbound_chunk(chunk) {
                             tracing::warn!(error = %err, "proxy inbound armor refused");
                         }
                     }
@@ -171,7 +171,9 @@ pub async fn proxy_loop(cfg: &ValidatedConfig) -> Result<(), L0dError> {
     }
 }
 
-async fn recv_inbound_armor(rx: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+async fn recv_inbound_armor(
+    rx: &mut Option<mpsc::Receiver<crate::l0::listen::InboundChunk>>,
+) -> Option<crate::l0::listen::InboundChunk> {
     match rx.as_mut() {
         Some(inner) => inner.recv().await,
         None => pending().await,

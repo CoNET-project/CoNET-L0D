@@ -35,7 +35,7 @@ impl ForwardStats {
         tracing::debug!(
             dest = %dest,
             packets = self.ipv4_packets,
-            "overlay IPv4 on TUN"
+                    "overlay IPv4 frame observed"
         );
         self.l0.note_overlay_packet(dest, locator.as_ref(), frame);
     }

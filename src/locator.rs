@@ -1,25 +1,56 @@
 use crate::error::L0dError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
-/// Peer locator, not an ERC-4804 content URL.
+/// Wallet-addressed application resource locator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Locator {
     pub host: LocatorHost,
-    pub service: OverlayService,
+    /// Absolute application path with an optional query string.
+    ///
+    /// Compatibility paths such as `/p2p/geth` remain parseable, but ordinary
+    /// application resources are not restricted to a fixed service catalog.
+    pub path_and_query: String,
 }
 
-/// Client address for temporary duplex + OS intercept: `web3://<host>:<port>`.
+/// Client address for a persistent application stream: `web3://<host>:<port>`.
 ///
 /// Port `8400` maps to geth, `4200` to beacon. Other ports stay numeric-only
 /// (no OverlayService) so proxy lines can use arbitrary logical ports.
+///
+/// Optional `@LOCAL` is a Linux-runtime loopback bind, not part of the
+/// public `web3://` locator contract: `web3://HOST:PORT@18400`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientTarget {
     pub host: LocatorHost,
-    /// Remote application port carried in duplex offers (`mainWallet:port`).
     pub port: u16,
-    /// Optional local TCP listen port (`web3://host:port@local`). When `None`,
-    /// the daemon tries `port` then `port + 10000`.
-    pub local_bind: Option<u16>,
+    /// Explicit `127.0.0.1` bind from `web3://HOST:PORT@LOCAL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
+    /// Assigned `127.0.0.1` listener after config validation.
+    #[serde(default)]
+    pub bind_port: u16,
+}
+
+/// Local bind candidates walk `port`, `port+10000`, `port+20000`, …
+pub const CLIENT_LOCAL_PORT_STRIDE: u16 = 10_000;
+
+/// Preferred loopback bind, then documented stride fallbacks.
+///
+/// An explicit `@LOCAL` bind is a single candidate and must not walk.
+pub fn client_bind_candidates(start: u16, explicit: bool) -> impl Iterator<Item = u16> {
+    std::iter::successors(Some(start), move |port| {
+        if explicit {
+            None
+        } else {
+            port.checked_add(CLIENT_LOCAL_PORT_STRIDE)
+        }
+    })
+}
+
+/// Next unused loopback bind for a logical port (`PORT`, `PORT+10000`, …).
+pub fn next_client_bind_port(logical: u16, claimed: &HashSet<u16>) -> Option<u16> {
+    client_bind_candidates(logical, false).find(|port| !claimed.contains(port))
 }
 
 impl ClientTarget {
@@ -34,7 +65,7 @@ impl ClientTarget {
         }
         if rest.contains('/') {
             return Err(L0dError::Locator(
-                "client target is web3://<host>:<port>, not /p2p/<service>".into(),
+                "client target is web3://<host>:<port>[@LOCAL], not /p2p/<service>".into(),
             ));
         }
         let (host_raw, port_raw) = rest.rsplit_once(':').ok_or_else(|| {
@@ -45,33 +76,42 @@ impl ClientTarget {
                 "client target host is empty or contains ':'".into(),
             ));
         }
-        let (port_part, local_bind) = if let Some((app_port, bind_raw)) = port_raw.split_once('@') {
-            let local: u16 = bind_raw.parse().map_err(|_| {
-                L0dError::Locator(format!(
-                    "client target local bind port is invalid: {bind_raw}"
-                ))
-            })?;
-            if local == 0 {
-                return Err(L0dError::Locator(
-                    "client target local bind port 0 is not allowed".into(),
-                ));
-            }
-            (app_port, Some(local))
-        } else {
-            (port_raw, None)
+        let (logical_raw, local_raw) = match port_raw.split_once('@') {
+            Some((logical, local)) => (logical, Some(local)),
+            None => (port_raw, None),
         };
-        let port: u16 = port_part.parse().map_err(|_| {
-            L0dError::Locator(format!("client target port is invalid: {port_part}"))
+        if logical_raw.is_empty() || local_raw.is_some_and(|s| s.is_empty() || s.contains('@')) {
+            return Err(L0dError::Locator(
+                "client target local bind must look like web3://HOST:PORT@LOCAL".into(),
+            ));
+        }
+        let port: u16 = logical_raw.parse().map_err(|_| {
+            L0dError::Locator(format!("client target port is invalid: {logical_raw}"))
         })?;
         if port == 0 {
             return Err(L0dError::Locator(
                 "client target port 0 is not allowed".into(),
             ));
         }
+        let local_port = match local_raw {
+            None => None,
+            Some(raw) => {
+                let local: u16 = raw.parse().map_err(|_| {
+                    L0dError::Locator(format!("client target local bind port is invalid: {raw}"))
+                })?;
+                if local == 0 {
+                    return Err(L0dError::Locator(
+                        "client target local bind port 0 is not allowed".into(),
+                    ));
+                }
+                Some(local)
+            }
+        };
         Ok(Self {
             host: parse_host(host_raw)?,
             port,
-            local_bind,
+            local_port,
+            bind_port: local_port.unwrap_or(port),
         })
     }
 
@@ -84,13 +124,17 @@ impl ClientTarget {
     }
 
     pub fn display(&self) -> String {
-        let base = match &self.host {
+        match &self.host {
             LocatorHost::Eoa(eoa) => format!("web3://{eoa}:{}", self.port),
             LocatorHost::Tag(tag) => format!("web3://{tag}.web3:{}", self.port),
-        };
-        match self.local_bind {
-            Some(local) => format!("{base}@{local}"),
-            None => base,
+        }
+    }
+
+    /// Config / CLI form including an explicit loopback bind when present.
+    pub fn display_with_local(&self) -> String {
+        match self.local_port {
+            Some(local) => format!("{}@{local}", self.display()),
+            None => self.display(),
         }
     }
 
@@ -98,12 +142,12 @@ impl ClientTarget {
     pub fn as_service_locator(&self) -> Option<Locator> {
         self.service().map(|service| Locator {
             host: self.host.clone(),
-            service,
+            path_and_query: format!("/p2p/{}", service.as_str()),
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LocatorHost {
     Eoa(String),
@@ -138,34 +182,60 @@ impl Locator {
             return Err(L0dError::Locator("unexpected extra scheme".into()));
         }
 
-        let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
-        if parts.len() != 3 {
+        let (host_raw, resource_raw) = rest.split_once('/').ok_or_else(|| {
+            L0dError::Locator(
+                "resource locator must look like web3://<host>/<path>; use web3://<host>:<port> for a stream"
+                    .into(),
+            )
+        })?;
+        if host_raw.is_empty() || host_raw.contains(':') {
             return Err(L0dError::Locator(
-                "expected web3://<host>/p2p/<geth|beacon>".into(),
+                "resource locator host is empty or contains a logical port".into(),
             ));
         }
-        if !parts[1].eq_ignore_ascii_case("p2p") {
-            return Err(L0dError::Locator("second path segment must be p2p".into()));
+        if resource_raw.contains('#') {
+            return Err(L0dError::Locator(
+                "resource locator fragments are client-local and must not be sent to the host"
+                    .into(),
+            ));
+        }
+        if resource_raw
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_ascii_whitespace() || c == '\\')
+        {
+            return Err(L0dError::Locator(
+                "resource path and query must not contain whitespace, controls, or backslashes"
+                    .into(),
+            ));
         }
 
-        let service = match parts[2].to_ascii_lowercase().as_str() {
-            "geth" => OverlayService::Geth,
-            "beacon" => OverlayService::Beacon,
-            other => {
-                return Err(L0dError::Locator(format!(
-                    "service must be geth or beacon, not {other}"
-                )))
-            }
-        };
+        let mut path_and_query = format!("/{resource_raw}");
+        if path_and_query.eq_ignore_ascii_case("/p2p/geth") {
+            path_and_query = "/p2p/geth".into();
+        } else if path_and_query.eq_ignore_ascii_case("/p2p/beacon") {
+            path_and_query = "/p2p/beacon".into();
+        }
 
-        let host = parse_host(parts[0])?;
-        Ok(Self { host, service })
+        Ok(Self {
+            host: parse_host(host_raw)?,
+            path_and_query,
+        })
     }
 
     pub fn display(&self) -> String {
         match &self.host {
-            LocatorHost::Eoa(eoa) => format!("web3://{eoa}/p2p/{}", self.service.as_str()),
-            LocatorHost::Tag(tag) => format!("web3://{tag}.web3/p2p/{}", self.service.as_str()),
+            LocatorHost::Eoa(eoa) => format!("web3://{eoa}{}", self.path_and_query),
+            LocatorHost::Tag(tag) => {
+                format!("web3://{tag}.web3{}", self.path_and_query)
+            }
+        }
+    }
+
+    pub fn service(&self) -> Option<OverlayService> {
+        match self.path_and_query.as_str() {
+            "/p2p/geth" => Some(OverlayService::Geth),
+            "/p2p/beacon" => Some(OverlayService::Beacon),
+            _ => None,
         }
     }
 }
@@ -227,14 +297,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_eoa_geth() {
-        let loc = Locator::parse("web3://0x1111111111111111111111111111111111111111/p2p/geth")
-            .expect("parse");
+    fn parse_eoa_resource_with_query() {
+        let loc =
+            Locator::parse("web3://0x1111111111111111111111111111111111111111/dashboard?range=7d")
+                .expect("parse");
         assert_eq!(
             loc.host,
             LocatorHost::Eoa("0x1111111111111111111111111111111111111111".into())
         );
-        assert_eq!(loc.service, OverlayService::Geth);
+        assert_eq!(loc.path_and_query, "/dashboard?range=7d");
+        assert_eq!(loc.service(), None);
+        assert_eq!(
+            loc.display(),
+            "web3://0x1111111111111111111111111111111111111111/dashboard?range=7d"
+        );
+    }
+
+    #[test]
+    fn parse_compatibility_service() {
+        let loc = Locator::parse("web3://0x1111111111111111111111111111111111111111/p2p/geth")
+            .expect("parse");
+        assert_eq!(loc.path_and_query, "/p2p/geth");
+        assert_eq!(loc.service(), Some(OverlayService::Geth));
     }
 
     #[test]
@@ -253,30 +337,26 @@ mod tests {
     }
 
     #[test]
-    fn reject_validator_service() {
-        assert!(
-            Locator::parse("web3://0x1111111111111111111111111111111111111111/p2p/validator")
-                .is_err()
-        );
+    fn parse_arbitrary_application_path() {
+        let loc = Locator::parse("web3://ExampleMerchant.web3/api/orders?id=42").expect("parse");
+        assert_eq!(loc.host, LocatorHost::Tag("ExampleMerchant".into()));
+        assert_eq!(loc.path_and_query, "/api/orders?id=42");
+    }
+
+    #[test]
+    fn parse_root_resource() {
+        let loc = Locator::parse("web3://ExampleMerchant.web3/").expect("parse root resource");
+        assert_eq!(loc.path_and_query, "/");
+    }
+
+    #[test]
+    fn reject_resource_fragment() {
+        assert!(Locator::parse("web3://ExampleMerchant.web3/app#section").is_err());
     }
 
     #[test]
     fn reject_short_hex() {
         assert!(Locator::parse("web3://0x1111/p2p/geth").is_err());
-    }
-
-    #[test]
-    fn parse_client_eoa_port_with_local_bind() {
-        let t = ClientTarget::parse(
-            "web3://0x1111111111111111111111111111111111111111:8400@18400",
-        )
-        .unwrap();
-        assert_eq!(t.port, 8400);
-        assert_eq!(t.local_bind, Some(18400));
-        assert_eq!(
-            t.display(),
-            "web3://0x1111111111111111111111111111111111111111:8400@18400"
-        );
     }
 
     #[test]
@@ -288,11 +368,33 @@ mod tests {
             LocatorHost::Eoa("0x1111111111111111111111111111111111111111".into())
         );
         assert_eq!(t.port, 8400);
+        assert_eq!(t.local_port, None);
+        assert_eq!(t.bind_port, 8400);
         assert_eq!(t.service(), Some(OverlayService::Geth));
         assert_eq!(
             t.display(),
             "web3://0x1111111111111111111111111111111111111111:8400"
         );
+        assert_eq!(t.display_with_local(), t.display());
+    }
+
+    #[test]
+    fn parse_client_explicit_local_bind() {
+        let t = ClientTarget::parse("web3://CoNET.web3:8400@18400").unwrap();
+        assert_eq!(t.port, 8400);
+        assert_eq!(t.local_port, Some(18400));
+        assert_eq!(t.bind_port, 18400);
+        assert_eq!(t.display(), "web3://CoNET.web3:8400");
+        assert_eq!(t.display_with_local(), "web3://CoNET.web3:8400@18400");
+        assert_eq!(
+            client_bind_candidates(t.bind_port, t.local_port.is_some()).collect::<Vec<_>>(),
+            vec![18400]
+        );
+    }
+
+    #[test]
+    fn reject_client_zero_local_bind() {
+        assert!(ClientTarget::parse("web3://CoNET.web3:8400@0").is_err());
     }
 
     #[test]
@@ -300,6 +402,13 @@ mod tests {
         let t = ClientTarget::parse("web3://CoNET.web3:4200").unwrap();
         assert_eq!(t.host, LocatorHost::Tag("CoNET".into()));
         assert_eq!(t.service(), Some(OverlayService::Beacon));
+        assert_eq!(t.bind_port, 4200);
+        assert_eq!(
+            client_bind_candidates(t.bind_port, false)
+                .take(3)
+                .collect::<Vec<_>>(),
+            vec![4200, 14200, 24200]
+        );
     }
 
     #[test]
@@ -308,5 +417,12 @@ mod tests {
             ClientTarget::parse("web3://0x1111111111111111111111111111111111111111/p2p/geth")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn next_bind_skips_claimed_logical_port() {
+        let claimed = HashSet::from([8400]);
+        assert_eq!(next_client_bind_port(8400, &claimed), Some(18400));
+        assert_eq!(next_client_bind_port(4200, &claimed), Some(4200));
     }
 }

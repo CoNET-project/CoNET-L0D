@@ -21,8 +21,171 @@ use base64::Engine;
 use reqwest::header::CONTENT_TYPE;
 use sequoia_openpgp::Cert;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// A listen stream is never an anonymous source of bytes.  The owner and,
+/// for temporary duplex listens, the session id travel with every item so the
+/// consumer can select exactly one AES key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundChunk {
+    pub owner: String,
+    pub session_id: Option<String>,
+    pub payload: String,
+}
+
+/// The durable owner of one inbound SSE connection.  The stream task and its
+/// cancellation token live here instead of being represented by a global
+/// string queue.
+///
+/// `session_id` is interior-mutable so a pre-warmed temporary listen can be
+/// rebound to the duplex `offer.session_id` when firstChunk allocates the
+/// line. AES ingress must look up the duplex map by that id, not by the
+/// random id minted at TemporaryIdentity::generate time.
+pub struct OwnedListenSession {
+    pub id: String,
+    pub owner: String,
+    session_id: Mutex<Option<String>>,
+    pub listen_kind: String,
+    pub entry: Mutex<Option<String>>,
+    pub cancel: Arc<AtomicBool>,
+    pub task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for OwnedListenSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedListenSession")
+            .field("id", &self.id)
+            .field("owner", &self.owner)
+            .field("session_id", &self.current_session_id())
+            .field("listen_kind", &self.listen_kind)
+            .field("entry", &self.entry)
+            .field("cancelled", &self.cancel.load(Ordering::Acquire))
+            .field(
+                "task_attached",
+                &self.task.lock().map(|t| t.is_some()).unwrap_or(false),
+            )
+            .finish()
+    }
+}
+
+impl OwnedListenSession {
+    pub fn new(
+        owner: impl Into<String>,
+        session_id: Option<String>,
+        listen_kind: impl Into<String>,
+    ) -> Arc<Self> {
+        let owner = owner.into();
+        let listen_kind = listen_kind.into();
+        let id = format!(
+            "{}:{}:{}",
+            owner,
+            listen_kind,
+            session_id.as_deref().unwrap_or("persistent")
+        );
+        Arc::new(Self {
+            id,
+            owner,
+            session_id: Mutex::new(session_id),
+            listen_kind,
+            entry: Mutex::new(None),
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: Mutex::new(None),
+        })
+    }
+
+    pub fn current_session_id(&self) -> Option<String> {
+        self.session_id.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Bind this live SSE to a duplex pipe handle. Registry `id` stays stable
+    /// (pump still keys InboundChunk.owner by construction id); only the
+    /// AES/session lookup field changes.
+    pub fn bind_session_id(&self, session_id: impl Into<String>) {
+        if let Ok(mut current) = self.session_id.lock() {
+            *current = Some(session_id.into());
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+
+    pub fn set_entry(&self, entry: impl Into<String>) {
+        if let Ok(mut current) = self.entry.lock() {
+            *current = Some(entry.into());
+        }
+    }
+
+    pub fn attach_task(&self, task: JoinHandle<()>) {
+        if let Ok(mut current) = self.task.lock() {
+            *current = Some(task);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ListenOwnerRegistry {
+    owners: Arc<Mutex<HashMap<String, Arc<OwnedListenSession>>>>,
+}
+
+impl ListenOwnerRegistry {
+    pub fn register(&self, owner: Arc<OwnedListenSession>) -> bool {
+        let Ok(mut owners) = self.owners.lock() else {
+            return false;
+        };
+        owners.insert(owner.id.clone(), owner).is_none()
+    }
+
+    pub fn get(&self, owner_id: &str) -> Option<Arc<OwnedListenSession>> {
+        self.owners.lock().ok()?.get(owner_id).cloned()
+    }
+
+    /// Find a live temporary listen by wallet address (case-insensitive).
+    pub fn find_by_wallet(&self, wallet: &str) -> Option<Arc<OwnedListenSession>> {
+        let Ok(owners) = self.owners.lock() else {
+            return None;
+        };
+        owners
+            .values()
+            .find(|session| session.owner.eq_ignore_ascii_case(wallet))
+            .cloned()
+    }
+
+    pub fn cancel(&self, owner: &str) -> bool {
+        let Some(session) = self.get(owner) else {
+            return false;
+        };
+        session.cancel();
+        true
+    }
+
+    pub fn remove(&self, owner: &str) -> Option<Arc<OwnedListenSession>> {
+        self.owners.lock().ok()?.remove(owner)
+    }
+
+    pub fn len(&self) -> usize {
+        self.owners.lock().map(|owners| owners.len()).unwrap_or(0)
+    }
+}
+
+impl InboundChunk {
+    pub fn new(owner: impl Into<String>, session_id: Option<String>, payload: String) -> Self {
+        Self {
+            owner: owner.into(),
+            session_id,
+            payload,
+        }
+    }
+}
 
 /// `command: mining` + `listenKind: chat` on a dedicated routing EOA.
 /// Do not put `Securitykey` in this object (B can decrypt listen).
@@ -579,8 +742,132 @@ pub async fn pump_sse_armors_with_idle_timeout(
     }
 }
 
+/// Compatibility helper for legacy unit tests. Production listeners must use
+/// `pump_sse_armors_owned_session`.
+#[cfg(test)]
+pub async fn pump_sse_armors_owned(
+    mut response: reqwest::Response,
+    armor_tx: &mpsc::Sender<InboundChunk>,
+    owner: String,
+    session_id: Option<String>,
+    idle_timeout: Option<Duration>,
+) -> Result<(), L0dError> {
+    let mut buf = String::new();
+    loop {
+        let read = response.chunk();
+        let result = match idle_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, read).await.map_err(|_| {
+                L0dError::L0(format!(
+                    "listen SSE abandoned: no inbound data for {}s; closing SSE",
+                    timeout.as_secs()
+                ))
+            })?,
+            None => Ok(read
+                .await
+                .map_err(|err| L0dError::L0(format!("listen SSE read: {err}")))?),
+        };
+        match result {
+            Err(err) => return Err(L0dError::L0(format!("listen SSE read: {err}"))),
+            Ok(Some(chunk)) => {
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                for armor in drain_sse_armors(&mut buf) {
+                    if armor_tx
+                        .send(InboundChunk::new(owner.clone(), session_id.clone(), armor))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => {
+                for armor in extract_inbound_armors(&buf) {
+                    if armor_tx
+                        .send(InboundChunk::new(owner.clone(), session_id.clone(), armor))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Owned SSE pump.  Cancellation is checked before reads and before queueing
+/// each frame, so a wrong-key/session error can close only this connection.
+pub async fn pump_sse_armors_owned_session(
+    mut response: reqwest::Response,
+    armor_tx: &mpsc::Sender<InboundChunk>,
+    owner: Arc<OwnedListenSession>,
+    idle_timeout: Option<Duration>,
+) -> Result<(), L0dError> {
+    let mut buf = String::new();
+    loop {
+        if owner.is_cancelled() {
+            return Ok(());
+        }
+        let read = response.chunk();
+        let result = match idle_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, read).await.map_err(|_| {
+                L0dError::L0(format!(
+                    "listen SSE abandoned: no inbound data for {}s; closing SSE",
+                    timeout.as_secs()
+                ))
+            })?,
+            None => Ok(read
+                .await
+                .map_err(|err| L0dError::L0(format!("listen SSE read: {err}")))?),
+        };
+        match result {
+            Err(err) => return Err(L0dError::L0(format!("listen SSE read: {err}"))),
+            Ok(Some(chunk)) => {
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                for armor in drain_sse_armors(&mut buf) {
+                    if owner.is_cancelled() {
+                        return Ok(());
+                    }
+                    if armor_tx
+                        .send(InboundChunk::new(
+                            owner.id.clone(),
+                            owner.current_session_id(),
+                            armor,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => {
+                for armor in extract_inbound_armors(&buf) {
+                    if owner.is_cancelled() {
+                        return Ok(());
+                    }
+                    if armor_tx
+                        .send(InboundChunk::new(
+                            owner.id.clone(),
+                            owner.current_session_id(),
+                            armor,
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Pump a normal Chat SSE. Chat heartbeats are governed by the mailbox and
 /// must not be mistaken for an abandoned occupied L0 pipe.
+#[cfg(test)]
 pub async fn pump_sse_armors(
     response: reqwest::Response,
     armor_tx: &mpsc::Sender<String>,
@@ -589,6 +876,7 @@ pub async fn pump_sse_armors(
 }
 
 /// One listen POST + SSE drain. Tests use wiremock. Do not call production SI from tests.
+#[cfg(test)]
 pub async fn run_listen_once(
     client: &reqwest::Client,
     url: &str,
@@ -664,6 +952,61 @@ mod tests {
         assert!(!cmd.contains("Securitykey"));
         assert!(!cmd.contains("signMessage"));
         assert!(!cmd.contains("l1p2p"));
+    }
+
+    #[test]
+    fn inbound_chunk_always_keeps_owner_and_session_binding() {
+        let chunk = InboundChunk::new(
+            "temporary-wallet",
+            Some("session-42".to_owned()),
+            "ciphertext".to_owned(),
+        );
+        assert_eq!(chunk.owner, "temporary-wallet");
+        assert_eq!(chunk.session_id.as_deref(), Some("session-42"));
+        assert_eq!(chunk.payload, "ciphertext");
+    }
+
+    #[test]
+    fn listen_owner_registry_isolated_by_owner_id_and_cancellation() {
+        let registry = ListenOwnerRegistry::default();
+        let first = OwnedListenSession::new("wallet-a", Some("session-a".to_owned()), "l0");
+        let second = OwnedListenSession::new("wallet-b", Some("session-b".to_owned()), "l0");
+        assert!(registry.register(first.clone()));
+        assert!(registry.register(second.clone()));
+        assert_eq!(registry.len(), 2);
+        assert!(registry.cancel(&first.id));
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert!(registry.get(&second.id).is_some());
+        assert!(registry.remove(&first.id).is_some());
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn listen_owner_id_distinguishes_reconnect_sessions() {
+        let old = OwnedListenSession::new("wallet-a", Some("old-key-session".to_owned()), "l0");
+        let new = OwnedListenSession::new("wallet-a", Some("new-key-session".to_owned()), "l0");
+        assert_ne!(old.id, new.id);
+    }
+
+    #[test]
+    fn listen_owner_session_can_rebind_to_duplex_pipe_handle() {
+        let registry = ListenOwnerRegistry::default();
+        let owner = OwnedListenSession::new("wallet-a", Some("warm-id".to_owned()), "l0");
+        assert!(registry.register(owner.clone()));
+        assert_eq!(owner.current_session_id().as_deref(), Some("warm-id"));
+        let found = registry.find_by_wallet("0xWALLET-A").or_else(|| {
+            // test wallet has no 0x; use exact owner string
+            registry.find_by_wallet("wallet-a")
+        });
+        let found = found.expect("find_by_wallet");
+        found.bind_session_id("duplex-offer-id");
+        assert_eq!(
+            found.current_session_id().as_deref(),
+            Some("duplex-offer-id")
+        );
+        // Registry id stays construction-time stable for InboundChunk.owner.
+        assert!(found.id.contains("warm-id"));
     }
 
     #[test]
@@ -780,12 +1123,9 @@ mod tests {
     #[test]
     fn aes_sse_does_not_complete_on_keepalive_nlnl() {
         let key = crate::l0::aes::generate_key();
-        let blob = crate::l0::duplex::seal_ping(
-            &key,
-            "pipe-handle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            1,
-        )
-        .unwrap();
+        let blob =
+            crate::l0::duplex::seal_ping(&key, "pipe-handle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1)
+                .unwrap();
         assert!(blob.len() > 32);
         let (half, rest) = blob.split_at(32);
         let mut buf = format!("data: {half}\n: keepalive\n\n");

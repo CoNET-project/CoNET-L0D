@@ -1,62 +1,102 @@
 # CoNET-L0D
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![GitBook Applications](https://img.shields.io/badge/GitBook-Applications-1B67B3)](https://gitbook.conet.network/applications/conet-l0d.html)
+[![GitBook Applications](https://img.shields.io/badge/GitBook-web3%3A%2F%2F-1B67B3)](https://gitbook.conet.network/applications/web3-url.html)
 [![GitBook Developers](https://img.shields.io/badge/GitBook-Developers-1B67B3)](https://gitbook.conet.network/developers/conet-l0d.html)
 
 **Repository:** [https://github.com/CoNET-project/CoNET-L0D](https://github.com/CoNET-project/CoNET-L0D)
 
-Linux userspace daemon that lets CoNET L1 `geth` and Prysm `beacon-chain` use **Layer Minus (L0)** as a **static overlay P2P path** without patching those clients.
+`web3://` is the **CoNET Web3 Application Protocol**: a wallet-addressed
+application locator carried by the Layer Minus (L0) forwarding
+infrastructure. It identifies a destination wallet or exact BeamioTag and an
+application service without exposing a new public origin.
 
-`conet-l0d` owns the network objects for its own lifetime:
+`conet-l0d` is the Linux runtime for that protocol:
 
-- creates TUN `conet-l0`
-- adds the overlay address and a route for `100.64.0.0/10`
-- installs a dedicated iptables chain `CONET_L0D` (loopback is returned first)
-- removes **exactly those** objects on `stop`, SIGINT / SIGTERM, or `teardown`
+- `--proxy HOST:PORT` publishes a request/response application upstream;
+- `--proxyDuplex HOST:PORT` publishes a continuous bidirectional stream;
+- `--clientDuplex web3://HOST:PORT` exposes remotes through `127.0.0.1`
+  (the same logical port may map to several remotes).
 
-Operators do **not** run `iptables` by hand.
+Windows, macOS, iOS, Android, and browser applications do not need the Linux
+daemon. They can implement the same `web3://` locator, signed request envelope,
+entry selection, mailbox listen, and encrypted response handling in a client
+library.
 
-**Maturity: under development.** Crate MVP is accepted (CLI, locator, TUN / iptables lifecycle, packet counters). Overlay `/post` prefers SI **`l0_listen` / `l0_connect`** occupancy plus **application duplex** (`duplex_offer` on Chat gossip; accept / reject / AES `duplex_frame` on the occupied pipe); **P1 gossip** remains the fallback if the peer app never sends `duplex_accept` or the pipe is missing. P1 outbound encrypt + mailbox wrap + `POST { data }`, inbound decrypt + TUN write-back, and listen HTTP+SSE workers exist in-crate and default **off**. Listen ingest matches SI `forWardPGPMessageToClient` raw JSON `{ "data": "<armor>" }` (Chat `handleInbound`), plus duplex JSON frames. In-crate listen matches SI `checkSign`. An authorized lab may enable `[l0]`. The 2026-08-18 lab on authorized L0_ONLY `.45` advertises overlay vIP `100.64.0.5`, completed overlay geth + beacon TCP, and is running CL initial-sync over overlay; after the batching binary the limiter is Prysm (~3.2 blocks/s); EL is still `0x0`. Lab overlay UDP echo and `:4300` (direct + public-ENR steer) arrived on the peer TUN; live discv5 from L0_ONLY `.45` to the `.98` DHT server over L0 is **accepted** (not a production product). Production mailbox delivery is **not** shipped. Production proposers keep public P2P (geth `8400`, beacon `4200` / `4300`) for the 6-second slot.
+**Maturity:** the locator, Linux runtime, signed web request gateway, and
+persistent application-stream path are implemented. The deployed `conet.network` gateway
+passed a real Entry → mailbox → origin → encrypted-response acceptance test on
+2026-08-20. This acceptance covers the Application Protocol; separate L1
+research records do not redefine the public L1 joining path.
+
+## Platform model
+
+| Platform | Recommended implementation |
+| --- | --- |
+| Linux server | `conet-l0d --proxy` or `--proxyDuplex` |
+| Linux client | `conet-l0d --clientDuplex` |
+| Browser / Windows / macOS / phone | Client-side `web3://` protocol library using HTTPS/SSE and Web Crypto/OpenPGP |
 
 ## What it is not
 
 | Other product | Difference |
 | --- | --- |
-| SilentPass / `SaaS_Sock5` | Device or app **egress** to a public `host:port`. Not L1 consensus P2P. |
-| Current L0 UDP forward | AES frames over HTTP / SSE — not raw OS UDP, not discv4. |
-| Validator client | Talks only to the **local** beacon. Do not capture its uid or read its keystore. |
+| SilentPass / `SaaS_Sock5` | Device or app egress to an ordinary Internet destination, not wallet-addressed application hosting |
+| L0 UDP forwarding | A separate end-to-end AES frame profile over mailbox relay |
+| L1 node operation | A separate geth/Prysm operator track with its own identities and public joining guide |
 
-Layer Minus stays a PGP / wallet-address forwarding plane. HTTP `/post` is only `{ "data": "<OpenPGP armor>" }`. This crate is an **application composition**, not a second IP network.
+Layer Minus stays a PGP / wallet-address forwarding plane. HTTP `/post` is
+only `{ "data": "<OpenPGP armor>" }`. `web3://` is an application protocol
+using that infrastructure, not a replacement forwarding network.
 
-Overlay duplex is SI **`l0_listen` / `l0_connect`** plus **application JSON** on Chat gossip / occupied AES. SI does **not** implement `duplex_*`. There is **no** live SI command named `p2p_stream_*` or `listenKind: "l1p2p"`. Do not send `mining` + `listenKind: "duplex"`.
+Application duplex uses SI **`l0_listen` / `l0_connect`** occupancy plus
+application JSON on Chat gossip and encrypted bytes on the occupied pipe. SI
+does **not** implement `duplex_*`; there is no live SI command named
+`p2p_stream_*` or `listenKind: "l1p2p"`.
 
-For `--clientDuplex`, local TCP is connection-driven. Each
+For `--clientDuplex`, the same logical port may map to several remotes;
+each remote gets its own `127.0.0.1` listener.
+Local TCP is connection-driven. Each
 `TcpListener.accept()` event is the sole connection handle; its explicit
 `mainWallet:port` new-line request creates a fresh temporary wallet/PGP route,
 AES key, return queue, and occupied pipe before offer handling.
 The same socket reuses that line until EOF/error; concurrent sockets on the
-same local port receive independent lines. Raw Geth/Prysm bytes are not
+same local port receive independent lines. Raw application bytes are not
 prefixed with a private header; the socket handle and encrypted
-`pipe_handle` provide correlation. `--client` remains the packet/TUN
-request/response path.
+`pipe_handle` provide correlation.
 
-For a TUN-less Beacon bridge, set `L0_STREAM_ONLY=1` in the operator startup
-environment and pass the local listener peer through `EXTRA_BEACON_PEERS`.
-The script then disables discovery and QUIC and does not load public/DHT
-peers. Explicit `EXTRA_BEACON_PEERS` values win over sourced host defaults,
-preventing a stale overlay VIP from being used as the Beacon `--peer`.
+## Owned SSE lifecycle
+
+Every inbound SSE is owned by a durable `OwnedListenSession` object. The owner
+retains the temporary identity, optional duplex `session_id`, listen kind,
+selected entry, cancellation token, and the connection task for the entire
+connection lifecycle. `ListenOwnerRegistry` registers owners by a unique
+owner id and permits cancellation/removal of one connection without affecting
+another.
+
+The global inbound queue is only an event transport: each `InboundChunk`
+contains the owner id, optional session id, and payload. It never owns an
+anonymous SSE and never performs process-wide AES-key trials. An AES blob
+without a bound session id is rejected; a bound blob is decrypted only with
+that session's current key. `TemporaryIdentity` is retained by its owning
+session and is not reduced to an unowned wallet string.
+
+An SSE EOF/error, session mismatch, malformed AES plaintext, or wrong AES key
+cancels that owner and clears the associated occupied-pipe state. Other owner
+sessions continue unaffected. Reconnect creates or reuses only the matching
+owner lifecycle; stale connection tasks cannot release another owner's pipe.
 
 ## Identity (`web3://`)
 
-The URI is a **peer locator**, not an ERC-4804 content URL.
+The URI is an **application locator**, not an ERC-4804 content URL.
 
 ```text
-web3://0x<40-hex>/p2p/geth
-web3://YourExactTag.web3/p2p/beacon
+web3://0x<40-hex>/dashboard?range=7d
+web3://YourExactTag.web3:9443
 ```
 
-`@beamioTag` must match **exactly** (`CoNET` ≠ `CONET`). Do not take `search-users` `results[0]`. An AA without AddressPGP is not a destination.
+`@beamioTag` must match **exactly** (`CoNET` ≠ `CONET`). Do not take
+`search-users` `results[0]`. An AA without AddressPGP is not a destination.
 
 Routing EOA ≠ deposit keystore ≠ fee recipient.
 
@@ -70,22 +110,27 @@ cd CoNET-L0D
 cargo test
 cargo build --release
 # binary: target/release/conet-l0d
-sudo install -m 0755 target/release/conet-l0d /usr/local/sbin/conet-l0d
+install -m 0755 target/release/conet-l0d ~/.local/bin/conet-l0d
 ```
 
-`check-config`, `resolve`, and `status` run on any OS. `start` / `stop` / `teardown` need Linux, `ip`, `iptables`, and `CAP_NET_ADMIN` (usually `sudo`). `gateway` is a separate server mode and does not create a TUN or modify iptables; it reads key material from local files.
+The Rust binary targets Linux. Browser and desktop/mobile clients can
+implement the protocol directly instead of launching this daemon.
 
 ## Commands
 
 ```bash
 conet-l0d check-config --config config/conet-l0d.example.toml
-conet-l0d resolve 'web3://0x1111111111111111111111111111111111111111/p2p/geth'
+conet-l0d resolve 'web3://0x1111111111111111111111111111111111111111/dashboard?range=7d'
 conet-l0d status --config /etc/conet-l0d.toml
-sudo conet-l0d start --config /etc/conet-l0d.toml
+conet-l0d start --config /etc/conet-l0d.toml
 conet-l0d gateway --config /etc/conet-l0d-gateway.toml
-sudo conet-l0d stop --config /etc/conet-l0d.toml
-sudo conet-l0d teardown --config /etc/conet-l0d.toml
+conet-l0d stop --config /etc/conet-l0d.toml
+conet-l0d teardown --config /etc/conet-l0d.toml
 ```
+
+`start` reads `[[l0.proxies]]`, `[[l0.proxy_duplex]]`, and
+`[l0].client_duplex` from TOML; equivalent repeatable CLI flags can be used for
+an explicit launch.
 
 Gateway mode uses `[gateway]` with a loopback `upstream`, separate
 `listen_entries` and `post_entries`, `routing_eoa`, and local files for the
@@ -116,7 +161,9 @@ fetch of `https://conet.network/` exactly. This proves the deployed mailbox
 request/response path and origin adapter, but does not make the gateway a
 direct public port-80 mailbox or claim production multi-Guardian hosting.
 
-Copy `config/conet-l0d.example.toml` to `/etc/conet-l0d.toml` and set `local_vip`, `identity.locator`, and `[[peers]]`.
+Copy `config/conet-l0d.example.toml` to `/etc/conet-l0d.toml`, set
+`identity.locator`, and configure the server proxies or client-duplex targets
+needed by the host.
 
 Optional systemd unit (`systemd/conet-l0d.service`):
 
@@ -126,29 +173,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now conet-l0d
 ```
 
-The unit must call `conet-l0d start` / `stop`. Do not put raw `iptables` in the unit.
+The unit calls `conet-l0d start` and `stop`; application endpoint declarations
+belong in the TOML file.
 
-## Client flags (advertise only)
+## L1 research status
 
-Authorized L0_ONLY `.45` points geth / beacon advertise flags at the overlay **vIP**. `.98` and production proposers keep the public IP. Do not bind Engine or HTTP to the vIP.
-
-```bash
-geth --nat extip:100.64.0.5 --bootnodes "enode://<peer-key>@100.64.0.1:8400" \
-  --http.addr 127.0.0.1 --authrpc.addr 127.0.0.1 --port 8400
-
-beacon-chain --p2p-host-ip=100.64.0.5 --p2p-tcp-port=4200 --p2p-udp-port=4300 \
-  --rpc-host=127.0.0.1 --grpc-gateway-host=127.0.0.1
-```
-
-Advertise-only flags do **not** stop the clients when the TUN is down. Binding `--http.addr`, `--authrpc.addr`, `--p2p-local-ip`, or `--rpc-host` to the overlay vIP can fail startup. Details: [docs/operator-flags.md](docs/operator-flags.md).
-
-Phase 1 uses **static** overlay peers. The crate envelope already carries IPv4 including UDP. A lab may prove overlay UDP / DHT-port comms and live discv5 via L0 ([docs/P2.md](docs/P2.md)); that is not a production discv5 product.
+The authorized 2026-08 lab used local endpoints `100.64.0.5` and
+`100.64.0.6` to prove Geth TCP, Prysm TCP, UDP echo, DHT-port communication,
+and live discv5 across L0. Those addresses are historical overlay endpoint
+facts, not a requirement of the Web3 Application Protocol. This experiment
+does not make L0 consensus transport the production default.
 
 ## Safety
 
-- First iptables rules: `RETURN` `127.0.0.0/8` (Engine JWT, beacon gRPC, local RPC).
+- Bind server upstreams to loopback unless an explicit deployment requires
+  another local interface.
+- Keep EIP-191 and OpenPGP secret files readable only by the service account.
 - Optional `validator_uid` is never captured.
-- Never REDIRECT `0.0.0.0/0:8400` or the whole public P2P space.
 - This process does not restart geth, beacon, or validator.
 - Do not invent a new public hostname for this product.
 
@@ -159,24 +200,32 @@ Phase 1 uses **static** overlay peers. The crate envelope already carries IPv4 i
 | [Whitepaper (EN)](whitepaper/conet-l0d.md) | Design (canonical technical wording) |
 | [白皮书（简体中文）](whitepaper/conet-l0d.zh-CN.md) | Paired translation |
 | [MVP](docs/MVP.md) · [MVP（中文）](docs/MVP.zh-CN.md) | Accepted crate MVP |
-| [P1](docs/P1.md) · [P1（中文）](docs/P1.zh-CN.md) | Overlay `/post` encrypt + mailbox wrap + POST; inbound decrypt + TUN write-back; EIP-191 listen worker; SI gossip JSON ingest; `[l0]` default off; authorized lab may enable `[l0]`; 2026-08-18: `.45` advertises overlay vIP; overlay geth + beacon TCP; CL initial-sync in progress |
-| `systemd/conet-l0d-gateway.service` | Optional gateway-only unit; no `CAP_NET_ADMIN`, TUN, or iptables |
-| [P2](docs/P2.md) · [P2（中文）](docs/P2.zh-CN.md) | Lab overlay UDP / DHT-port comms (echo + `:4300` + public-ENR steer + live discv5 via L0). Not a closed P2 / production product |
-| [Lab overlay QoS 2026-08-18](docs/lab-overlay-qos-2026-08-18.md) | Both-end log + TUN + TCP quality snapshot (~15 min). Mailbox path lossless; overlay RTT ~500 ms; hub TUN `tx_dropped=937`. Not a protocol change |
+| [P1](docs/P1.md) · [P1（中文）](docs/P1.zh-CN.md) | Encrypted `/post`, mailbox listen, request/response, and application-duplex transport |
+| `systemd/conet-l0d-gateway.service` | Optional signed web request gateway unit |
+| [P2](docs/P2.md) · [P2（中文）](docs/P2.zh-CN.md) | Experimental composition of selected L1 TCP streams over the persistent `web3://` application transport. Not the public L1 joining contract |
 | [Operator flags](docs/operator-flags.md) | geth / beacon advertise flags |
 | [RULES.md](RULES.md) | Engineering constraints |
-| [GitBook Applications](https://gitbook.conet.network/applications/conet-l0d.html) | Operator how-to |
-| [GitBook Developers](https://gitbook.conet.network/developers/conet-l0d.html) | CLI, config, wire contract |
-| [How to use Layer Minus](https://gitbook.conet.network/l0/using-l0.html) | L0 forwarding plane |
+| [Web3 Application Protocol](https://gitbook.conet.network/l0/web3-application-protocol.html) | Cross-platform protocol model and browser contract |
+| [GitBook Applications](https://gitbook.conet.network/applications/web3-url.html) | `web3://` product and platform overview |
+| [GitBook Developers](https://gitbook.conet.network/developers/conet-l0d.html) | Linux CLI and configuration |
+| [How to use Layer Minus](https://gitbook.conet.network/l0/using-l0.html) | L0 forwarding infrastructure |
 | [Run an L1 node](https://gitbook.conet.network/developers/l1-node.html) | Public P2P (production default) |
 
 A change to the whitepaper, `RULES.md`, or MVP must update **both** GitBook pages in the same task.
 
-## What this revision does / does not
+## Current scope
 
-**Does:** overlay vIP table, `web3://` locator parse, TUN + iptables lifecycle, packet counters, **application duplex** on Chat gossip (offer / accept / AES `duplex_frame`) when the peer app accepts, **P1 gossip** fallback otherwise, dest-aggregated IPv4 batch in `ipv4` (POST concurrency 32 / queue 2048; inbound TUN write queue 1024), inbound decrypt + TUN write queue when `routing_key_file` is set, listen HTTP+SSE workers when enabled plus `listen_entries`, `mailbox_route_pgp_file`, `routing_eoa`, `routing_key_file`, and `routing_eth_key_file`. Optional `[[l0.channels]]` is one routing EOA + SSE per overlay port (8400 / 4200 / 4300). Listen ingest accepts SI gossip JSON `{ "data": "<armor>" }` and duplex frames. An authorized lab may enable `[l0]`.
+The public product surface is:
 
-**Does not (yet):** finish L0-only follow-the-chain (2026-08-18: overlay TCP proven; after the batching binary the limiter is Prysm initial-sync at ~3.2 blocks/s, ~15 h; `.45` EL still `0x0`; watch with `scripts/watch-l0-follow.sh`), production mailbox delivery, production discv4 / discv5 (lab discv5 via L0 is accepted — [docs/P2.md](docs/P2.md); if `connected` drops, `overlay-dht-steer.sh apply` first; authorized `.45` `restart-beacon` only after dial backoff; after DNAT, `.45` `ss` may show hub public `:4200` — original dest, not a leak), validator proxying. Do **not** treat SI `duplex_*` or `p2p_stream_*` as current SI. The crate never restarts geth/beacon; an authorized operator script may restart only the named lab host.
+1. the cross-platform `web3://` application locator and signed wire contract;
+2. Linux server publishing through `--proxy` / `--proxyDuplex`;
+3. Linux client access through `--clientDuplex`;
+4. browser and native client implementations of the same protocol; and
+5. the deployed signed HTTP gateway profile.
+
+Production multi-Guardian hosting and production L1 consensus transport are
+not yet claimed. Do not treat experimental SI command names as deployed wire
+contracts. The crate never restarts geth, beacon, or validator.
 
 ## License
 

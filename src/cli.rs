@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "conet-l0d",
-    about = "CoNET L1 overlay daemon: own TUN + iptables for geth/beacon overlay P2P"
+    about = "Linux runtime for wallet-addressed web3:// services over CoNET Layer Minus"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -18,13 +18,13 @@ pub enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Parse a web3:// locator; optional config fills in the overlay vIP
+    /// Parse a web3:// application locator and optional local endpoint mapping
     Resolve {
         uri: String,
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Linux: create TUN, route, CONET_L0D, then run the packet loop
+    /// Run configured web3:// server proxies and client endpoints
     Start {
         #[arg(long)]
         config: PathBuf,
@@ -37,35 +37,32 @@ pub enum Command {
         /// Local hex secp256k1 key file for main-wallet EIP-191 signing.
         #[arg(long = "mainWalletKey")]
         main_wallet_key: Option<PathBuf>,
-        /// Proxy target, repeatable as host:port. The port is the L0 logical port.
+        /// Request/response upstream, repeatable as host:port.
         #[arg(long = "proxy", value_name = "HOST:PORT")]
         proxy: Vec<String>,
-        /// Persistent bidirectional proxy target, repeatable as host:port.
+        /// Persistent bidirectional upstream, repeatable as host:port.
         #[arg(long = "proxyDuplex", alias = "proxy-duplex", value_name = "HOST:PORT")]
         proxy_duplex: Vec<String>,
-        /// Client target, repeatable as web3://<wallet|tag.web3>:<port>.
-        /// Local request/response endpoint toward that mainWallet:port.
-        #[arg(long = "client", value_name = "web3://HOST:PORT")]
-        client: Vec<String>,
-        /// Duplex client target, repeatable as web3://<wallet|tag.web3>:<port>.
+        /// Persistent client target exposed through a local TCP endpoint.
+        /// Repeatable. The same logical PORT may map to several remotes.
         #[arg(
             long = "clientDuplex",
-            alias = "client-duplex",
-            value_name = "web3://HOST:PORT"
+            aliases = ["client", "client-duplex"],
+            value_name = "web3://HOST:PORT[@LOCAL]"
         )]
         client_duplex: Vec<String>,
     },
-    /// Run the application gateway without creating a TUN or changing iptables
+    /// Run the signed web request gateway for a loopback HTTP upstream
     Gateway {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Signal the pid in the state file, then teardown
+    /// Signal the pid in the state file, then clean up daemon state
     Stop {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Remove owned TUN / route / iptables even if the daemon is dead
+    /// Remove daemon-owned runtime state even if the process is dead
     Teardown {
         #[arg(long)]
         config: PathBuf,

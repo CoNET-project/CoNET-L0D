@@ -1,10 +1,8 @@
 # Production spoke on 74.208.224.45 — overlay client to hub 216.225.202.82 (100.64.0.7).
 # Spoke routing EOAs are local; [[peers]] locators are hub per-port routing EOAs.
 
-tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
 local_vip = "100.64.0.5"
-iptables_chain = "CONET_L0D"
 state_path = "/home/peter/conet-l0d-lab/run/state.json"
 
 [identity]

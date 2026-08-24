@@ -12,6 +12,7 @@
 use crate::error::L0dError;
 use crate::l0::aes;
 use crate::l0::duplex;
+use crate::l0::listen::InboundChunk;
 use crate::l0::post;
 use rustls::pki_types::ServerName;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,7 +58,7 @@ pub async fn run_occupied_pipe<F, H>(
     mut heartbeat_of: H,
     mut first: Option<String>,
     mut rx: mpsc::Receiver<String>,
-    inbound_tx: Option<mpsc::Sender<String>>,
+    inbound_tx: Option<mpsc::Sender<InboundChunk>>,
     cancel: Arc<AtomicBool>,
     mut on_up: F,
 ) -> Result<(), L0dError>
@@ -140,7 +141,14 @@ where
                                     }
                                     if duplex::looks_like_aes_blob(&l) {
                                         if let Some(tx) = inbound_tx.as_ref() {
-                                            if tx.try_send(l).is_err() {
+                                            if tx
+                                                .try_send(InboundChunk::new(
+                                                    expected_session_id.to_owned(),
+                                                    Some(expected_session_id.to_owned()),
+                                                    l,
+                                                ))
+                                                .is_err()
+                                            {
                                                 tracing::warn!(
                                                     session = %expected_session_id,
                                                     "occupied pipe inbound AES dropped; listen queue full"

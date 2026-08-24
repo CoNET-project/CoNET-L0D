@@ -1,120 +1,71 @@
-# Example overlay table. Copy to /etc/conet-l0d.toml and edit.
-# The daemon owns TUN + iptables. Do not add a second operator iptables script.
+# CoNET Web3 Application Protocol runtime.
+# Copy to /etc/conet-l0d.toml and choose a server or client-duplex profile.
 
-tun_name = "conet-l0"
-overlay_cidr = "100.64.0.0/10"
-# `auto` selects an unused-looking VIP in overlay_cidr (normally .5).
-local_vip = "auto"
-iptables_chain = "CONET_L0D"
 state_path = "/run/conet-l0d/state.json"
-# Optional: never capture this uid (Prysm validator).
-# validator_uid = 998
 
 [identity]
-# Peer locator, not ERC-4804 content. Routing EOA ≠ deposit keystore ≠ fee recipient.
-locator = "web3://0x1111111111111111111111111111111111111111/p2p/geth"
+# Application locator. Routing EOA, billing wallet, and application origin
+# identity are separate roles.
+locator = "web3://0x1111111111111111111111111111111111111111/app"
 
-[[peers]]
-locator = "web3://HubTag.web3/p2p/geth"
-vip = "100.64.0.1"
-tcp_ports = [8400]
+[l0]
+# Keep false until the route identities and existing Entry hosts below are
+# configured.
+enabled = false
+rpc = "https://rpc1.conet.network"
+address_pgp = "0x684b0ac760cEE9c9b85de36d69746420648Cf9e2"
+route_register_url = "https://beamio.app/api/regiestChatRoute"
 
-[[peers]]
-locator = "web3://HubTag.web3/p2p/beacon"
-vip = "100.64.0.1"
-tcp_ports = [4200]
-# udp_ports = [4300]
+# Outbound POST uses Entry A. Mailbox listen uses Entry C. Both must differ
+# from the destination mailbox B.
+entries = []
+listen_entries = []
 
-# P1 overlay /post client. Default off. When enabled and peer user+route PGP
-# files plus an entry are set, the daemon encrypts, wraps, and POSTs.
-# Inbound decrypt + TUN write-back is in-crate when routing_key_file is an
-# OpenPGP secret cert. Listen HTTP+SSE is in-crate when enabled plus
-# listen_entries, mailbox_route_pgp_file (this host's B route PUBLIC key),
-# routing_eoa, routing_key_file, and routing_eth_key_file (hex secp256k1;
-# must match routing_eoa; not OpenPGP). Listen is EIP-191 + SI
-# { message, signMessage } base64. Lab stays off. Do not put Securitykey
-# in a B-decryptable listen command.
-# Encrypt envelope to peer user PGP, wrap { data, NoPush: true } to B route PGP,
-# POST only { "data": outerArmor } to a healthy entry A ≠ B.
-# Listen POST goes to entry C ≠ B. Do not invent a new SI command. Do not
-# L0_ONLY lab may advertise the overlay vIP. Do not bind RPC/Engine to it.
-# Outbound POST tries each [l0].entries host once; it does not fall back
-# onto listen_entries.
-#
-# Optional per-port listen wallets (geth :8400, beacon TCP :4200, discv5 :4300).
-# Each channel is a dedicated routing EOA + OpenPGP secret + EIP-191 key +
-# mailbox B route public key + listen SSE. Outbound encrypts to the peer
-# user PGP for that overlay port. Same VIP may have several [[peers]] rows.
-# Empty [[l0.channels]] keeps one routing EOA for all overlay ports.
-# :4300 is still overlay IPv4 (not SI udp_relay). listenKind stays "chat".
-#
-# [[l0.channels]]
-# port = 8400
-# routing_eoa = "0x<geth-routing-eoa>"
-# routing_key_file = "/etc/conet-l0d/geth.key"
-# routing_eth_key_file = "/etc/conet-l0d/geth.eth"
-# mailbox_route_pgp_file = "/etc/conet-l0d/geth-mailbox-route.asc"
-# listen_entries = ["https://<existing-guardian>.conet.network"]
-#
-# [l0]
-# enabled = false
-# rpc = "https://rpc1.conet.network"
-# address_pgp = "0x684b0ac760cEE9c9b85de36d69746420648Cf9e2"
-# entries = ["https://<existing-guardian>.conet.network"]
-# listen_entries = ["https://<existing-guardian>.conet.network"]
-# routing_eoa = "0x<dedicated-routing-eoa>"
-# routing_key_file = "/etc/conet-l0d/routing.key"
-# routing_eth_key_file = "/etc/conet-l0d/routing.eth"
-# mailbox_route_pgp_file = "/etc/conet-l0d/self-mailbox-route.asc"
-# Main paid account for all temporary channel mailbox signatures. Required
-# whenever [[l0.channels]] is used; its key must match billing_eoa.
+# Main paid account for signed mailbox commands.
 # billing_eoa = "0x<main-paid-wallet>"
 # billing_eth_key_file = "/etc/conet-l0d/billing.eth"
-# billing_pgp_file = "/etc/conet-l0d/billing-pgp.asc" # optional main-wallet PGP
+# billing_pgp_file = "/etc/conet-l0d/billing-pgp.asc"
+
+# Default communication identity for a single-port profile.
+# routing_eoa = "0x<routing-eoa>"
+# routing_key_file = "/etc/conet-l0d/routing-pgp.asc"
+# routing_eth_key_file = "/etc/conet-l0d/routing.eth"
+# mailbox_route_pgp_file = "/etc/conet-l0d/mailbox-route.asc"
+
+# Linux client profile. Every target is exposed through 127.0.0.1.
+# The same logical PORT may map to several remotes. Repeat for more lines:
+#   --clientDuplex web3://0x<hub-a>:8400
+#   --clientDuplex web3://0x<hub-b>:8400
+#   --clientDuplex web3://0x<destination-wallet>:4200
+client_duplex = [
+  # "web3://0x<destination-wallet>:9443",
+]
+
+# Linux request/response server profile:
 #
-# Server-side dynamic proxy. The upstream port is also the logical L0 port.
-# Every incoming request receives a new temporary wallet/PGP/AES/session.
-# Temporary identities are memory-only and are registered before routing.
-# When proxies are set and clients are empty (proxy_server_only), no TUN,
-# route, or iptables resource is created. `proxy` is request/response; duplex
-# lines are declared separately with `proxy_duplex`.
 # [[l0.proxies]]
 # host = "127.0.0.1"
-# port = 8400
+# port = 8080
+
+# Linux continuous-stream server profile:
 #
 # [[l0.proxy_duplex]]
 # host = "127.0.0.1"
-# port = 4200
-#
-# Client endpoint toward a peer mainWallet:port.
-# The daemon advertises local_vip:port (for example 100.64.0.5:4000) and
-# maps packets sent there to the configured web3 target. No extra iptables
-# rules are needed; L0d owns the TUN/routing rules.
-# `--client` is the request/response client mode. Duplex channel seeding is
-# configured separately by the `--client-duplex` CLI option.
-# clients = [
-#   "web3://0x<mainWallet>:8400",
-#   "web3://0x<mainWallet>:4200",
-# ]
-#
-# Duplex clients use a separate setting:
-# client_duplex = [
-#   # app port 8400/4200 with free local listens when geth/beacon own those ports:
-#   "web3://0x<mainWallet>:8400@18400",
-#   "web3://0x<mainWallet>:4200@14200",
-# ]
-# Dial mainWallet = peer billing_eoa. Proxy drain attaches only to Proxy-role
-# sessions; client_duplex lines stay Peer even on the same logical app port.
-#
-# Per-peer public key files (lab override; do not log contents):
-# user_pgp_file = "/etc/conet-l0d/peer-user.asc"
-# route_pgp_file = "/etc/conet-l0d/peer-route.asc"
+# port = 9443
 
-# Application gateway mode:
-#   conet-l0d gateway --config /etc/conet-l0d-gateway.toml
-# This mode does not create a TUN or change iptables. It listens to the
-# gateway mailbox over SSE, fetches only loopback HTTP content, and posts
-# encrypted responses to the requesting wallet mailbox through Entry nodes.
+# Multi-port servers use one communication identity per logical port because
+# SI exclusive occupy is one line per listen wallet.
+#
+# [[l0.channels]]
+# port = 9444
+# routing_eoa = "0x<port-routing-eoa>"
+# routing_key_file = "/etc/conet-l0d/9444-pgp.asc"
+# routing_eth_key_file = "/etc/conet-l0d/9444.eth"
+# mailbox_route_pgp_file = "/etc/conet-l0d/9444-mailbox-route.asc"
+# listen_entries = ["https://<existing-entry-c>.conet.network"]
+
+# Signed request/response gateway profile. Use a dedicated file when launching
+# `conet-l0d gateway --config /etc/conet-l0d-gateway.toml`.
 #
 # [gateway]
 # rpc = "https://rpc1.conet.network"

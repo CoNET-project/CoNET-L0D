@@ -1,5 +1,5 @@
 use crate::error::L0dError;
-use crate::locator::{Locator, LocatorHost};
+use crate::locator::{next_client_bind_port, Locator, LocatorHost};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -257,26 +257,33 @@ impl ValidatedConfig {
         }
     }
 
-    /// Human-readable local virtual endpoint mappings for startup/status output.
+    /// Human-readable local endpoint mappings for startup/status output.
+    ///
+    /// Packet clients stay on the overlay VIP. Duplex clients bind
+    /// `127.0.0.1:<bind_port>`. The same logical PORT may map to several
+    /// remotes; each remote gets its own loopback listener.
     pub fn client_mappings(&self) -> Vec<(String, String)> {
-        self.clients
+        let packet: Vec<(String, String)> = self
+            .clients
             .iter()
-            .chain(self.client_duplex.iter())
             .map(|target| {
                 (
                     target.display(),
-                    format!(
-                        "{}:{}",
-                        if self.packet_mode_required() {
-                            self.local_vip
-                        } else {
-                            Ipv4Addr::UNSPECIFIED
-                        },
-                        target.local_bind.unwrap_or(target.port)
-                    ),
+                    format!("{}:{}", self.local_vip, target.port),
                 )
             })
-            .collect()
+            .collect();
+        let duplex: Vec<(String, String)> = self
+            .client_duplex
+            .iter()
+            .map(|target| {
+                (
+                    target.display(),
+                    format!("{}:{}", Ipv4Addr::LOCALHOST, target.bind_port),
+                )
+            })
+            .collect();
+        packet.into_iter().chain(duplex).collect()
     }
 }
 
@@ -741,10 +748,10 @@ impl DaemonConfig {
             }
         }
         let mut clients = Vec::new();
-        let mut client_ports = HashSet::new();
+        let mut packet_client_ports = HashSet::new();
         for raw in &self.l0.clients {
             let target = crate::locator::ClientTarget::parse(raw)?;
-            if !client_ports.insert(target.port) {
+            if !packet_client_ports.insert(target.port) {
                 return Err(L0dError::Config(format!(
                     "l0 client port {} is assigned twice",
                     target.port
@@ -758,14 +765,33 @@ impl DaemonConfig {
             ));
         }
         let mut client_duplex = Vec::new();
+        let mut duplex_targets = HashSet::new();
+        let mut client_bind_ports = HashSet::new();
         for raw in &self.l0.client_duplex {
-            let target = crate::locator::ClientTarget::parse(raw)?;
-            if !client_ports.insert(target.port) {
+            let mut target = crate::locator::ClientTarget::parse(raw)?;
+            if !duplex_targets.insert((target.host.clone(), target.port)) {
                 return Err(L0dError::Config(format!(
-                    "l0 client port {} is assigned twice",
-                    target.port
+                    "l0 client target {} is assigned twice",
+                    target.display()
                 )));
             }
+            target.bind_port = if let Some(local) = target.local_port {
+                if !client_bind_ports.insert(local) {
+                    return Err(L0dError::Config(format!(
+                        "l0 client local bind {local} is assigned twice"
+                    )));
+                }
+                local
+            } else {
+                let Some(bind) = next_client_bind_port(target.port, &client_bind_ports) else {
+                    return Err(L0dError::Config(format!(
+                        "l0 client port {} has no free local bind",
+                        target.port
+                    )));
+                };
+                client_bind_ports.insert(bind);
+                bind
+            };
             client_duplex.push(target);
         }
         if !client_duplex.is_empty() && !self.l0.enabled {
@@ -998,6 +1024,31 @@ impl ValidatedConfig {
 mod tests {
     use super::*;
 
+    fn example_config_with_test_peers() -> DaemonConfig {
+        let mut cfg: DaemonConfig =
+            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
+                .expect("parse example");
+        cfg.peers = vec![
+            PeerConfig {
+                locator: "web3://HubTag.web3/p2p/geth".into(),
+                vip: "100.64.0.1".into(),
+                tcp_ports: vec![8400],
+                udp_ports: Vec::new(),
+                user_pgp_file: None,
+                route_pgp_file: None,
+            },
+            PeerConfig {
+                locator: "web3://HubTag.web3/p2p/beacon".into(),
+                vip: "100.64.0.1".into(),
+                tcp_ports: vec![4200],
+                udp_ports: Vec::new(),
+                user_pgp_file: None,
+                route_pgp_file: None,
+            },
+        ];
+        cfg
+    }
+
     #[test]
     fn default_overlay_contains_example_vips() {
         let cidr = Ipv4Cidr::parse("100.64.0.0/10").unwrap();
@@ -1009,9 +1060,7 @@ mod tests {
 
     #[test]
     fn auto_vip_skips_configured_peer_vips() {
-        let mut cfg: DaemonConfig =
-            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
-                .expect("parse example");
+        let mut cfg = example_config_with_test_peers();
         cfg.local_vip = "auto".into();
         cfg.peers[0].vip = "100.64.0.5".into();
         let validated = cfg.validate().expect("auto vip");
@@ -1036,9 +1085,7 @@ mod tests {
 
     #[test]
     fn same_vip_two_ports_is_ok() {
-        let mut cfg: DaemonConfig =
-            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
-                .expect("parse example");
+        let mut cfg = example_config_with_test_peers();
         cfg.peers[1].udp_ports = vec![4300];
         let validated = cfg.validate().expect("same vip geth+beacon");
         assert_eq!(validated.peers.len(), 2);
@@ -1055,9 +1102,7 @@ mod tests {
 
     #[test]
     fn reject_duplicate_port_on_same_vip() {
-        let mut cfg: DaemonConfig =
-            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
-                .expect("parse example");
+        let mut cfg = example_config_with_test_peers();
         cfg.peers[1].tcp_ports = vec![8400];
         assert!(cfg.validate().is_err());
     }
@@ -1158,9 +1203,7 @@ mod tests {
 
     #[test]
     fn clients_extend_overlay_ports_and_lookup_peer() {
-        let mut cfg: DaemonConfig =
-            toml::from_str(include_str!("../config/conet-l0d.example.toml"))
-                .expect("parse example");
+        let mut cfg = example_config_with_test_peers();
         cfg.peers[0].locator = "web3://0x2222222222222222222222222222222222222222/p2p/geth".into();
         cfg.peers[0].tcp_ports = vec![8400];
         cfg.peers[1].locator =
@@ -1193,6 +1236,116 @@ mod tests {
                 .expect("local beacon endpoint")
                 .display(),
             "web3://0x2222222222222222222222222222222222222222/p2p/beacon"
+        );
+    }
+
+    #[test]
+    fn allow_two_remotes_on_one_logical_client_port() {
+        let mut cfg = example_config_with_test_peers();
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
+        cfg.l0.client_duplex = vec![
+            "web3://0x2222222222222222222222222222222222222222:8400".into(),
+            "web3://0x3333333333333333333333333333333333333333:8400".into(),
+        ];
+        let validated = cfg.validate().expect("one logical port, many remotes");
+        assert_eq!(
+            validated.client_mappings(),
+            vec![
+                (
+                    "web3://0x2222222222222222222222222222222222222222:8400".into(),
+                    "127.0.0.1:8400".into()
+                ),
+                (
+                    "web3://0x3333333333333333333333333333333333333333:8400".into(),
+                    "127.0.0.1:18400".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_duplex_client_target() {
+        let mut cfg = example_config_with_test_peers();
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
+        cfg.l0.client_duplex = vec![
+            "web3://0x2222222222222222222222222222222222222222:8400".into(),
+            "web3://0x2222222222222222222222222222222222222222:8400".into(),
+        ];
+        let err = cfg.validate().expect_err("same remote twice");
+        assert!(
+            err.to_string().contains("l0 client target")
+                && err.to_string().contains("is assigned twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_client_local_bind() {
+        let mut cfg = example_config_with_test_peers();
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
+        cfg.l0.client_duplex = vec![
+            "web3://0x2222222222222222222222222222222222222222:8400".into(),
+            "web3://0x2222222222222222222222222222222222222222:4200@8400".into(),
+        ];
+        let err = cfg.validate().expect_err("unique loopback binds");
+        assert!(
+            err.to_string()
+                .contains("l0 client local bind 8400 is assigned twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn duplex_clients_map_one_logical_port_to_one_loopback() {
+        let mut cfg = example_config_with_test_peers();
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
+        cfg.l0.client_duplex = vec![
+            "web3://0x2222222222222222222222222222222222222222:8400".into(),
+            "web3://0x2222222222222222222222222222222222222222:4200".into(),
+        ];
+        let validated = cfg.validate().expect("distinct logical ports");
+        assert_eq!(
+            validated.client_mappings(),
+            vec![
+                (
+                    "web3://0x2222222222222222222222222222222222222222:8400".into(),
+                    "127.0.0.1:8400".into()
+                ),
+                (
+                    "web3://0x2222222222222222222222222222222222222222:4200".into(),
+                    "127.0.0.1:4200".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_packet_and_duplex_same_logical_port() {
+        let mut cfg = example_config_with_test_peers();
+        cfg.l0.enabled = true;
+        cfg.l0.entries = vec!["http://20ab90fe82d0e9e3.conet.network".into()];
+        cfg.l0.clients = vec!["web3://0x2222222222222222222222222222222222222222:8400".into()];
+        cfg.l0.client_duplex =
+            vec!["web3://0x3333333333333333333333333333333333333333:8400".into()];
+        let validated = cfg
+            .validate()
+            .expect("packet VIP and duplex loopback may share a logical port");
+        assert_eq!(
+            validated.client_mappings(),
+            vec![
+                (
+                    "web3://0x2222222222222222222222222222222222222222:8400".into(),
+                    format!("{}:8400", validated.local_vip)
+                ),
+                (
+                    "web3://0x3333333333333333333333333333333333333333:8400".into(),
+                    "127.0.0.1:8400".into()
+                ),
+            ]
         );
     }
 }

@@ -1,10 +1,8 @@
 # Hub 198.251.77.98 — spoke .45 only, geth :8400 duplex (no beacon/udp).
 # Pair with config/conet-l0d.45.lab-geth8400.toml on spoke.
 
-tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
 local_vip = "100.64.0.6"
-iptables_chain = "CONET_L0D"
 state_path = "/home/peter/conet-l0d-lab/run/state.json"
 
 [identity]

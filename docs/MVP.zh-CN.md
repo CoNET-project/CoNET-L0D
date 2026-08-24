@@ -1,109 +1,201 @@
-## Client 与 proxy 传输模式
+# `web3://` 应用运行时 — MVP
 
-`--client web3://<mainWallet>:<port>` 默认为 P1 请求/响应客户端；
-`--clientDuplex` 才启用持续双向 stream。`local_vip = "auto"` 时客户端
-会自动选择本地 VIP，并输出 `web3://... -> VIP:port` 映射。
+对应英文版：[`MVP.md`](MVP.md)
 
-服务器端 `--proxy HOST:PORT` 只表示请求/响应配置，
-`--proxyDuplex HOST:PORT` 表示原始双向转发。仅 proxy 的 daemon 不创建
-TUN、路由或 iptables 链；同一逻辑端口不能同时配置两种 proxy 模式。
-# MVP — conet-l0d
+修订：2026-08-22
 
-**成对：** [English](./MVP.md)  
-**Revision：** 2026-08-24（动态代理线路、主钱包计费、每线路临时身份）
+## 1. 产品边界
 
-公开 how-to：[Applications](https://gitbook.conet.network/applications/conet-l0d.html) · [Developers](https://gitbook.conet.network/developers/conet-l0d.html)
+`web3://` 是构建于 CoNET Layer Minus（L0）之上的钱包地址化应用协议。
+它为应用提供稳定的目标名称，由 L0 提供加密入口路由、mailbox 投递和双向传输。
 
-## 目标
+`conet-l0d` 是该协议的 Linux 运行时：
 
-交付独立 **Linux 命令** `conet-l0d`：启动创建 TUN + iptables，停止/teardown **只**拆除这些对象。操作员不用手写 `iptables`。
+- Linux 服务器用 `--proxy` 或 `--proxyDuplex` 发布本地服务；
+- Linux 客户端用 `--clientDuplex` 访问
+  `web3://<wallet-or-tag>:<port>` 目标；
+- Windows、macOS、Android、iOS 上的浏览器和原生应用在客户端代码中实现同一应用协议，并使用已有 L0 entry，无需 Linux daemon。
 
-## 范围内
+公开 L1 节点加入方式仍是现有公网 P2P 路径。通过 L0 承载部分 L1 数据流，
+是同一应用传输的独立实验用途。
 
-| 项 | 验收 |
-| --- | --- |
-| 二进制 | `cargo build --release` → `conet-l0d` |
-| `check-config` / `resolve` | 任意 OS 可跑；精确解析 `web3://` |
-| `start` | Linux + `CAP_NET_ADMIN`：TUN `conet-l0`、本机 vIP `/32`、路由 `100.64.0.0/10`、链 `CONET_L0D` 且 loopback `RETURN` |
-| `stop` / SIGINT / SIGTERM | 与 start 相反；pid 来自 state 文件 |
-| `teardown` | 守护进程已死后仍能走同一反向路径 |
-| 收包循环 | 统计 TUN 上的 IPv4；记录目的 vIP（不含密钥） |
-| L0 | crate 桩已验收：统计 TUN IPv4 并记录目的 vIP。现役 overlay `/post` 优先 **SI `l0_listen` / `l0_connect` 占用管道 + 应用层 duplex**（要约走 Chat gossip；接受 / 拒绝 / 帧为占用管道上的 AES）；`duplex_reject` 或无 accept 或无占用管道则 P1 gossip — [P1](./P1.zh-CN.md)。不得声称 SI `duplex_*` 或 `p2p_stream_*` |
-| 文档 | 成对白皮书 + 本 MVP + GitBook Applications + Developers |
-| 示例 + unit | `config/conet-l0d.example.toml` 与 `systemd/conet-l0d.service`（仅 `start`/`stop`） |
+## 2. MVP 能力
 
-## 动态代理线路
+### 2.1 寻址
 
-服务器模式可配置 `[[l0.proxies]]` 上游目标。`billing_eoa` 与本机
-`billing_eth_key_file` 为 duplex offer/accept（对端验签）身份；mailbox
-`l0_listen` / `l0_connect` 由各 channel 钱包签名，直至 SI 舰队支持
-`billingWallet`。每条线路在 `mainWallet:port` 匹配后仍使用独立临时钱包、
-PGP/AES/session。临时身份必须先登记再路由，任何传输失败时释放。一个
-逻辑端口可并发多条线路，但绝不共享线路身份或 pipe。占用管道字节转发到
-配置的 `host:port`；不保存离线数据。
+运行时接受显式钱包地址化目标：
 
-仅代理服务器（有 `[[l0.proxies]]`、无 `l0.clients` / `--client`）不创建
-TUN 或 iptables。每个明确的新线路请求都为配置的 `host:port` 建立独立的
-原始 TCP 上游线路；同一端口的并发连接仍相互隔离。收到 offer 只能绑定
-已登记的 `pipe_handle` 或临时 `listenWallet`；未知、过期或有歧义的 offer
-必须拒绝，不得在 offer 阶段创建临时钱包、session 或新的 `l0_connect`。多端口代理须为每个端口
-配置独立的 `[[l0.channels]]` routing EOA（SI 独占占用）；offer 匹配仍用
-`billing_eoa` 作为 `mainWallet`。旧式 `--client` 继续使用 packet/TUN 路径；
-`--clientDuplex` 只有在应用实际建立本地 TCP 连接时才分配线路。
+```text
+web3://0x1111111111111111111111111111111111111111:4200
+web3://ExactTag.web3:4200
+```
 
-`--clientDuplex` 的本地 listener 以 `accept()` 事件作为唯一连接句柄：
-每个新 socket 立即生成新的临时钱包、PGP route、AES key、返回队列和
-duplex offer。同一个 socket 在 EOF/错误前始终复用这条临时线路；第二个
-socket 即使连接同一个 `127.0.0.1:<port>` 也会得到另一条线路。L0d 不向
-Geth/Prysm 原始字节插入私有 header，socket handle 与加密的
-`pipe_handle` 负责关联。
+EOA 是无歧义目标。BeamioTag 必须按大小写精确匹配；存在歧义的搜索结果必须拒绝。
 
-**角色门控：** `maybe_start_proxy_drain` 仅对 `DuplexLineRole::Proxy`（入站
-proxy 握手分配的线路）连接本地上游。`client_duplex` 线路为 `Peer`，即使
-逻辑口与 `proxy_duplex` 相同也不得误挂本机 geth/beacon。
+应用 locator、付费钱包、通信身份、validator 身份和 fee recipient 是彼此独立的角色。
 
-**本地口：** `l0.client_duplex` 支持 `web3://<billing>:8400@18400`（及
-`:4200@14200`）。`@local` 为显式本机 listen；省略时先尝试 `port`，失败再
-`port+10000`。拨号 `mainWallet` 必须是对端 `billing_eoa`。
+### 2.2 Linux 服务器 profile
 
-
-### 通过无 TUN 的 Duplex Listener 连接 Beacon
-
-当 `conet-l0d` 提供本地 duplex listener（例如 Beacon 使用
-`127.0.0.1:14200`）时，Beacon 必须连接本地 stream peer，不能连接另一客户端
-的 VIP，也不能回退到公网 ENR。实验室启动脚本支持
-`L0_STREAM_ONLY=1`：只使用显式传入的 `EXTRA_BEACON_PEERS`，增加
-`--no-discovery` 与 `--disable-quic`，并且不依赖 TUN、iptables、DHT steer
-或 listen-DNAT。显式命令行 peer 优先于主机环境默认值，避免旧的 `.98`
-peer 覆盖 `.82` stream 目标。
-
-## 范围外（不算 MVP 失败）
-
-- 生产 mailbox 投递（P1 crate 可 POST 现役 `/post`，并解析 SI gossip JSON `{ "data": "<armor>" }`；经授权实验室可开 `[l0]`；2026-08-18 实验室 `.45` 通告 overlay vIP，overlay geth + beacon TCP 已通；合批二进制之后限速是 Prysm initial-sync 约 3.2 块/秒；EL 仍为 `0x0`；只读抽检 `scripts/watch-l0-follow.sh` — 见 [P1.zh-CN.md](./P1.zh-CN.md)）
-- 生产 discv4 / discv5（实验室 overlay UDP + 经 L0 的现役 discv5 见 [P2.zh-CN.md](./P2.zh-CN.md)；掉线先 `overlay-dht-steer.sh apply` 清幽灵 conntrack；授权 `.45` `restart-beacon` 仅用于拨号 backoff；DNAT 后 `.45` `ss` 可能显示枢纽公网 `:4200`（原目的，不是漏公网）；不是已关闭的 P2 / 生产产品）
-- 代理 validator 或读取 keystore
-- 新域名。overlay duplex 是 Chat gossip 上的应用 JSON；不得发明 SI `duplex_*` 或 `p2p_stream_*`
-- crate 自己重启 geth / beacon / validator（经授权的**操作员**脚本可以只重启 **`.45`** 做 L0_ONLY；未授权不要动 `.98`；禁止 wipe）
-
-## 命令
+请求/响应服务使用：
 
 ```bash
-conet-l0d check-config --config config/conet-l0d.example.toml
-conet-l0d resolve 'web3://0x1111111111111111111111111111111111111111/p2p/geth'
-sudo conet-l0d start --config /etc/conet-l0d.toml
-sudo conet-l0d stop --config /etc/conet-l0d.toml
-sudo conet-l0d teardown --config /etc/conet-l0d.toml
+conet-l0d start \
+  --mainWallet 0x<main-paid-wallet> \
+  --proxy 127.0.0.1:8080 \
+  --config /etc/conet-l0d.toml
+```
+
+持续双向服务使用：
+
+```bash
+conet-l0d start \
+  --mainWallet 0x<main-paid-wallet> \
+  --proxyDuplex 127.0.0.1:4200 \
+  --config /etc/conet-l0d.toml
+```
+
+`--proxy` 承载有边界的请求/响应交换。
+`--proxyDuplex` 承载持续原始字节流，并保持写入顺序。
+
+### 2.3 Linux 客户端 profile
+
+```bash
+conet-l0d start \
+  --mainWallet 0x<main-paid-wallet> \
+  --clientDuplex web3://0x<destination-wallet>:4200 \
+  --config /etc/conet-l0d.toml
+```
+
+每个 `--clientDuplex` 目标在 `127.0.0.1` 上提供一个本地 TCP
+endpoint。同一逻辑口可对应多条远端；每条远端各自一个 loopback 监听。
+daemon 向该目标开启付费 L0 line，并在任一侧关闭前持续双向转发字节。
+
+### 2.4 浏览器与原生客户端
+
+浏览器或原生客户端直接执行同一协议步骤：
+
+1. 解析 `web3://` 目标；
+2. 解析精确钱包身份；
+3. 为出站工作选择已有 Entry A，为 mailbox 工作选择 Entry C；
+4. 按要求用 user key 或 route key 加密命令；
+5. 验证调用方签名的请求合同，并按 request ID、nonce 与 expiry 关联每个已解密响应；
+6. 网络尝试失败时保留最后一次可信状态。
+
+浏览器实现是 Windows、macOS、Android、iOS 的可移植客户端路径。产品代码不得在日志中
+暴露私钥、session key、明文 payload 或完整密文。
+
+## 3. Runtime 到 L0 的映射
+
+Linux runtime 用已部署的 Layer Minus attachment 命令与版本化应用消息组合出
+应用 profile：
+
+| 应用需求 | Runtime 或 wire 机制 |
+|---|---|
+| 发布本地请求/响应服务 | `--proxy` / `[[l0.proxies]]` runtime profile |
+| 发布持续双向服务 | `--proxyDuplex` / `[[l0.proxy_duplex]]` runtime profile |
+| 向目标开启付费 line | 已部署 SI 命令 `l0_connect` |
+| 接收 line | 已部署 SI 命令 `l0_listen` |
+| 协调 duplex attachment | 应用消息 `duplex_offer` / `duplex_accept` |
+| 关闭 occupied line | 该 line 上的 `l0_pipe_end` |
+
+`--proxy`、`--proxyDuplex` 与 `duplex_*` 都不是 SI 命令。它们是建立在
+现有 L0 attachment 合同上的 `conet-l0d` runtime profile 或 peer 应用消息。
+
+出站应用工作经已有 Entry A；mailbox listen 与 route 命令经已有 Entry C。两者都不能是
+目标 mailbox B。
+
+HTTP body 必须始终只有：
+
+```json
+{ "data": "<OpenPGP armor>" }
+```
+
+Mailbox 指令必须进入加密工作包，绝不能成为额外 HTTP 明文字段。
+
+## 4. 身份与计费
+
+main paid wallet 签署付费 line 命令。多端口服务器为每个逻辑端口使用独立通信身份，
+因为 SI exclusive occupancy 对每个 listen wallet 只允许一条 line。
+
+建议 ownership：
+
+| Secret | 建议 owner |
+|---|---|
+| main wallet 签名密钥 | 仅 root 可读的服务 secret |
+| main wallet PGP key | 仅 root 可读的服务 secret |
+| 每端口通信 EOA key | 仅 root 可读的服务 secret |
+| 每端口通信 PGP key | 仅 root 可读的服务 secret |
+| mailbox route PGP key | 仅 root 可读的服务 secret |
+
+命令输出和日志都不得打印私钥。
+
+## 5. 配置
+
+公开样例是 [`../config/conet-l0d.example.toml`](../config/conet-l0d.example.toml)。
+其主 profile 为：
+
+```toml
+[l0]
+enabled = true
+client_duplex = [
+  "web3://0x<destination-wallet>:4200",
+]
+
+[[l0.proxies]]
+host = "127.0.0.1"
+port = 8080
+
+[[l0.proxy_duplex]]
+host = "127.0.0.1"
+port = 4200
+```
+
+生产环境应为不同 server/client 角色使用独立配置文件。
+
+## 6. CLI 合同
+
+```bash
+conet-l0d check-config --config /etc/conet-l0d.toml
+conet-l0d resolve web3://0x1111111111111111111111111111111111111111:4200 \
+  --config /etc/conet-l0d.toml
+conet-l0d start --config /etc/conet-l0d.toml
 conet-l0d status --config /etc/conet-l0d.toml
+conet-l0d stop --config /etc/conet-l0d.toml
+conet-l0d teardown --config /etc/conet-l0d.toml
 ```
 
-## 测试
+`check-config` 和 `resolve` 不修改状态。`start`、`stop`、`teardown` 只管理该 daemon
+自己的运行时状态。
 
-```bash
-cargo test
-```
+## 7. 验收条件
 
-`resolve` / 配置单测须在 macOS 通过。`start` 仅 Linux。
+满足以下条件即通过 MVP：
 
-## 同步规则
+1. 样例配置可解析并通过校验；
+2. `--proxy` 可转发请求并返回关联响应；
+3. `--proxyDuplex` 可转发持续、有序数据流；
+4. `--clientDuplex` 可提供本地 endpoint 并到达精确 `web3://` 目标；
+5. 强制 Entry A / Entry C 路由并排除 mailbox B；
+6. 重复或过期 line 控制帧不会破坏其他 session；
+7. `l0_pipe_end` 与 socket close 可确定性释放 line ownership；
+8. daemon 重启不要求重启被发布的应用；
+9. 日志包含 route/session metadata，但不包含 secret material；
+10. 英中公开文档描述同一协议。
 
-改本文件、白皮书或 `RULES.md` 时，同一任务更新 GitBook **Applications** 与 **Developers** 的 `conet-l0d` 页。
+## 8. 非目标
+
+- 替换公开 L1 节点加入路径；
+- 在已有 primitive 足够时另造 L0 wire protocol；
+- 发明新域名或 SI 命令；
+- 把 billing、validator 或 fee-recipient 角色嵌入应用 locator；
+- 从 TCP 应用 profile 承诺通用 UDP 语义。
+
+## 9. 交付顺序
+
+1. 精确 `web3://` 解析与配置校验；
+2. 请求/响应 server profile；
+3. duplex server profile；
+4. duplex Linux client profile；
+5. 浏览器/原生客户端互操作；
+6. replay、reconnect、close 与失败路径测试；
+7. 应用路径稳定后再添加可选 L1 研究 profile。

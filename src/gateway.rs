@@ -1,8 +1,7 @@
 //! Mailbox-SSE to localhost HTTP gateway.
 //!
-//! This mode deliberately does not create a TUN or modify iptables.  The
-//! inbound SSE is receive-only: responses are encrypted for the requester and
-//! POSTed to the requester's mailbox through an Entry node.
+//! The inbound SSE is receive-only: responses are encrypted for the requester
+//! and POSTed to the requester's mailbox through an Entry node.
 
 use crate::config::ValidatedGateway;
 use crate::error::L0dError;
@@ -86,21 +85,26 @@ pub async fn run(path: &Path) -> anyhow::Result<()> {
     tracing::info!(
         eoa = %runtime.config.routing_eoa,
         upstream = %runtime.config.upstream,
-        "conet-l0d gateway started; no TUN or iptables owned"
+        "conet-l0d web3 application gateway started"
     );
 
-    let (tx, mut rx) = mpsc::channel::<String>(256);
+    let (tx, mut rx) = mpsc::channel::<listen::InboundChunk>(256);
+    let owner =
+        listen::OwnedListenSession::new(runtime.config.routing_eoa.clone(), None, "gateway");
+    let owners = listen::ListenOwnerRegistry::default();
+    owners.register(owner.clone());
     let listener_runtime = runtime.clone();
+    let listener_owner = owner.clone();
     tokio::spawn(async move {
-        if let Err(err) = listen_loop(listener_runtime, tx).await {
+        if let Err(err) = listen_loop(listener_runtime, tx, listener_owner).await {
             tracing::error!(error = %err, "gateway SSE listener stopped");
         }
     });
 
-    while let Some(armor) = rx.recv().await {
+    while let Some(chunk) = rx.recv().await {
         let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_request(&runtime, &armor).await {
+            if let Err(err) = handle_request(&runtime, &chunk.payload).await {
                 tracing::warn!(error = %err, "gateway request rejected");
             }
         });
@@ -131,7 +135,8 @@ impl GatewayRuntime {
 
 async fn listen_loop(
     runtime: GatewayRuntime,
-    armor_tx: mpsc::Sender<String>,
+    armor_tx: mpsc::Sender<listen::InboundChunk>,
+    owner: Arc<listen::OwnedListenSession>,
 ) -> Result<(), L0dError> {
     loop {
         for entry in &runtime.config.listen_entries {
@@ -146,7 +151,15 @@ async fn listen_loop(
             tracing::info!(entry = %entry, "gateway opening mailbox SSE");
             match listen::open_listen_sse(&runtime.http, &url, &armor).await {
                 Ok(response) => {
-                    if let Err(err) = listen::pump_sse_armors(response, &armor_tx).await {
+                    owner.set_entry(entry);
+                    if let Err(err) = listen::pump_sse_armors_owned_session(
+                        response,
+                        &armor_tx,
+                        owner.clone(),
+                        None,
+                    )
+                    .await
+                    {
                         tracing::warn!(entry = %entry, error = %err, "gateway SSE closed");
                     }
                 }
@@ -178,6 +191,11 @@ fn validate_request(
     let request = &signed.request;
     if request.v != 1 || request.request_type != "conet_web3_request_v1" {
         return Err(L0dError::L0("unsupported gateway request version".into()));
+    }
+    if request.request_id.trim().is_empty() || request.nonce.trim().is_empty() {
+        return Err(L0dError::L0(
+            "gateway request identifiers are required".into(),
+        ));
     }
     if request.expires_at < chrono::Utc::now().timestamp().max(0) as u64 {
         return Err(L0dError::L0("gateway request has expired".into()));

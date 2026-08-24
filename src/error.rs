@@ -12,7 +12,7 @@ pub enum L0dError {
     ///
     #[error("l0 pipe ended ({reason})")]
     L0PipeEnd { reason: String, session_id: String },
-    #[error("start/stop/teardown require Linux with CAP_NET_ADMIN, ip, and iptables")]
+    #[error("the requested conet-l0d runtime mode is available only on Linux")]
     NotLinux,
     #[error("net operation failed: {0}")]
     #[allow(dead_code)]

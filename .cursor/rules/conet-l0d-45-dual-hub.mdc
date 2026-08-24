@@ -1,0 +1,37 @@
+---
+description: .45 spoke geth/beacon 必须同时连接 .82 与 .98（stream-only 双 hub）
+alwaysApply: true
+---
+
+# `.45` 站立 join：必须双连 `.82` + `.98`
+
+`.45`（`74.208.224.45`）的 **geth + beacon** 必须同时连生产 hub **`.82`** 与实验室 hub **`.98`**。只连一边视为故障。
+
+与 `conet-l0d-beacon-sync-recovery.mdc` §3b **历史 isolate 单 hub 测** 分开：站立 join **不是**「不要挂 `.82`」。
+
+## 形态（stream-only；无 TUN）
+
+同一逻辑端口不能挂两条 `client_duplex`。`.82` 走本机 L0d listener；`.98` 走公网。
+
+| 层 | `.82` | `.98` |
+|---|---|---|
+| **Beacon `--peer`** | `/ip4/127.0.0.1/tcp/14200/p2p/16Uiu2HAmDJCHuVkXtkPrrL8YykQ9gFZnQkR9Q6WjZZUrmueohPfd` | `/ip4/198.251.77.98/tcp/4200/p2p/16Uiu2HAmF1SXGHnne9DQTHGfgGQgje3cBV8pdSLJF25ajYKr2hvS` |
+| **Geth bootnode** | `enode://f1e249c9…@127.0.0.1:18400` | `enode://00656198…@198.251.77.98:8400` |
+
+`EXTRA_BEACON_PEERS` **必须逗号分隔**。**不要**把 overlay VIP `100.64.0.6` / `100.64.0.7` 当 stream `--peer`。**不要**启用 `l0-dual-hub.env` 完整 TUN mesh。
+
+真相：`scripts/l0-stream.env`。脚本须自动 `source $LAB_DIR/run/l0-stream.env`（否则 crate `scripts/l0-stream.env`）。重启前：`set -a; source …/l0-stream.env; set +a`。
+
+## 验收（两边都要）
+
+- Beacon `GET :4100/eth/v1/node/peers`：同时见上表两个 `peer_id`（`.82` 经 `127.0.0.1:14200`，`.98` 经 `198.251.77.98:4200`）
+- Geth `admin_peers`：同时见 `127.0.0.1:18400` 与 `198.251.77.98:8400`
+- 验 geth：**只认 `geth.pid`**。刚 checkpoint 的 `beacondata` **禁止**再 wipe
+- Spoke EL 仍 `0x0` 而 CL 在涨 = EL 滞后，**不要**再重启 geth
+- 重启后可重打 listen-DNAT（无 TUN 失败可忽略）；**不要**立刻反复 `overlay-dht-steer.sh apply`
+
+## 严禁
+
+- ❌ 只挂 `.82` 或只挂 `.98`
+- ❌ 未授权重启 `.82` / `.98` EL/CL，或动 `.45` validator
+- ❌ stream-only 用 overlay VIP / 启用完整 TUN 双 hub

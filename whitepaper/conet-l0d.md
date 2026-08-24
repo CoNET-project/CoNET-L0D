@@ -1,330 +1,336 @@
-## Client and proxy transport split
+# `web3://` over CoNET Layer Minus
 
-The client surface has two explicit transports. `--client` uses the P1
-request/response path; `--clientDuplex` uses the encrypted persistent duplex
-pipe. Client applications use the automatically selected local VIP printed by
-L0d, rather than configuring an additional firewall or iptables rule.
+Linux runtime, cross-platform client contract, and application gateway
 
-The server surface mirrors this split: `--proxy` is request/response
-configuration and `--proxyDuplex` is a persistent raw stream. Proxy-only mode
-is intentionally network-independent: it does not create a TUN, route, or
-iptables chain. Logical ports are unique across both proxy mode lists.
+Paired Chinese version: [`conet-l0d.zh-CN.md`](conet-l0d.zh-CN.md)
 
-For `--clientDuplex`, duplex allocation is connection-driven. The local
-`TcpListener.accept()` event is the sole local connection handle: each new
-socket gets a new temporary wallet/PGP route, AES key, opaque `pipe_handle`,
-return queue, and occupied line. The same socket keeps that line until EOF or
-error, while another socket on the same local port gets another line. L0d
-does not prepend a private header to Geth/Prysm bytes; the socket handle and
-encrypted `pipe_handle` provide correlation.
+Revision: 2026-08-22
 
-The initial application bytes are read from a new socket while that socket is
-paused. The initiator creates and registers its per-socket temporary wallet/PGP
-route and waits for its temporary listen SSE before sending those bytes as
-`firstChunk`. A proxy may allocate a temporary line only when the EIP-191
-signer matches `billingWallet` and the offer explicitly matches the configured
-main wallet and `--proxyDuplex` port. The proxy registers its own temporary
-route and waits for its listen SSE before opening the configured upstream TCP
-client. It forwards `firstChunk`, pauses after the first upstream bytes,
-returns them as `responseChunk` in `duplex_accept`. The proxy
-reverse-occupies the initiator listen only if that return pipe is still
-empty, then starts upstream-to-pipe forwarding. It does not wait for a second
-local protocol chunk: geth / beacon often stay paused after Hello until both
-occupied pipes are live. The initiator decrypts that accept with its
-temporary PGP key, writes the response, and occupies immediately (an empty
-first AES blob is allowed). Subsequent bytes reuse the same opaque handle;
-unsigned, stale, unmatched, or ambiguous offers must not allocate a temporary
-line.
-# conet-l0d — L1 overlay on Layer Minus
+## Abstract
 
-**Paired translation:** [简体中文](./conet-l0d.zh-CN.md)  
-**Revision:** 2026-08-24 (proxy handshake reverse-occupies after accept without waiting for a resume blob; client occupies immediately after writing `responseChunk`; AddressPGP `searchKey` wait after `regiestChatRoute` HTTP 200; PKESK-selected inbound decrypt; ready-gated socket duplex bootstrap; connection-driven socket handles; per-connection temporary identities; slot-critical publication gate vs public P2P; multi-Guardian / multi-Mailbox path diversity; SI `l0_listen` / `l0_connect` occupancy pipe; application duplex; optional per-port `[[l0.channels]]`; lab overlay TCP/UDP; not a production discv5 product)
-**Public operator guide:** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
-**Public developer guide:** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
+`web3://` is a wallet-addressed application protocol built on CoNET Layer
+Minus (L0). It gives an application a stable cryptographic destination while
+L0 supplies encrypted entry routing, mailbox delivery, and bidirectional
+transport.
 
-This whitepaper is an **L1 node overlay + L0 application composition**. It does not amend the CoNET-DLE multi-chain whitepaper and does not add a second IP network to Layer Minus.
+`conet-l0d` is the Linux runtime for this protocol. A Linux server can publish
+a local service with `--proxy` or `--proxyDuplex`; a Linux client can expose a
+remote `web3://` service through a local endpoint with `--clientDuplex`.
+Windows, macOS, Android, and iOS do not need to run the Linux daemon. Browser
+extensions, web applications, and native applications can implement the same
+locator, caller-signed request, encrypted response correlation, and stream
+contract in client code.
 
-When this file or `RULES.md` changes, the same task must update **both** GitBook pages above. Do not leave the public book on a previous revision.
+The protocol composes existing L0 primitives. It does not introduce a second
+network, a new SI command family, or a replacement for the public CoNET L1
+node-joining path.
 
 ## 1. Problem
 
-CoNET L1 `geth` and Prysm `beacon-chain` speak ordinary TCP/UDP to `IP:port`. Operators who sit behind NAT, lack a stable public address, or want a **wallet-addressed** backup path cannot change those clients’ source. They need a Linux command that:
+Internet applications normally expose a DNS name, public origin, and
+certificate-bound server identity. This makes the origin easy to locate and
+ties application naming to conventional hosting.
 
-1. presents a stable overlay locator (`web3://…` → overlay IPv4);
-2. **catches** only packets destined to that overlay;
-3. carries the byte stream on Layer Minus (wallet + OpenPGP, `POST /post`);
-4. **owns** TUN and iptables for the lifetime of the process — start installs, stop/teardown removes, no hand-written `iptables`.
+CoNET already provides a different foundation:
 
-## 2. Non-goals
+- wallet and OpenPGP identities;
+- encrypted entry routing;
+- mailbox delivery;
+- persistent receive sessions; and
+- sender-to-recipient application encryption.
 
-| Out of scope | Why |
-| --- | --- |
-| Patch geth / beacon / validator | Product constraint: zero client source change |
-| Kernel module | Userspace daemon is enough |
-| SilentPass / `SaaS_Sock5` as L1 P2P | Those commands open a public `host:port` egress |
-| Treat current L0 UDP forward as OS UDP | AES frames over HTTP/SSE; idle 10 min; not discv4 |
-| Capture `127.0.0.0/8` or validator uid | Engine JWT, beacon gRPC, local RPC must stay local |
-| Redirect `0.0.0.0/0:8400` | Mixed-mode public P2P must keep working |
-| New public hostname | Reuse existing CoNET / beamio.app paths |
-| Restart EL / CL / VA | Lifecycle is only this daemon’s net objects |
+What applications need above that foundation is a small, explicit contract
+for naming a destination, opening a session, carrying requests or streams,
+and returning a response to the authenticated caller.
 
-## 3. Architecture
+## 2. Layered model
 
 ```text
-geth / beacon
-  connect(100.64.x.y : 8400|4200)
-        │
-   kernel route  100.64.0.0/10 → tun conet-l0
-        │
-   conet-l0d  (owns TUN + iptables chain CONET_L0D)
-        │  resolve overlay IP → web3:// wallet | tag.web3
-        │  encrypt to peer user PGP; listen/control to mailbox B route PGP
-        ▼
-   Layer Minus   POST { data: armor }  entry A ≠ B
-        │
-   peer conet-l0d  injects src=remote-vIP into peer TUN
-        ▼
-   peer geth / beacon  accept() on 0.0.0.0:port
+Application
+  web3:// URI, request or stream semantics, errors
+                         │
+Client implementation
+  browser / native library / conet-l0d
+                         │
+Layer Minus
+  entry A/C, mailbox B, OpenPGP routing, SSE/duplex delivery
+                         │
+Local server adapter
+  conet-l0d proxy or application gateway
+                         │
+Origin service
+  HTTP API, WebSocket, or TCP service on localhost/private network
 ```
 
-Layer Minus remains a [PGP / wallet forwarding plane](https://gitbook.conet.network/l0/using-l0.html). `conet-l0d` is one application combination, like Chat or SilentPass — not a new L0 protocol.
+Each layer has one responsibility:
 
-## 4. Identity (`web3://` locator)
+| Layer | Responsibility |
+|---|---|
+| L0 | Encrypted wallet-addressed transport |
+| `web3://` | Application destination and session contract |
+| `conet-l0d` | Linux server/client adapter |
+| Browser/native client | Cross-platform user-facing implementation |
+| Origin | Existing application logic |
 
-The URI is a **peer locator**, not an ERC-4804 content URI.
+The application protocol does not change the L0 HTTP envelope. Entry requests
+continue to contain only `{ "data": "<OpenPGP armor>" }`.
+
+## 3. Product roles by platform
+
+| Platform | Recommended role |
+|---|---|
+| Linux server | Publish a local service with `conet-l0d --proxy` or `--proxyDuplex` |
+| Linux client | Reach remotes with `conet-l0d --clientDuplex` (same logical port may map to several remotes) |
+| Windows / macOS | Browser extension, browser client, or native client implementing `web3://` |
+| Android / iOS | Web or native client using the same protocol over HTTPS/SSE |
+| Browser | Parse, sign, encrypt, send, receive, decrypt, and render without a Linux daemon |
+
+This separation keeps the protocol platform-neutral while providing a
+production-oriented Linux reference runtime.
+
+## 4. Destination grammar
+
+The current Linux runtime accepts wallet-addressed endpoints:
 
 ```text
-web3://<host>/p2p/<service>
-
-host     = 0x + 40 hex                    → EOA
-         | <beamioTag>.web3               → exact tag → EOA
-service  = geth | beacon
+web3://0x<40-hex>:<port>
+web3://<exact-tag>.web3:<port>
 ```
 
-Resolution:
+Examples:
 
-1. EOA directly, or **exact** BeamioTag match (`CoNET` ≠ `CONET`). Never `search-users` `results[0]`.
-2. `searchKey(EOA)` on AddressPGP `0x684b0ac760cEE9c9b85de36d69746420648Cf9e2`.
-3. Require user PGP + mailbox route. An AA without AddressPGP is not a destination.
-4. Allocate or look up overlay vIP. geth/beacon only see `vIP:port`.
-
-Routing EOA ≠ deposit keystore ≠ fee recipient. The daemon must not read validator keys.
-
-## 5. Catch path (no client bind to overlay)
-
-Advertise flags are **not** listen addresses:
-
-| Client | Advertise (safe) | Bind (do not set to overlay) |
-| --- | --- | --- |
-| geth | `--nat=extip=<local-vIP>` | `--http.addr` / `--authrpc.addr` stay `127.0.0.1` |
-| beacon | `--p2p-host-ip=<local-vIP>` | `--rpc-host` / `--grpc-gateway-host` stay `127.0.0.1` |
-
-`--port 8400` and `--p2p-tcp-port=4200` still listen on `0.0.0.0`. A missing overlay address does **not** stop client startup. Unreachable overlay bootnodes leave the process up with zero overlay peers.
-
-Phase 1 uses **static** overlay peers. The crate envelope already carries complete IPv4, including UDP. A lab may steer beacon `:4300` onto TUN and run discv5 from a L0_ONLY host to a public DHT server over L0 (`docs/P2.md`). That is not a production discv5 product and does not close follow-the-chain.
-
-## 6. Daemon-owned net objects
-
-On `start` (after optional dirty-state teardown):
-
-1. Create TUN `conet-l0`.
-2. `ip addr add <local-vIP>/32 dev conet-l0`.
-3. `ip route add 100.64.0.0/10 dev conet-l0`.
-4. Create iptables chain `CONET_L0D` (filter + mangle).
-5. First rules: `RETURN` `127.0.0.0/8`; optional `owner --uid-owner <validator>` `RETURN`.
-6. Jump `OUTPUT` / `PREROUTING` into that chain only.
-7. Write state + pid; run the packet loop.
-
-On SIGINT / SIGTERM / `stop` / `teardown`:
-
-1. Delete the jumps (only those that point at `CONET_L0D`).
-2. Flush and `-X` `CONET_L0D`.
-3. Delete the overlay route, address, and TUN.
-4. Remove the state file.
-
-Operators never run `iptables` by hand. Teardown must not delete foreign rules.
-
-## 7. L0 mapping (Phase 1)
-
-| Direction | Encrypt to | HTTP |
-| --- | --- | --- |
-| `duplex_offer` | Peer **long-lived user PGP** | Entry **A ≠ B**. Chat gossip to the existing channel SSE. SI does **not** parse `duplex_*` |
-| Exclusive L0 listen | Mailbox **B route PGP** | `l0_listen` or `mining` + `listenKind: "l0"` via **C ≠ B**. No overlay AES. Two owned L0 SSEs; no guest listen on peer B |
-| `l0_connect` | **Target** mailbox **B route PGP** | Occupies idle L0 SSE; then AES blobs on the same TCP. Occupied → 409 |
-| `duplex_accept` / `duplex_reject` | AES on occupied initiator L0 pipe | First AES blob after responder occupies `W_I` |
-| Overlay IPv4 (duplex data plane) | AES of `duplex_frame` JSON; `payload` = standard base64 of `L0D1` \|\| IPv4 | Occupied peer L0 pipe |
-| P1 gossip fallback (`duplex_reject` or no accept or no pipe) | Peer **user PGP**, then mailbox-work wrap to **B route PGP** | Entry **A ≠ B** |
-
-HTTP body is only `{ "data": "<armor>" }`. No hop-sig header from this client. No `NoPush` on HTTP JSON.
-
-Duplex is **application JSON** on Chat gossip plus AES on the SI occupancy pipe: `duplex_offer`, `duplex_accept`, `duplex_reject`, `duplex_frame`. Initiator sends the overlay AES key and a **session listen wallet**; responder either occupies that L0 SSE with `duplex_reject` or accepts with a key echo and its own session listen wallet. Spec: [Duplex overlay](https://gitbook.conet.network/l0/duplex-forward.html). Crate MVP reuses the registered per-port channel EOA as the session listen identity. Do **not** send `command: "mining"` with `listenKind: "duplex"`. Do **not** document SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` as current SI. Do document live SI `l0_listen` / `l0_connect`.
-
-Existing UDP forward is a different composition (shorter idle; not overlay TCP).
-
-## 8. Production posture
-
-Keep **public P2P** for slot-critical gossip (`SECONDS_PER_SLOT=6`). Use L0 overlay for NAT / no public IP / backup peers. **Do not** default to L0-only proposers until the GitBook [slot-critical publication gate](https://gitbook.conet.network/developers/l1-node.html#slot-critical-publication-gate) is filled **against a public-P2P baseline** (L0 RTT P50/P95/P99; block propagation to 50% and 90%; attestation inclusion delay; missed slots; reorgs; duplex reconnect time; Guardian failover time; UDP/discv5 loss).
-
-A 2026-08-18 ~15 min lab snapshot showed overlay TCP RTT ~475–750 ms vs ~40–55 ms on `.98` public peers. That is **not** P50/P95/P99 and **not** a proposer-set measurement.
-
-If overlay traffic hangs on **few mailboxes**, the risk moves from validator **IP** concentration to **Guardian path** concentration. Production overlay must use several independent entries, several mailboxes, several ASNs, several regions, one routing EOA per overlay port (`[[l0.channels]]`), and automatic reconnect **plus** failover to another B. Per-port EOAs on the **same** mailbox do not remove mailbox concentration. Occupy retry is in-crate; cross-Guardian failover is not a shipped product.
-
-## 9. Security
-
-- Do not log private keys, full PGP armor, or session keys.
-- Do not capture loopback or validator gRPC.
-- Mixed mode: never mark the entire public 8400/4200/4300 space.
-- Capability `CAP_NET_ADMIN` is required; drop other privileges where the OS allows.
-
-## 10. Phases
-
-| Phase | Scope |
-| --- | --- |
-| **MVP** | **Accepted (2026-08-17).** Linux command; TUN + iptables lifecycle; locator parse; static peer table; packet counters; L0 client stub |
-| **P1** | **In crate; `[l0]` default off.** Wallet-to-wallet TCP byte stream. Prefer **application duplex** (offer on long-lived Chat SSE; accept / reject / frames on session listen SSEs) when the peer app sends `duplex_accept`; **P1 gossip** remains the fallback on `duplex_reject` or missing accept. Static overlay bootnodes. Crate encrypts the overlay envelope to the peer **user PGP**, wraps `{ data, NoPush: true }` to mailbox **B route PGP**, and POSTs only `{ "data" }` when `[l0].enabled` plus peer user+route PGP files and an entry are present. Inbound decrypt of user-PGP armor → overlay envelope → raw IPv4 queued to TUN is **in-crate** when `routing_key_file` is an OpenPGP secret cert. Listen HTTP+SSE worker is **in-crate** when enabled plus `listen_entries` (C ≠ B), `mailbox_route_pgp_file` (this host's B route **public** key), `routing_eoa`, `routing_key_file`, and `routing_eth_key_file` (hex secp256k1; recovered address must match `routing_eoa`; not OpenPGP). Optional `[[l0.channels]]` is one EOA + SSE per overlay port 8400 / 4200 / 4300 (encrypt to the peer user PGP for that port; classify by well-known src or dest port). Empty channels keep one EOA. `:4300` is overlay IPv4, not `udp_relay`. Crate MVP session listen **is** that channel Chat SSE (`mining` + `listenKind: "chat"`, no overlay AES). `duplex_reject` or missing `duplex_accept` keeps P1 gossip. Listen is EIP-191-signed as SI `{ message, signMessage }` base64. Listen ingest matches SI `forWardPGPMessageToClient` raw JSON `{ "data": "<armor>" }` (Chat `handleInbound`), not only SSE armor lines. Tests use wiremock only. An **authorized** lab may enable `[l0]`. Do **not** treat SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` as current SI. **2026-08-17 23:12Z L0-only:** outbound HTTP 200, no inbound TUN write (old SSE-only parser). **23:30Z** (restart only `conet-l0d`): inbound IPv4 on both TUNs and overlay geth TCP (`.45` `100.64.0.5` ↔ `.98` `100.64.0.6:8400`). **2026-08-18:** authorized L0_ONLY `.45` advertises overlay vIP `100.64.0.5`; overlay geth + beacon TCP ESTAB; dest-aggregated IPv4 + POST concurrency 32 / queue 512 (upgrade both lab binaries together). After that binary, overlay queue-full is 0; remaining follow-the-chain limiter is Prysm initial-sync (~3.2 blocks/s, ~15 h). EL still `0x0`. Operator watch: `scripts/watch-l0-follow.sh`. The follow-the-chain gate stays open. `.98` and production proposers keep the public IP. HTTP 200 ≠ delivery. |
-| **P2** | **Lab comms accepted; not a product.** Crate already carries IPv4/UDP — no extra datagram adapter. 2026-08-18 lab: overlay UDP echo and `:4300` (direct + public-ENR steer) arrived on the peer TUN. Live Prysm discv5 on L0_ONLY `.45` then abandoned static `--peer` and connected to the `.98` DHT server over L0 (`--p2p-static-id` on `.98`; bootstrap ENR; allowlist = overlay + hub public `/32`; TCP/UDP steer DNAT; isolate still drops unsteered public P2P). After DNAT, `.45` `ss` may show hub public `:4200` (original dest, not a leak); overlay proof is TUN VIP + isolate DROP=0. If `connected` later drops, re-apply `overlay-dht-steer.sh` first (flush ghost hub conntrack; do not restart EL/CL). `restart-beacon` only if Prysm stays in dial backoff (**2026-08-18 ~17:28Z** on `.45` restored `connected=1` and `Processing blocks`; do not re-apply steer immediately after start). First-minute `suitable=0` is expected. EL `0x0` while `head_slot` climbs is CL lag. See `docs/P2.md`. |
-| **P3** | Hybrid production (public P2P + L0 backup); **published** slot-critical metrics vs public P2P; multi-entry / multi-mailbox / multi-ASN diversity |
-
-## 11. Source of truth
-
-| Artifact | Role |
-| --- | --- |
-| [github.com/CoNET-project/CoNET-L0D](https://github.com/CoNET-project/CoNET-L0D) | Canonical public crate |
-| This pair + `RULES.md` | Design and engineering constraints |
-| `docs/MVP.md` | Accepted crate MVP |
-| `docs/P1.md` | Overlay wire: application duplex plus P1 gossip fallback; `[l0]` |
-| `docs/P2.md` | Lab overlay UDP / DHT-port comms + live discv5 via L0 (not a closed P2 / production product) |
-| `config/conet-l0d.example.toml` | Example overlay table |
-| `systemd/conet-l0d.service` | Process owns TUN/iptables; unit must not run raw `iptables` |
-| GitBook Applications | Operator how-to (English public book) |
-| GitBook Developers | CLI, config, wire contract |
-| GitBook L0 | Forwarding plane — do not fork it here |
-
-## Related
-
-- [How to use Layer Minus](https://gitbook.conet.network/l0/using-l0.html)
-- [Run an L1 node](https://gitbook.conet.network/developers/l1-node.html)
-- [SilentPass](https://gitbook.conet.network/applications/silentpass-vpn.html) — egress, not L1 P2P
-- [Wallet-addressed peer identity](https://gitbook.conet.network/l0/wallet-address-p2p.html)
-
-## 12. Ephemeral listen attachment and transport teardown (2026-08-20 redesign)
-
-The previous deterministic `sessionId` / wallet-and-port correlation model is retired.
-It is not a compatibility target. A duplex attachment now uses a fresh 32-byte
-opaque `pipe_handle`, generated independently for each pipe incarnation. The
-handle is not derived from either wallet, port, IP address, or route.
-
-The first `duplex_offer` is a bootstrap message and may be routed to the
-receiver's long-lived public user PGP so the mailbox can find the receiver.
-The offer carries the initiator's dedicated listen-pipe PGP. After accepting,
-the receiver encrypts `duplex_accept` to that advertised pipe PGP, not to the
-initiator's long-lived public PGP. The accept carries the receiver's own
-dedicated listen-pipe PGP and the negotiated AES key. After this exchange,
-duplex control traffic uses the two dedicated pipe PGP identities; the
-initiator does not continue using the receiver's public user PGP.
-Mailbox and entry SI components must treat all handles as hop-local opaque
-values and must not correlate handles across hops.
-
-The SI knowledge boundary is deliberately narrow:
-
-- a mailbox SI knows only its own waiting pool and its own occupied TCP;
-- an entry SI knows only its local transport handle and socket lifecycle;
-- neither SI learns the end-to-end AES key or the full path;
-- no SSE-side `l0_pipe_end`, wallet, connector, or deterministic session notice
-  is emitted.
-
-`l0_pipe_end` is now a strict occupied-TCP control line. It is accepted only on
-the TCP connection that is already bound to the same opaque `pipe_handle`:
-
-```json
-{
-  "type": "l0_pipe_end",
-  "pipe_handle": "<64 lowercase hex>",
-  "reason": "transport_closed"
-}
+```text
+web3://0x1111111111111111111111111111111111111111:443
+web3://ExampleMerchant.web3:9443
 ```
 
-It carries no wallet or connector field. A missing, malformed, or mismatched
-handle is rejected. An SSE parser must never interpret this object as a
-remote teardown command. The normal failure signal for an entry-to-entry
-transport is HTTP `410` before a response is committed, or immediate FIN/RST
-after a keep-alive response has been committed. The sender observes that
-failure and stops its packet loop; it must not continue writing to a dead
-destination.
+The host identifies the remote application owner. The port identifies a
+logical application service. Exact tag resolution is required; a prefix
+search result must never be selected implicitly.
 
-This design prevents a malicious listener from turning a healthy sender into a
-packet amplifier: only the currently bound transport can terminate itself, and
-reconnect is subject to the existing bounded retry/backoff and occupancy
-limits. Cross-hop teardown forwarding, if implemented by SI, is an internal
-opaque-handle operation and is never exposed as an application message.
+A browser-facing resource adds a path and query:
 
-## 13. Occupied-pipe liveness timeout
+```text
+web3://0x1111111111111111111111111111111111111111/dashboard?range=7d
+```
 
-The sender of an occupied bidirectional pipe is responsible for sending
-application data within every two-minute window. When no overlay IPv4 frame
-is available, `conet-l0d` sends an encrypted `duplex_ping` application blob
-every 60 seconds. This is ordinary duplex data and never a fabricated IP
-packet.
+The signed request carries the canonical target, path, and query. Human-readable
+aliases may be presented by clients, but they resolve to an exact wallet
+identity before encryption.
 
-Only the exclusive L0 listen SSE applies this inactivity rule; the normal
-Chat SSE keeps its mailbox heartbeat semantics. The L0 listener measures
-inbound bytes. If no bytes arrive for 120 seconds, it treats the pipe as
-abandoned, closes its SSE, and clears the local occupied writer. The peer
-observes EOF and must stop writing to that incarnation.
+The repository also recognizes `/p2p/geth` and `/p2p/beacon` peer locators for
+controlled L1 experiments. Those locators are one application composition,
+not the definition of the general protocol.
 
-After its own listening SSE has terminated and a replacement listen has
-successfully been established, a bidirectional client may issue a new
-`l0_connect`. The replacement uses a fresh request and fresh `pipe_handle`;
-stale `pipe_tx` state must not be reused. Reconnect remains bounded by the
-existing retry/backoff and occupancy limits.
+## 5. Session profiles
 
-### Session role vs logical port (no global upstream by port)
+### 5.1 Request/response
 
-Each duplex line already has an independent `pipe_handle`. **Do not** attach
-local geth/beacon upstream merely because `session.port` matches a configured
-`[[l0.proxy_duplex]]` port.
+`--proxy HOST:PORT` publishes a local request/response upstream. A signed
+application request is routed to the wallet destination, validated by the
+server adapter, forwarded to the configured origin, and encrypted back to the
+requester's registered user PGP key.
 
-`maybe_start_proxy_drain` may dial the local upstream **only** for sessions
-allocated by the inbound proxy handshake (`mainWallet:port` + `firstChunk`)
-with `DuplexLineRole::Proxy`. Sessions from `--clientDuplex` /
-`l0.client_duplex` are `DuplexLineRole::Peer` and must not open that upstream
-even when the remote application port is `:8400` / `:4200`.
+This profile is suitable for bounded HTTP-style operations.
 
-One daemon may run client and proxy together. Client local listen ports must
-be free OS ports (`web3://<billing_eoa>:8400@18400`, `:4200@14200`). Dialed
-`mainWallet` is the peer `billing_eoa`, never a per-port channel `routing_eoa`.
+### 5.2 Persistent duplex
 
-## 14. Main-wallet billing for temporary channels (2026-08-21)
+`--proxyDuplex HOST:PORT` publishes a continuous bidirectional TCP service.
+`--clientDuplex web3://HOST:PORT` exposes the selected remote
+service through a `127.0.0.1` TCP endpoint. The same logical port may map to
+several remotes; each remote gets its own loopback listener. The preferred
+bind is `PORT`; if occupied, the runtime walks `PORT+10000`, `PORT+20000`,
+…. The same `(host, PORT)` listed twice is rejected.
 
-For an explicit new-line request addressed to `mainWallet:port`, `conet-l0d`
-creates a fresh, process-memory-only communication wallet and OpenPGP identity
-for that line. It registers the temporary user PGP and route key with the
-existing AddressPGP registration API before any offer is processed. HTTP 200
-from `regiestChatRoute` is queue admission only: the mailbox still reads
-`searchKey` on AddressPGP, so the daemon waits until that `routeKeyID` is
-visible on CoNET RPC before opening `l0_listen`. The temporary wallet is
-therefore routable, but is never the payer.
+Each accepted local connection creates a distinct application session:
 
-A `duplex_offer` is OpenPGP-encrypted to the destination **user** PGP for
-that `mainWallet:port`. The receiver selects the decrypt secret from the
-message PKESK recipients and must not try every listen wallet in list order.
-If the recovered `ingress_wallet` is not the configured routing EOA for that
-port, the offer is rejected.
+```text
+local TCP connection
+    → duplex offer
+    → remote acceptance
+    → bidirectional encrypted frames
+    → explicit close or reconnect
+```
 
-The mailbox command keeps the temporary wallet in `walletAddress` and carries
-the configured paid account in `billingWallet`. Its EIP-191 signature is made
-by the paid account. CoNET-SI verifies the signature against
-`billingWallet`, while retaining `walletAddress` as the routing and mailbox
-subject, and charges hop usage to the billing wallet. If `billingWallet` is
-absent, SI preserves the legacy rule that the signer must recover to
-`walletAddress`.
+Session identifiers, ordering, limits, and teardown belong to the application
+stream contract. L0 supplies transport; it does not interpret the origin
+protocol.
 
-Every explicit new-line request has an independent temporary wallet, PGP
-registration, AES key, occupied pipe, opaque handle, and upstream socket.
-Multiple clients may share a logical proxy port without sharing any of these
-identities or transport resources. A received `duplex_offer` is attach-only:
-it may match an already registered `pipe_handle` or temporary `listenWallet`.
-Unknown, stale, or ambiguous offers are rejected without allocation or a new
-`l0_connect`. Registration or billing failure is
-fail-closed; it must not silently fall back to an unregistered temporary
-route.
+## 6. Signed web request gateway
+
+The `conet-l0d gateway` profile maps a wallet-addressed request to a loopback
+HTTP origin.
+
+The implemented v1 request includes:
+
+- `type = "conet_web3_request_v1"`;
+- a unique `requestId`;
+- caller wallet `from`;
+- `target = web3://<gateway-eoa>/...`;
+- method, path, query, selected headers, and optional body;
+- nonce and expiry; and
+- an EIP-191 signature over the canonical request JSON.
+
+The gateway:
+
+1. decrypts the request with its user PGP key;
+2. checks version, expiry, method, path, target, and signature;
+3. forwards only to a configured loopback origin;
+4. bounds request and response sizes and execution time;
+5. encrypts `conet_web3_response_v1` to the caller's registered user PGP key;
+6. sends the response through ordinary L0 entries.
+
+The current gateway restricts methods to `GET` and `HEAD`. Broader methods,
+delegation, payments, and origin identity headers require a later protocol
+revision rather than undocumented behavior.
+
+## 7. L0 routing and privacy
+
+The protocol follows the existing A/B/C mailbox model:
+
+| Action | Encryption target | Network entry |
+|---|---|---|
+| Application delivery | Recipient user PGP | Healthy entry A, distinct from mailbox B |
+| Receive/listen command | Mailbox B route PGP | Healthy entry C, distinct from B |
+| Response | Caller user PGP | Healthy entry selected by the responder |
+
+Entry and mailbox nodes receive only the information required for routing.
+They do not become trusted application origins and must not gain plaintext
+request bodies.
+
+Clients must not optimize by directly connecting to mailbox B. Direct mailbox
+access reveals routing placement and diverges from the protocol's privacy
+model.
+
+## 8. Identity and authorization
+
+`web3://` binds application access to cryptographic identity:
+
+1. the target resolves to an exact wallet;
+2. the payload is encrypted to the target's user PGP key;
+3. the request is signed by the caller EOA;
+4. the server validates that signature and target;
+5. the response is encrypted to the caller's user PGP key.
+
+An application may add its own authorization policy after identity
+verification. The protocol proves who signed the request; it does not grant
+every signer access to every resource.
+
+Private keys, complete PGP ciphertexts, and plaintext application bodies must
+not be written to logs.
+
+## 9. Linux runtime configuration
+
+The public configuration centers on application endpoints:
+
+```toml
+[l0]
+entries = ["https://example-entry.conet.network"]
+listen_entries = ["https://another-entry.conet.network"]
+routing_eoa = "0x..."
+routing_key_file = "/etc/conet-l0d/app-secret.asc"
+routing_eth_key_file = "/etc/conet-l0d/app-eip191.key"
+mailbox_route_pgp_file = "/etc/conet-l0d/mailbox-route-public.asc"
+client_duplex = ["web3://ExactPeer.web3:9443"]
+
+[[l0.proxy_duplex]]
+host = "127.0.0.1"
+port = 9443
+```
+
+Operators should keep origin services on loopback or a private network and
+publish only the intended logical ports.
+
+## 10. Lifecycle and observability
+
+The Linux runtime exposes:
+
+| Command | Purpose |
+|---|---|
+| `check-config` | Validate configuration without opening sessions |
+| `resolve` | Parse and resolve a `web3://` locator |
+| `start` | Run configured server proxies and client endpoints |
+| `gateway` | Run the signed web request gateway |
+| `status` | Report recorded runtime state |
+| `stop` | Signal the recorded process and clean runtime state |
+| `teardown` | Remove stale daemon-owned runtime state |
+
+Useful evidence includes:
+
+- exact wallet or tag resolution;
+- published and local endpoint addresses;
+- accepted request or duplex session IDs;
+- encrypted frame counters and bounded queue status;
+- response status or stream close reason; and
+- reconnect attempts.
+
+A process being alive is not proof that an application request or stream
+completed.
+
+## 11. Failure model
+
+Clients and operators should distinguish:
+
+| Failure | Meaning |
+|---|---|
+| Locator resolution fails | Destination is invalid, ambiguous, or unregistered |
+| Entry request fails | Selected entry is unavailable; try another healthy entry |
+| Mailbox rejects routing | Destination route does not match that mailbox |
+| Signature fails | Caller identity or canonical request bytes do not match |
+| Origin connect fails | Published local service is unavailable |
+| Stream closes | Reconnect according to bounded client policy |
+| Response timeout | No trustworthy application response was completed |
+
+Transport failure must not be converted into a successful empty response.
+Applications preserve their last trusted data according to their own cache
+policy.
+
+## 12. Optional L1 composition
+
+Selected geth or Prysm TCP streams can be used as a controlled Linux-to-Linux
+duplex experiment. This composition:
+
+- reuses the same wallet destination and stream contract;
+- preserves geth and Prysm identities;
+- requires independent verification at the L1 client layer; and
+- remains separate from the public L1 node-joining guide.
+
+It does not mean that CoNET L1 consensus has generally moved to L0. See
+[`docs/P2.md`](../docs/P2.md) for the bounded laboratory record.
+
+## 13. Maturity
+
+| Capability | Status |
+|---|---|
+| Wallet/tag locator parsing | Implemented |
+| Linux request/response proxy | Implemented |
+| Linux duplex server/client runtime | Implemented |
+| Signed v1 GET/HEAD gateway | Implemented |
+| Browser extension/client composition | Early implementation / evolving |
+| Cross-platform protocol SDK | Destination |
+| Delegation, payment scopes, formal canonical-byte specification | Draft |
+| L1 TCP composition | Laboratory-proven, not the public default |
+
+Documentation must preserve these distinctions. A working locator or Linux
+runtime is not proof that every browser feature or future protocol extension
+is production-ready.
+
+## 14. Non-goals
+
+The protocol is not:
+
+- a general-purpose network interface;
+- a VPN product;
+- a new public SI command family;
+- a reason to expose origin services directly;
+- a replacement for TLS on ordinary web endpoints;
+- a replacement for the public L1 P2P joining path; or
+- permission to invent new domains or centralized routing services.
+
+## Conclusion
+
+The durable abstraction is the application protocol, not one operating-system
+adapter. Layer Minus supplies private wallet-addressed transport;
+`web3://` defines how applications name and exchange data; `conet-l0d`
+provides the Linux runtime; and browser or native clients provide the
+cross-platform user experience.

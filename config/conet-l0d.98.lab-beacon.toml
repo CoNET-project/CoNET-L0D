@@ -4,10 +4,8 @@
 # PEER_OVERLAY_VIP=100.64.0.7 (do not change .82 --nat). Geth docks overlay
 # enode @100.64.0.7:8400; do not keep the public @216.225.202.82:8400 peer.
 
-tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
 local_vip = "100.64.0.6"
-iptables_chain = "CONET_L0D"
 state_path = "/home/peter/conet-l0d-lab/run/state.json"
 
 [identity]

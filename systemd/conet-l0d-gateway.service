@@ -1,6 +1,6 @@
 [Unit]
-Description=CoNET Web3 Enterprise Gateway (conet-l0d)
-Documentation=https://gitbook.conet.network/applications/conet-l0d.html
+Description=CoNET web3 application gateway (conet-l0d)
+Documentation=https://gitbook.conet.network/developers/conet-l0d.html
 After=network-online.target
 Wants=network-online.target
 

@@ -1,300 +1,310 @@
-## Client 与 proxy 传输分流
+# 基于 CoNET Layer Minus 的 `web3://`
 
-客户端有两种明确传输：`--client` 使用 P1 请求/响应路径，
-`--clientDuplex` 使用加密的持续 duplex pipe。L0d 会自动选择并打印
-本地 VIP，客户端不需要额外配置防火墙或 iptables。
+Linux 运行时、跨平台客户端合同与应用网关
 
-## 以 socket 为边界的 duplex 握手
+对应英文版：[`conet-l0d.md`](conet-l0d.md)
 
-本地 TCP socket 事件是唯一的连接句柄。新 socket 读取首段应用数据后
-保持暂停；发起端创建并登记该 socket 专属的临时钱包/PGP route，等待临时
-`l0_listen` SSE 就绪后，才把数据作为 `firstChunk` 放入
-`duplex_offer`。只有 EIP-191 签名者与 `billingWallet` 一致，且 offer
-明确匹配 main wallet/port 及 `--proxyDuplex` 端口时，proxy 才能创建
-临时线路。proxy 先登记自己的临时 route 并等待 listen SSE 就绪，再创建
-上游 TCP client、发送 `firstChunk`，取得首段响应后暂停上游，把响应作为
-`responseChunk` 放入 `duplex_accept`。仅当返程 pipe 仍空时，proxy 才反向
-占用发起端 listen，然后开始向上游与 pipe 转发。它**不等**下一协议块：
-geth / beacon 在 Hello 之后常常保持暂停，直到两条占用管道都起来。
-发起端用该 socket 的临时 PGP 私钥解密 accept，把 `responseChunk` 写回本地
-socket 后立刻 occupy（允许空的首个 AES blob）。后续数据只复用同一个
-不透明 `pipe_handle`；未签名、过期、未匹配或不明确的 offer 不得创建临时线路。
+修订：2026-08-22
 
-服务器端同样分流：`--proxy` 是请求/响应配置，
-`--proxyDuplex` 是持续原始 stream。仅 proxy 模式有意不依赖网络配置：
-不创建 TUN、路由或 iptables 链。两种 proxy 配置之间的逻辑端口必须唯一。
+## 摘要
 
-`--clientDuplex` 按连接事件分配线路。本地 `TcpListener.accept()` 事件
-就是唯一的本地连接句柄：每个新 socket 都生成新的临时钱包/PGP route、
-AES key、透明 `pipe_handle`、返回队列和占用线路。同一个 socket 在 EOF
-或错误前始终复用该线路；即使连接同一个本地端口，第二个 socket 也会
-获得另一条线路。L0d 不在 Geth/Prysm 原始字节前插入私有 header，而由
-socket handle 与加密的 `pipe_handle` 负责关联。
-# conet-l0d — 在 Layer Minus 上的 L1 overlay
+`web3://` 是构建于 CoNET Layer Minus（L0）之上的钱包地址化应用协议。
+它为应用提供稳定的密码学目标，由 L0 提供加密入口路由、mailbox 投递和双向传输。
 
-**成对译本：** [English](./conet-l0d.md)  
-**Revision：** 2026-08-24（proxy 握手在 accept 后即可反向占用，不等 resume 首包；客户端写回 `responseChunk` 后立刻 occupy；`regiestChatRoute` HTTP 200 后等待 AddressPGP `searchKey`；入站按 PKESK 选解密密钥；SSE/返程 pipe 就绪门闸；按连接 socket 句柄分配 duplex 线路；每连接临时身份；slot 关键指标发表门槛 vs 公网 P2P；多 Guardian / 多 Mailbox 路径多样性；SI `l0_listen` / `l0_connect` 占用管道；应用层 duplex；可选按端口 `[[l0.channels]]`；实验室 overlay TCP/UDP；不是生产 discv5 产品）
-**公开操作说明：** [Applications — L1 overlay daemon](https://gitbook.conet.network/applications/conet-l0d.html)  
-**公开开发说明：** [Developers — conet-l0d](https://gitbook.conet.network/developers/conet-l0d.html)
+`conet-l0d` 是该协议的 Linux 运行时。Linux 服务器可用 `--proxy` 或
+`--proxyDuplex` 发布本地服务；Linux 客户端可用 `--clientDuplex`
+把远端 `web3://` 服务提供为本地 endpoint。Windows、macOS、Android
+与 iOS 无需运行 Linux daemon。浏览器扩展、Web 应用和原生应用可在客户端代码中
+实现相同的 locator、调用方签名请求、加密响应关联与 stream 合同。
 
-本白皮书是 **L1 节点 overlay + L0 应用组合**。它不修改 CoNET-DLE 多链白皮书，也不把 Layer Minus 变成第二套 IP 网。
-
-改本文件或 `RULES.md` 时，**同一任务**必须更新上面两份 GitBook 页面。禁止公开书停留在旧 Revision。
+该协议组合现有 L0 原语，不会引入第二套网络、新 SI 命令族，也不会替代公开
+CoNET L1 节点加入路径。
 
 ## 1. 问题
 
-CoNET L1 的 `geth` 与 Prysm `beacon-chain` 只对普通 `IP:port` 做 TCP/UDP。坐在 NAT 后、没有稳定公网地址、或需要 **钱包寻址** 备份路径的操作员，不能改这些客户端源码。他们需要一条 Linux 命令：
+互联网应用通常暴露 DNS 名称、公开 origin 与绑定证书的服务器身份。这使 origin
+容易被定位，也把应用命名绑定到传统托管方式。
 
-1. 给出稳定 overlay 定位符（`web3://…` → overlay IPv4）；
-2. **只 catch** 发往该 overlay 的包；
-3. 用 Layer Minus（钱包 + OpenPGP，`POST /post`）搬运字节流；
-4. **自行持有** TUN 与 iptables：启动安装、停止/teardown 拆除，操作员不用手写 `iptables`。
+CoNET 已经提供另一种基础：
 
-## 2. 非目标
+- 钱包与 OpenPGP 身份；
+- 加密入口路由；
+- mailbox 投递；
+- 持续接收 session；
+- 发件人与收件人之间的应用加密。
 
-| 不做 | 原因 |
-| --- | --- |
-| 改 geth / beacon / validator 源码 | 产品约束：零客户端源码改动 |
-| 内核模块 | 用户态守护进程足够 |
-| 把 SilentPass / `SaaS_Sock5` 当 L1 P2P | 那些命令是出口去连公网 `host:port` |
-| 把现有 L0 UDP forward 当 OS UDP | HTTP/SSE 上的 AES 帧；空闲 10 分钟；不是 discv4 |
-| 捕获 `127.0.0.0/8` 或 validator uid | Engine JWT、beacon gRPC、本地 RPC 必须留在本机 |
-| 对 `0.0.0.0/0:8400` 做 REDIRECT | 混合模式的公网 P2P 必须继续工作 |
-| 新建公网域名 | 复用现有 CoNET / beamio.app 路径 |
-| 重启 EL / CL / VA | 生命周期只动本守护进程的网络对象 |
+应用在此基础之上还需要一份小而明确的合同，用于命名目标、打开 session、
+承载 request 或 stream，并把响应返回给已认证调用方。
 
-## 3. 架构
+## 2. 分层模型
 
 ```text
-geth / beacon
-  connect(100.64.x.y : 8400|4200)
-        │
-   内核路由  100.64.0.0/10 → tun conet-l0
-        │
-   conet-l0d  （持有 TUN + iptables 链 CONET_L0D）
-        │  overlay IP → web3:// 钱包 | tag.web3
-        │  业务字节加密给对端 user PGP；listen/控制加密给 mailbox B route PGP
-        ▼
-   Layer Minus   POST { data: armor }  入口 A ≠ B
-        │
-   对端 conet-l0d  把 src=对端 vIP 写入对端 TUN
-        ▼
-   对端 geth / beacon  在 0.0.0.0:port 上 accept()
+Application
+  web3:// URI、request 或 stream 语义、错误
+                         │
+Client implementation
+  browser / native library / conet-l0d
+                         │
+Layer Minus
+  entry A/C、mailbox B、OpenPGP 路由、SSE/duplex 投递
+                         │
+Local server adapter
+  conet-l0d proxy 或 application gateway
+                         │
+Origin service
+  localhost/private network 上的 HTTP API、WebSocket 或 TCP 服务
 ```
 
-Layer Minus 仍是 [PGP / 钱包转发平面](https://gitbook.conet.network/l0/using-l0.html)。`conet-l0d` 与 Chat、SilentPass 一样，是应用组合，不是新的 L0 协议。
+每层只承担一种职责：
 
-## 4. 身份（`web3://` 定位符）
+| 层 | 职责 |
+|---|---|
+| L0 | 加密的钱包地址化传输 |
+| `web3://` | 应用目标与 session 合同 |
+| `conet-l0d` | Linux server/client adapter |
+| 浏览器/原生客户端 | 跨平台用户侧实现 |
+| Origin | 现有应用逻辑 |
 
-该 URI 是 **对等定位符**，不是 ERC-4804 内容 URI。
+应用协议不修改 L0 HTTP 信封。Entry request 仍然只包含
+`{ "data": "<OpenPGP armor>" }`。
+
+## 3. 各平台产品角色
+
+| 平台 | 推荐角色 |
+|---|---|
+| Linux server | 用 `conet-l0d --proxy` 或 `--proxyDuplex` 发布本地服务 |
+| Linux client | 用 `conet-l0d --clientDuplex` 连接远端（同一逻辑口可对应多条远端） |
+| Windows / macOS | 实现 `web3://` 的浏览器扩展、浏览器客户端或原生客户端 |
+| Android / iOS | 通过 HTTPS/SSE 使用同一协议的 Web 或原生客户端 |
+| Browser | 无需 Linux daemon，完成 parse、sign、encrypt、send、receive、decrypt 与 render |
+
+这种分工让协议保持平台中立，同时提供面向生产的 Linux 参考运行时。
+
+## 4. 目标语法
+
+当前 Linux 运行时接受钱包地址化 endpoint：
 
 ```text
-web3://<host>/p2p/<service>
-
-host     = 0x + 40 hex                    → EOA
-         | <beamioTag>.web3               → 精确 tag → EOA
-service  = geth | beacon
+web3://0x<40-hex>:<port>
+web3://<exact-tag>.web3:<port>
 ```
 
-解析：
+例如：
 
-1. 直接 EOA，或 **精确** 匹配 BeamioTag（`CoNET` ≠ `CONET`）。禁止 `search-users` 的 `results[0]`。
-2. 在 AddressPGP `0x684b0ac760cEE9c9b85de36d69746420648Cf9e2` 上 `searchKey(EOA)`。
-3. 必须有 user PGP 与 mailbox route。没有 AddressPGP 的 AA 不是目的地。
-4. 分配或查找 overlay vIP。geth/beacon 只看见 `vIP:port`。
-
-routing EOA ≠ deposit keystore ≠ fee recipient。守护进程不得读取 validator 密钥。
-
-## 5. Catch 路径（客户端不要 bind overlay）
-
-广告旗标 **不是** 监听地址：
-
-| 客户端 | 广告（安全） | 绑定（不要写成 overlay） |
-| --- | --- | --- |
-| geth | `--nat=extip=<本机 vIP>` | `--http.addr` / `--authrpc.addr` 仍为 `127.0.0.1` |
-| beacon | `--p2p-host-ip=<本机 vIP>` | `--rpc-host` / `--grpc-gateway-host` 仍为 `127.0.0.1` |
-
-`--port 8400` 与 `--p2p-tcp-port=4200` 仍听 `0.0.0.0`。本机还没有 overlay 地址 **不会** 让客户端启动失败。overlay bootnode 暂时不可达时，进程仍在，只是 overlay 对等为零。
-
-Phase 1 使用 **静态** overlay 对等。crate 信封已是完整 IPv4（含 UDP）。实验室可以把 beacon `:4300` 拐上 TUN，并让 L0_ONLY 主机经 L0 连公网 DHT 服务器跑 discv5（`docs/P2.zh-CN.md`）。这不是生产 discv5 产品，也不关闭追链门。
-
-## 6. 守护进程持有的网络对象
-
-`start`（若有脏状态则先 teardown）：
-
-1. 创建 TUN `conet-l0`。
-2. `ip addr add <本机 vIP>/32 dev conet-l0`。
-3. `ip route add 100.64.0.0/10 dev conet-l0`。
-4. 创建 iptables 链 `CONET_L0D`（filter + mangle）。
-5. 首条规则：`RETURN` `127.0.0.0/8`；可选 `owner --uid-owner <validator>` `RETURN`。
-6. 只把 `OUTPUT` / `PREROUTING` 跳进该链。
-7. 写 state + pid；进入收包循环。
-
-SIGINT / SIGTERM / `stop` / `teardown`：
-
-1. 删除指向 `CONET_L0D` 的 jump。
-2. flush 并 `-X` `CONET_L0D`。
-3. 删除 overlay 路由、地址与 TUN。
-4. 删除 state 文件。
-
-操作员不用手写 `iptables`。teardown 不得删除他人规则。
-
-## 7. L0 映射（Phase 1）
-
-| 方向 | 加密目标 | HTTP |
-| --- | --- | --- |
-| `duplex_offer` | 对端 **长期 user PGP** | 入口 **A ≠ B**。Chat gossip 到现有通道 SSE。SI **不解析** `duplex_*` |
-| 独占 L0 listen | mailbox **B route PGP** | `l0_listen` 或 `mining` + `listenKind: "l0"`，经 **C ≠ B**。不得带 overlay AES。两套自有 L0 SSE；禁止在对端 B 上 guest listen |
-| `l0_connect` | **目标** mailbox **B route PGP** | 占用空闲 L0 SSE；随后同一 TCP 上 AES blob。已占用 → 409 |
-| `duplex_accept` / `duplex_reject` | 占用发起方 L0 管道上的 AES | 接收方占用 `W_I` 后的首个 AES blob |
-| Overlay IPv4（duplex 数据面） | AES 封 `duplex_frame` JSON；`payload` = `L0D1` \|\| IPv4 的 standard base64 | 占用对端 L0 管道 |
-| P1 gossip 回退（`duplex_reject` 或无 accept 或无占用管道） | 对端 **user PGP**，再 wrap 给 **B route PGP** | 入口 **A ≠ B** |
-
-HTTP 体只有 `{ "data": "<armor>" }`。本客户端不带 hop-sig 头。HTTP JSON 上不放 `NoPush`。
-
-Duplex 是 Chat gossip 上的 **应用 JSON**，加上 SI 占用管道上的 AES：`duplex_offer`、`duplex_accept`、`duplex_reject`、`duplex_frame`。发起方附 overlay AES 钥与 **会话 listen 钱包**；接收方拒绝则以 `l0_connect` 占用该 L0 SSE 并发送 `duplex_reject`，同意则回钥并附自己的会话 listen 钱包。规范：[Duplex overlay](https://gitbook.conet.network/l0/duplex-forward.html)。crate MVP 用已登记的按端口通道 EOA 作为会话 listen 身份。**禁止**发 `command: "mining"` + `listenKind: "duplex"`。**禁止**把 SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` 写成现役 SI。**要**把现役 SI `l0_listen` / `l0_connect` 写进协议页。
-
-现有 UDP forward 是另一条组合（idle 更短；不是 overlay TCP）。
-
-## 8. 生产姿态
-
-slot 关键 gossip（`SECONDS_PER_SLOT=6`）继续走 **公网 P2P**。L0 overlay 用于 NAT / 无公网 IP / 备份对等。**在** GitBook [slot 关键发表门槛](https://gitbook.conet.network/developers/l1-node.html#slot-critical-publication-gate) **对照公网 P2P 基线填齐之前**，不得把 L0-only 提议者当默认（须发布：L0 RTT P50/P95/P99；区块传到 50% 与 90% 节点的时间；attestation inclusion delay；missed slot；reorg；duplex 重连时间；Guardian 故障切换时间；UDP/discv5 丢包率）。
-
-2026-08-18 约 15 分钟实验室快照：overlay TCP RTT 约 475–750 ms，相对 `.98` 公网 peer 约 40–55 ms。这 **不是** P50/P95/P99，也 **不是** 提议者集合实测。
-
-若 overlay 流量挤在 **少数 Mailbox**，风险会从验证者 **IP** 集中变成 **Guardian 路径** 集中。生产 overlay 必须有多个独立入口、多个 Mailbox、多个 ASN、多个地区、每 overlay 端口独立 Routing EOA（`[[l0.channels]]`），以及自动重连 **并** 切到另一个 B。同一 B 上的按端口 EOA **不能** 消除 Mailbox 集中。占用重试已在 crate 内；跨 Guardian 故障切换不是已交付产品。
-
-## 9. 安全
-
-- 不得记录私钥、完整 PGP armor 或会话密钥。
-- 不得捕获 loopback 或 validator gRPC。
-- 混合模式：不得 mark 全部公网 8400/4200/4300。
-- 需要 `CAP_NET_ADMIN`；能降权则降权。
-
-## 10. 分期
-
-| 阶段 | 范围 |
-| --- | --- |
-| **MVP** | **已验收（2026-08-17）。** Linux 命令；TUN + iptables 生命周期；定位符解析；静态对等表；收包计数；L0 客户端桩 |
-| **P1** | **已在 crate；`[l0]` 默认关。** 钱包对钱包 TCP 字节流。对端应用回 `duplex_accept` 时优先 **应用层 duplex**（现有 Chat gossip）；否则保持 **P1 gossip**（user-PGP 信封 + mailbox wrap）。静态 overlay bootnode。crate 把 overlay 信封加密给对端 **user PGP**，再 wrap `{ data, NoPush: true }` 给 mailbox **B route PGP**，仅在 `[l0].enabled` 且对端有 user+route PGP 文件与 entry 时 `POST { "data" }`。入站：解密 user-PGP armor → overlay 信封 → 原始 IPv4 入队写回 TUN（`routing_key_file` 须为 OpenPGP 私钥证书）**已在 crate**。Listen HTTP+SSE worker **已在 crate**：enabled 加上 `listen_entries`（C ≠ B）、`mailbox_route_pgp_file`（本机 B route **公钥**）、`routing_eoa`、`routing_key_file` 与 `routing_eth_key_file`（hex secp256k1；recovered 地址须等于 `routing_eoa`；不是 OpenPGP）。可选 `[[l0.channels]]` 为 overlay 端口 8400 / 4200 / 4300 各用一个 EOA + SSE（出站加密给该端口的对端 user PGP；按知名源或目的端口分类）。未配 channels 时仍是一个 EOA。`:4300` 是 overlay IPv4，不是 `udp_relay`。应用层 host listen **就是**现有 Chat SSE（`mining` + `listenKind: "chat"`，listen **不得**带 overlay AES）。对端不回 `duplex_accept` 则保持 P1 gossip。EIP-191 签成 SI `{ message, signMessage }` base64。Listen 入站对齐 SI `forWardPGPMessageToClient` 的原始 JSON `{ "data": "<armor>" }`（与 Chat `handleInbound` 相同），不再只认 SSE armor 行。测试只用 wiremock。**经授权**的实验室可开 `[l0]`。**禁止**把 SI `duplex_*` / `p2p_stream_*` / `listenKind: "l1p2p"` 写成现役 SI。**2026-08-17 23:12Z L0-only：** 出站 HTTP 200，无入站 TUN 写回（当时只扫 SSE）。**23:30Z**（只重启 `conet-l0d`）：两机 TUN 均有入站 IPv4，且 overlay geth TCP 已通（`.45` `100.64.0.5` ↔ `.98` `100.64.0.6:8400`）。**2026-08-18：** 授权 L0_ONLY `.45` 通告 overlay vIP `100.64.0.5`；overlay geth + beacon TCP 已 ESTAB；IPv4 合批 + POST 并发 32 / 队列 512（两机必须同升二进制）。该二进制之后 overlay queue-full 为 0；追链剩余限速是 Prysm initial-sync（约 3.2 块/秒、约 15 小时）。EL 仍为 `0x0`。只读抽检：`scripts/watch-l0-follow.sh`。追链门仍开。`.98` 与生产 proposer 仍通告公网 IP。HTTP 200 ≠ 投递。 |
-| **P2** | **实验室通讯已验收；不是产品。** crate 已运 IPv4/UDP — 不必再做 datagram 适配器。2026-08-18 实验室：overlay UDP 回声与 `:4300`（直发 + 公网 ENR steer）已到对端 TUN。随后 L0_ONLY `.45` 放弃静态 `--peer`，经 L0 连上 `.98` DHT 服务器（`.98` 用 `--p2p-static-id`；bootstrap ENR；allowlist = overlay + 枢纽公网 `/32`；TCP/UDP steer DNAT；隔离链仍丢未 steer 的公网 P2P）。DNAT 之后 `.45` `ss` 可能显示枢纽公网 `:4200`（原目的，不是漏公网）；overlay 证明是 TUN VIP + 隔离 DROP=0。若后来 `connected` 掉线，先重打 `overlay-dht-steer.sh`（清幽灵 conntrack；**不要**为此重启 EL/CL）。仅当 Prysm 仍停在拨号 backoff 时才 `restart-beacon`（**2026-08-18 约 17:28Z** `.45` 恢复 `connected=1` 与 `Processing blocks`；启动后不要立刻再打 steer）。第一分钟 `suitable=0` 属预期。EL 仍为 `0x0` 而 `head_slot` 在涨 = CL 滞后。见 `docs/P2.zh-CN.md`。 |
-| **P3** | 混合生产（公网 P2P + L0 备份）；**已发布** slot 关键指标 vs 公网 P2P；多入口 / 多 Mailbox / 多 ASN 多样性 |
-
-## 11. 真相来源
-
-| 产物 | 角色 |
-| --- | --- |
-| [github.com/CoNET-project/CoNET-L0D](https://github.com/CoNET-project/CoNET-L0D) | 公开 crate 真相来源 |
-| 本成对白皮书 + `RULES.md` | 设计与工程约束 |
-| `docs/MVP.md` | 已验收的 crate MVP |
-| `docs/P1.md` | Overlay 线合同：应用层 duplex + P1 gossip 回退；`[l0]` |
-| `docs/P2.md` | 实验室 overlay UDP / DHT 口通讯 + 经 L0 的现役 discv5（不是已关闭的 P2 / 生产产品） |
-| `config/conet-l0d.example.toml` | overlay 表示例 |
-| `systemd/conet-l0d.service` | 进程持有 TUN/iptables；unit 不得写裸 `iptables` |
-| GitBook Applications | 操作员 how-to（公开书英语） |
-| GitBook Developers | CLI、配置、线合同 |
-| GitBook L0 | 转发平面 — 不要在此分叉 |
-
-## 相关
-
-- [How to use Layer Minus](https://gitbook.conet.network/l0/using-l0.html)
-- [Run an L1 node](https://gitbook.conet.network/developers/l1-node.html)
-- [SilentPass](https://gitbook.conet.network/applications/silentpass-vpn.html) — 出口，不是 L1 P2P
-- [Wallet-addressed peer identity](https://gitbook.conet.network/l0/wallet-address-p2p.html)
-
-## 12. 临时聆听身份与传输拆线（2026-08-20 重设计）
-
-旧的确定性 `sessionId`、钱包/端口关联方式已经废弃，不再作为兼容目标。
-每次双向管道建立都生成新的 32 字节随机 opaque `pipe_handle`。它不能由任一
-钱包、端口、IP 或路由推导。
-
-首个 `duplex_offer` 是 bootstrap 请求，可以先加密到接收方长期公共用户
-PGP，以便 mailbox 找到接收方。请求中携带发起方专用的 listen 管道 PGP。
-接收方接受后，`duplex_accept` 必须加密到请求中提及的
-`listenUserPgp`，不能再加密到发起方长期公共用户 PGP。响应携带接收方自己
-专用的 listen 管道 PGP 和协商出的 AES 密钥。完成交换后，双向控制流只使用
-双方各自的专用管道 PGP；发起方不再使用接收方公共用户 PGP。
-Mailbox/Entry SI 只能把 handle 当作本跳 opaque 值，不能跨跳关联。
-
-SI 的知识边界严格限制为：
-
-- mailbox SI 只知道自己的等待池和自己持有的 occupied TCP；
-- entry SI 只知道本跳 handle 和 socket 生命周期；
-- 任一 SI 都不能获得端到端 AES 密钥或完整路径；
-- 不再发送 SSE 侧 `l0_pipe_end`、钱包、connector 或确定性 session 通知。
-
-`l0_pipe_end` 现在只允许作为 occupied TCP 控制行。它必须出现在已经绑定
-同一个 opaque `pipe_handle` 的 TCP 连接上：
-
-```json
-{
-  "type": "l0_pipe_end",
-  "pipe_handle": "<64 位小写 hex>",
-  "reason": "transport_closed"
-}
+```text
+web3://0x1111111111111111111111111111111111111111:443
+web3://ExampleMerchant.web3:9443
 ```
 
-不得携带 wallet 或 connector。缺失、格式错误或不匹配的 handle 必须拒绝。
-SSE 解析器绝不能把该对象当成远端拆线命令。entry-to-entry 传输在响应提交前
-使用 HTTP `410`，响应已经进入 keep-alive 后立即 FIN/RST；发送方收到失败后
-必须停止 packet loop，不得继续向失效目标写包。
+Host 标识远端应用 owner，port 标识逻辑应用服务。必须精确解析 tag；
+不得隐式选取前缀搜索的第一条结果。
 
-这样恶意 listener 不能把健康发送方变成 packet 放大器：只有当前绑定的传输
-才能结束自身，重连仍受限于已有的有界 retry/backoff 与占用上限。SI 如需
-跨跳传递拆线，只能在内部使用 opaque handle，不能暴露为应用消息。
+面向浏览器的资源可增加 path 与 query：
 
-## 13. occupied 管道存活超时
+```text
+web3://0x1111111111111111111111111111111111111111/dashboard?range=7d
+```
 
-occupied 双向管道的发送方负责在每个两分钟窗口内发送至少一段应用数据。
-没有 overlay IPv4 帧时，`conet-l0d` 每 60 秒发送一个加密的
-`duplex_ping` 应用 blob。这是普通双工数据，不是伪造的 IP 数据包。
+签名 request 承载 canonical target、path 与 query。客户端可以展示人类可读别名，
+但加密前必须解析到精确钱包身份。
 
-只有专用 L0 listen SSE 适用该无活动规则；普通 Chat SSE 继续使用 mailbox
-自己的 heartbeat 语义。L0 聆听方以收到的字节作为存活信号：连续 120 秒没有
-任何入站字节，就将管道视为已废弃，关闭自己的 SSE，并清除本地 occupied
-writer。对端观察到 EOF 后必须停止向该管道实例继续写入。
+仓库还识别 `/p2p/geth` 与 `/p2p/beacon` peer locator，用于受控 L1 实验。
+这些 locator 只是应用组合之一，不是通用协议的定义。
 
-双向 client 只有在自己的聆听 SSE 已终止、并且新的 listen 已成功建立后，
-才可以发起新的 `l0_connect`。新连接必须使用新的请求和新的 `pipe_handle`；
-不得复用旧的 `pipe_tx`。重连仍受现有 retry/backoff 与占用上限约束。
+## 5. Session profile
 
-### 会话角色与逻辑端口（禁止按 port 全局挂上游）
+### 5.1 Request/response
 
-每条 duplex 线路已有独立 `pipe_handle`。**不得**仅因 `session.port` 与
-`[[l0.proxy_duplex]]` 相同，就把任意占用 pipe 接到本机 geth/beacon。
+`--proxy HOST:PORT` 发布本地 request/response upstream。签名应用 request
+路由到钱包目标，由 server adapter 校验，转发到配置的 origin，再加密给调用方
+已登记的 user PGP key。
 
-实现要求：仅当会话由入站 proxy 握手（`mainWallet:port` + `firstChunk`）
-分配、角色为 `DuplexLineRole::Proxy` 时，才允许 `maybe_start_proxy_drain`
-连接本地上游。`--clientDuplex` / `l0.client_duplex` 产生的会话为
-`DuplexLineRole::Peer`，即使目标应用口是 `:8400` / `:4200` 也不得误挂
-本机 proxy 上游。
+该 profile 适合有边界的 HTTP 风格操作。
 
-同一 daemon 可同时配置 client 与 proxy：client 本地 listen 必须使用空闲
-端口（`web3://<billing_eoa>:8400@18400`、`:4200@14200`）；对外拨号的
-`mainWallet` 必须是对端 `billing_eoa`，不是 channel `routing_eoa`。
+### 5.2 持续双向传输
 
-## 14. 临时通道由主钱包计费（2026-08-21）
+`--proxyDuplex HOST:PORT` 发布持续双向 TCP 服务。
+`--clientDuplex web3://HOST:PORT` 把选定远端服务提供为
+`127.0.0.1` TCP endpoint。同一逻辑口可对应多条远端；每条远端各自一个
+loopback 监听。首选绑定 `PORT`；若已被占用则依次尝试 `PORT+10000`、
+`PORT+20000`……。同一 `(host, PORT)` 重复列出则拒绝。
 
-当明确的新线路请求以 `mainWallet:port` 寻址时，`conet-l0d` 才为该线路生成
-仅存在于进程内存的临时通信钱包与 OpenPGP 身份，并在处理任何 offer 前，
-通过现有 AddressPGP 注册接口登记临时用户 PGP 与 route key。
-`regiestChatRoute` 的 HTTP 200 只表示入队成功：mailbox 仍读 AddressPGP
-的 `searchKey`，因此 daemon 必须等到 CoNET RPC 上能看到该 `routeKeyID`
-后才打开 `l0_listen`。临时钱包因此可以被路由，但绝不是付款方。
+每个被接受的本地连接都会创建独立应用 session：
 
-`duplex_offer` 加密给该 `mainWallet:port` 的目标 **user** PGP。接收端按
-消息 PKESK 收件人选择解密密钥，不得按 listen 钱包列表顺序逐个试解。
-若恢复出的 `ingress_wallet` 不是该端口配置的 routing EOA，必须拒绝 offer。
+```text
+local TCP connection
+    → duplex offer
+    → remote acceptance
+    → bidirectional encrypted frames
+    → explicit close or reconnect
+```
 
-Mailbox 命令的 `walletAddress` 保留临时钱包，另携带配置的付费账户
-`billingWallet`，并由付费账户制作 EIP-191 签名。CoNET-SI 使用
-`billingWallet` 验签，同时保留 `walletAddress` 作为路由和 mailbox subject，
-并将 hop 用量记到计费钱包。没有 `billingWallet` 时，SI 保留旧规则：签名
-恢复地址必须等于 `walletAddress`。
+Session ID、顺序、上限与关闭行为属于应用 stream 合同。L0 提供传输，
+不解释 origin 协议。
 
-每个明确的新线路请求拥有独立的临时钱包、PGP 登记、AES 密钥、occupied
-pipe、opaque handle 与上游 socket。多个 client 可以共享逻辑端口，但不得
-共享上述任何身份或传输资源。收到 `duplex_offer` 只能绑定已经登记的
-`pipe_handle` 或临时 `listenWallet`；未知、过期或有歧义的 offer 必须拒绝，
-不得分配身份、创建 session 或发起新的 `l0_connect`。登记或计费失败必须
-fail-closed，不能静默使用未登记的临时路由。
+## 6. 签名 Web request 网关
+
+`conet-l0d gateway` profile 把钱包地址化 request 映射到 loopback HTTP origin。
+
+已实现的 v1 request 包含：
+
+- `type = "conet_web3_request_v1"`；
+- 唯一 `requestId`；
+- 调用方钱包 `from`；
+- `target = web3://<gateway-eoa>/...`；
+- method、path、query、选定 headers 与可选 body；
+- nonce 与 expiry；
+- 对 canonical request JSON 的 EIP-191 签名。
+
+网关执行：
+
+1. 用自身 user PGP key 解密 request；
+2. 检查 version、expiry、method、path、target 与 signature；
+3. 只转发到已配置的 loopback origin；
+4. 限制 request/response 大小与执行时间；
+5. 把 `conet_web3_response_v1` 加密给调用方已登记的 user PGP key；
+6. 通过普通 L0 entry 发送 response。
+
+当前网关只允许 `GET` 与 `HEAD`。更广泛的 method、delegation、payment
+与 origin identity header 必须通过后续协议版本定义，不得依靠未文档化行为。
+
+## 7. L0 路由与隐私
+
+该协议遵循现有 A/B/C mailbox 模型：
+
+| 动作 | 加密目标 | 网络入口 |
+|---|---|---|
+| 应用投递 | 收件人 user PGP | 与 mailbox B 不同的健康 entry A |
+| Receive/listen command | mailbox B route PGP | 与 B 不同的健康 entry C |
+| Response | 调用方 user PGP | 响应方选择的健康 entry |
+
+Entry 与 mailbox 节点只获得路由所必需的信息。它们不会成为受信应用 origin，
+也不得获得 request body 明文。
+
+客户端不得通过直连 mailbox B 进行“优化”。直连会暴露路由位置，
+并偏离协议隐私模型。
+
+## 8. 身份与授权
+
+`web3://` 把应用访问绑定到密码学身份：
+
+1. target 解析为精确钱包；
+2. payload 加密给 target 的 user PGP key；
+3. request 由调用方 EOA 签名；
+4. server 校验签名与 target；
+5. response 加密给调用方 user PGP key。
+
+应用可在身份校验后增加自身授权策略。协议证明谁签署了 request，
+不代表每位签署者自动拥有所有资源权限。
+
+日志不得写入私钥、完整 PGP 密文或应用 body 明文。
+
+## 9. Linux 运行时配置
+
+公开配置以应用 endpoint 为中心：
+
+```toml
+[l0]
+entries = ["https://example-entry.conet.network"]
+listen_entries = ["https://another-entry.conet.network"]
+routing_eoa = "0x..."
+routing_key_file = "/etc/conet-l0d/app-secret.asc"
+routing_eth_key_file = "/etc/conet-l0d/app-eip191.key"
+mailbox_route_pgp_file = "/etc/conet-l0d/mailbox-route-public.asc"
+client_duplex = ["web3://ExactPeer.web3:9443"]
+
+[[l0.proxy_duplex]]
+host = "127.0.0.1"
+port = 9443
+```
+
+运营者应让 origin service 只监听 loopback 或 private network，
+并且只发布预期的逻辑 port。
+
+## 10. 生命周期与可观测性
+
+Linux 运行时提供：
+
+| 命令 | 用途 |
+|---|---|
+| `check-config` | 不打开 session，仅校验配置 |
+| `resolve` | 解析并解析到 `web3://` locator |
+| `start` | 运行已配置的 server proxy 与 client endpoint |
+| `gateway` | 运行签名 Web request 网关 |
+| `status` | 报告已记录 runtime state |
+| `stop` | 向已记录进程发信号并清理 runtime state |
+| `teardown` | 删除遗留的 daemon-owned runtime state |
+
+有效证据包括：
+
+- 精确钱包或 tag 解析；
+- 已发布与本地 endpoint 地址；
+- 被接受的 request 或 duplex session ID；
+- 加密 frame 计数与有界 queue 状态；
+- response status 或 stream close reason；
+- reconnect attempt。
+
+进程存活不能证明应用 request 或 stream 已完成。
+
+## 11. 故障模型
+
+客户端与运营者应区分：
+
+| 故障 | 含义 |
+|---|---|
+| Locator 解析失败 | 目标无效、有歧义或未登记 |
+| Entry request 失败 | 所选 entry 不可用；尝试另一健康 entry |
+| Mailbox 拒绝路由 | 目标 route 不属于该 mailbox |
+| Signature 失败 | 调用方身份或 canonical request bytes 不匹配 |
+| Origin connect 失败 | 已发布的本地服务不可用 |
+| Stream close | 按有界客户端策略重连 |
+| Response timeout | 没有完成可信应用响应 |
+
+传输失败不得转换为“成功但空”的响应。应用应根据自身缓存策略保留上次可信数据。
+
+## 12. 可选 L1 组合
+
+选定 geth 或 Prysm TCP 数据流可用于受控 Linux-to-Linux duplex 实验。
+该组合：
+
+- 复用同一钱包目标与 stream 合同；
+- 保留 geth 与 Prysm identity；
+- 要求在 L1 客户端层独立验收；
+- 与公开 L1 节点加入指南分离。
+
+这不代表 CoNET L1 共识已普遍迁移到 L0。有限实验记录见
+[`docs/P2.zh-CN.md`](../docs/P2.zh-CN.md)。
+
+## 13. 成熟度
+
+| 能力 | 状态 |
+|---|---|
+| 钱包/tag locator 解析 | 已实现 |
+| Linux request/response proxy | 已实现 |
+| Linux duplex server/client runtime | 已实现 |
+| 签名 v1 GET/HEAD gateway | 已实现 |
+| 浏览器扩展/client 组合 | 早期实现 / 持续演进 |
+| 跨平台协议 SDK | 目标 |
+| Delegation、payment scope、正式 canonical-byte 规范 | Draft |
+| L1 TCP 组合 | 实验室已验证，不是公开默认路径 |
+
+文档必须保留这些区别。Locator 或 Linux runtime 可用，不代表所有浏览器能力
+或未来协议扩展都已达到生产状态。
+
+## 14. 非目标
+
+该协议不是：
+
+- 通用网络接口；
+- VPN 产品；
+- 新公开 SI 命令族；
+- 直接暴露 origin service 的理由；
+- 普通 Web endpoint 上 TLS 的替代品；
+- 公开 L1 P2P 加入路径的替代品；
+- 发明新域名或中心化路由服务的许可。
+
+## 结论
+
+持久抽象是应用协议，而不是某个操作系统 adapter。Layer Minus 提供私密的钱包地址化传输；
+`web3://` 定义应用如何命名和交换数据；`conet-l0d` 提供 Linux 运行时；
+浏览器或原生客户端提供跨平台用户体验。

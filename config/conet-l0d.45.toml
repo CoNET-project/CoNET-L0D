@@ -1,14 +1,10 @@
 # Overlay table for the 74.208.224.45 MVP lab (peer of 198.251.77.98).
-# start/stop/teardown still need CAP_NET_ADMIN (sudo).
 # Do not bind geth/beacon RPC to local_vip.
 # L0 byte-stream: crate P1 objects exist, but [l0] stays off on this lab host.
-# TUN counts overlay IPv4; it does not encapsulate to the peer public IP.
-# Keep geth/beacon advertise on the public IP until a live L0 stream exists.
+# Keep EL/CL public advertisement separate from the lab overlay endpoint.
 
-tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
 local_vip = "100.64.0.5"
-iptables_chain = "CONET_L0D"
 state_path = "/home/peter/conet-l0d-lab/run/state.json"
 
 [identity]

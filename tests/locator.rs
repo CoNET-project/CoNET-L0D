@@ -28,11 +28,11 @@ fn check_config_example() {
 }
 
 #[test]
-fn resolve_eoa() {
+fn resolve_eoa_resource() {
     let out = Command::new(bin())
         .args([
             "resolve",
-            "web3://0x1111111111111111111111111111111111111111/p2p/geth",
+            "web3://0x1111111111111111111111111111111111111111/app",
             "--config",
         ])
         .arg(example_config())
@@ -41,17 +41,19 @@ fn resolve_eoa() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("0x1111111111111111111111111111111111111111"));
+    assert!(stdout.contains("\"kind\": \"resource\""));
+    assert!(stdout.contains("\"path_and_query\": \"/app\""));
     assert!(stdout.contains("100.64.0.5"));
 }
 
 #[test]
 fn resolve_exact_tags_differ() {
     let a = Command::new(bin())
-        .args(["resolve", "web3://CoNET.web3/p2p/geth"])
+        .args(["resolve", "web3://CoNET.web3/profile"])
         .output()
         .expect("run");
     let b = Command::new(bin())
-        .args(["resolve", "web3://CONET.web3/p2p/geth"])
+        .args(["resolve", "web3://CONET.web3/profile"])
         .output()
         .expect("run");
     assert!(a.status.success());
@@ -64,9 +66,27 @@ fn resolve_exact_tags_differ() {
 }
 
 #[test]
+fn resolve_stream_target() {
+    let out = Command::new(bin())
+        .args(["resolve", "web3://ExampleMerchant.web3:9443", "--config"])
+        .arg(example_config())
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"kind\": \"stream\""));
+    assert!(stdout.contains("\"logical_port\": 9443"));
+    assert!(stdout.contains("\"tag\": \"ExampleMerchant\""));
+}
+
+#[test]
 fn reject_results_zero() {
     let out = Command::new(bin())
-        .args(["resolve", "web3://results[0]/p2p/geth"])
+        .args(["resolve", "web3://results[0]/app"])
         .output()
         .expect("run");
     assert!(!out.status.success());
@@ -88,8 +108,5 @@ fn start_is_linux_only_on_macos() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        err.contains("Linux") || err.contains("CAP_NET_ADMIN"),
-        "{err}"
-    );
+    assert!(err.contains("Linux"), "{err}");
 }

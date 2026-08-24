@@ -68,9 +68,11 @@ alwaysApply: true
    - Spoke overlay geth 仍 `eth_blockNumber=0x0` 而 CL 在涨 = EL 滞后，**不要**据此重启 geth
    - 验 geth 未动：读 **`geth.pid`**（`.45` HTTP 常为 `:8545`；`.98` 实验室 HTTP 为 **`:8889`**，不是 `:8545`）
 
-## 3b. Overlay 静态 peer 测 CL sync（2026-08-20）
+## 3b. Overlay 静态 peer 测 CL sync（2026-08-20，历史 isolate 单 hub）
 
-测 **spoke overlay 追链** 时用 lab-only 双端口 toml（`:8400` + `:4200`），**不要**挂生产 `.82`、**不要** `dual.toml`、本测不必开 `:4300` / `L0_DHT`。
+该节是 **历史 isolate 单 hub 实验**，不是站立 `.45` join。站立 `.45` 的 geth/beacon **必须同时连 `.82` + `.98`**（stream-only：本机 `127.0.0.1:18400/:14200` 接 `.82`，公网 `:8400/:4200` 接 `.98`），见 `conet-l0d-45-dual-hub.mdc`。**不要**启用完整 TUN mesh `l0-dual-hub.env`。
+
+测 **spoke overlay isolate 单 hub 追链** 时用 lab-only 双端口 toml（`:8400` + `:4200`），**不要**挂完整 `dual.toml` TUN mesh、本测不必开 `:4300` / `L0_DHT`。
 
 1. Bounce **仅** `conet-l0d`：**先 hub，再 spoke**；两侧 `pipe_tx` 须同时有 `port=4200` 与 `8400`。
 2. 两机 `overlay-beacon-listen-dnat.sh apply`（排除 `:8400`）。

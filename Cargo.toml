@@ -2,7 +2,7 @@
 name = "conet-l0d"
 version = "0.1.0"
 edition = "2021"
-description = "CoNET L0 overlay daemon: catch geth/beacon overlay P2P and own TUN + iptables lifecycle"
+description = "Linux runtime for wallet-addressed web3:// services over CoNET Layer Minus"
 license = "MIT"
 publish = false
 repository = "https://github.com/CoNET-project/CoNET-L0D"

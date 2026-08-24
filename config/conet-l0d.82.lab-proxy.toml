@@ -1,15 +1,13 @@
-# Lab: production hub .82 as **proxy-server** L0 (no TUN/iptables).
-# Each duplex line is delivered directly to its configured upstream.
+# Lab: production hub .82 as a direct-upstream stream server.
+# Each application stream is delivered to its configured upstream.
 # Upstream targets = local geth :8400 + beacon :4200.
 # Billing / offer match = mainWallet 0x66dC…; each accepted client line gets
 # a fresh temporary listen identity.  The proxy can therefore multiplex .45
 # and .98 on the same logical mainWallet:8400 / mainWallet:4200.
 # Bounce only conet-l0d (hub first). Do not restart geth/beacon/validator unless authorized.
 
-tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
 local_vip = "100.64.0.7"
-iptables_chain = "CONET_L0D"
 state_path = "/home/peter/conet-l0d-lab/run/state-lab-proxy.json"
 
 [identity]

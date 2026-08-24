@@ -28,7 +28,7 @@ Beacon on `.45` still runs `--no-discovery`; natural discv5 is ~0. Traffic in th
 | `pipe_queue_full` | 0 | 0 |
 | `l0_connect` pipe failed | **3** (all sessions) | **3** |
 | POST failed | 0 | 0 |
-| TUN `tx_dropped` / `rx_dropped` | 0 / 0 | 0 / 0 |
+| local overlay endpoint `tx_dropped` / `rx_dropped` | 0 / 0 | 0 / 0 |
 
 AES share of `:4300` in the window is tiny (**4/60** spoke batches) because pipes died ~10 s after probes began; the rest is healthy P1 fallback with identical batch shape.
 

@@ -1,6 +1,6 @@
 use crate::config::{DaemonConfig, ValidatedConfig};
 use crate::error::L0dError;
-use crate::locator::Locator;
+use crate::locator::{ClientTarget, Locator, LocatorHost};
 use crate::netops;
 use crate::state::RuntimeState;
 use serde_json::json;
@@ -46,10 +46,8 @@ fn acquire_instance_lock(state_path: &Path) -> anyhow::Result<InstanceLock> {
 pub fn check_config(path: &Path) -> anyhow::Result<()> {
     let cfg = load_validated(path)?;
     println!("ok");
-    println!("tun            {}", cfg.raw.tun_name);
-    println!("overlay        {}", cfg.overlay.display());
-    println!("local_vip      {}", cfg.local_vip);
-    println!("iptables_chain {}", cfg.raw.iptables_chain);
+    println!("network        {}", cfg.overlay.display());
+    println!("local_endpoint {}", cfg.local_vip);
     println!("identity       {}", cfg.identity.display());
     println!("peers          {}", cfg.peers.len());
     println!("l0.enabled     {}", cfg.l0.enabled);
@@ -59,11 +57,7 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
     println!("l0.listen      {}", cfg.l0.listen_entries.len());
     println!("l0.channels    {}", cfg.l0.channels.len());
     println!("l0.proxies     {}", cfg.l0.proxies.len());
-    println!(
-        "l0.clients     {} request/response, {} duplex",
-        cfg.clients.len(),
-        cfg.client_duplex.len()
-    );
+    println!("l0.client_duplex {}", cfg.client_duplex.len());
     for (target, endpoint) in cfg.client_mappings() {
         println!("client         {target} -> {endpoint}");
     }
@@ -123,27 +117,65 @@ pub fn check_config(path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn resolve(uri: &str, config: Option<&Path>) -> anyhow::Result<()> {
-    let locator = Locator::parse(uri)?;
-    let mut vip = None;
-    if let Some(path) = config {
-        let cfg = load_validated(path)?;
-        vip = cfg.lookup_locator(&locator).map(|ip| ip.to_string());
+    match Locator::parse(uri) {
+        Ok(locator) => {
+            let mut local_endpoint = None;
+            if let Some(path) = config {
+                let cfg = load_validated(path)?;
+                local_endpoint = cfg.lookup_locator(&locator).map(|ip| ip.to_string());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "locator": locator.display(),
+                    "kind": "resource",
+                    "host": locator_host_json(&locator.host),
+                    "path_and_query": &locator.path_and_query,
+                    "compatibility_service": locator.service().map(|service| service.as_str()),
+                    "local_endpoint": local_endpoint,
+                    "note": "web3:// identifies a wallet-addressed application resource. Exact BeamioTag only (CoNET ≠ CONET)."
+                }))?
+            );
+            Ok(())
+        }
+        Err(resource_error) => match ClientTarget::parse(uri) {
+            Ok(target) => {
+                let mut local_endpoint = None;
+                let target_display = target.display();
+                if let Some(path) = config {
+                    let cfg = load_validated(path)?;
+                    local_endpoint = cfg
+                        .client_mappings()
+                        .into_iter()
+                        .find(|(configured, _)| configured == &target_display)
+                        .map(|(_, endpoint)| endpoint.to_string());
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "locator": target_display,
+                        "kind": "stream",
+                        "host": locator_host_json(&target.host),
+                        "logical_port": target.port,
+                        "compatibility_service": target.service().map(|service| service.as_str()),
+                        "local_endpoint": local_endpoint,
+                        "note": "web3:// identifies a wallet-addressed application stream. Exact BeamioTag only (CoNET ≠ CONET)."
+                    }))?
+                );
+                Ok(())
+            }
+            Err(stream_error) => Err(anyhow::anyhow!(
+                "invalid web3:// URI: resource form failed ({resource_error}); stream form failed ({stream_error})"
+            )),
+        },
     }
-    let host = match &locator.host {
-        crate::locator::LocatorHost::Eoa(eoa) => json!({ "kind": "eoa", "eoa": eoa }),
-        crate::locator::LocatorHost::Tag(tag) => json!({ "kind": "tag", "tag": tag }),
-    };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "locator": locator.display(),
-            "service": locator.service.as_str(),
-            "host": host,
-            "vip": vip,
-            "note": "web3:// is a peer locator, not ERC-4804 content. Exact BeamioTag only (CoNET ≠ CONET)."
-        }))?
-    );
-    Ok(())
+}
+
+fn locator_host_json(host: &LocatorHost) -> serde_json::Value {
+    match host {
+        LocatorHost::Eoa(eoa) => json!({ "kind": "eoa", "eoa": eoa }),
+        LocatorHost::Tag(tag) => json!({ "kind": "tag", "tag": tag }),
+    }
 }
 
 pub fn status(path: &Path) -> anyhow::Result<()> {
@@ -157,16 +189,11 @@ pub fn status(path: &Path) -> anyhow::Result<()> {
             let alive = netops::process_alive(state.pid);
             println!("{}", if alive { "running" } else { "dirty" });
             println!("pid      {}", state.pid);
-            println!("tun      {}", state.tun_name);
-            println!("overlay  {}", state.overlay_cidr);
-            println!("vip      {}", state.local_vip);
-            println!("chain    {}", state.iptables_chain);
+            println!("network  {}", state.overlay_cidr);
+            println!("endpoint {}", state.local_vip);
             println!("started  {}", state.started_at);
             if !alive {
-                println!(
-                    "hint     sudo conet-l0d teardown --config {}",
-                    path.display()
-                );
+                println!("hint     conet-l0d teardown --config {}", path.display());
             }
         }
     }
@@ -222,12 +249,12 @@ pub async fn start_with_overrides(
         tracing::info!(
             proxies = cfg.l0.proxies.len(),
             proxy_duplex = cfg.l0.proxy_duplex.len(),
-            "proxy-server mode: no TUN or iptables; accepting L0 proxy lines"
+            "web3 server mode: accepting Layer Minus proxy lines"
         );
     } else if !packet_mode {
         tracing::info!(
             client_duplex = cfg.client_duplex.len(),
-            "duplex client mode: no TUN or iptables; local TCP listeners carry raw stream bytes"
+            "web3 client mode: local TCP endpoints carry bidirectional application streams"
         );
     }
     for (target, endpoint) in cfg.client_mappings() {
@@ -247,17 +274,15 @@ pub async fn start_with_overrides(
         tracing::info!(
             proxies = cfg.l0.proxies.len(),
             proxy_duplex = cfg.l0.proxy_duplex.len(),
-            "conet-l0d started in proxy-server mode (no TUN, route, or iptables)"
+            "conet-l0d web3 server started"
         );
     } else if packet_mode {
         tracing::info!(
-            tun = %cfg.raw.tun_name,
-            vip = %cfg.local_vip,
-            chain = %cfg.raw.iptables_chain,
-            "conet-l0d started; owns TUN + iptables"
+            endpoint = %cfg.local_vip,
+            "conet-l0d request/response runtime started"
         );
     } else {
-        tracing::info!("conet-l0d started in duplex client mode (no TUN, route, or iptables)");
+        tracing::info!("conet-l0d web3 duplex client started");
     }
 
     let run = async {
@@ -351,11 +376,7 @@ async fn teardown_inner(cfg: &ValidatedConfig) -> Result<(), L0dError> {
         netops::uninstall(cfg, state.as_ref()).await?;
     }
     RuntimeState::remove(&cfg.raw.state_path)?;
-    if !owns_network {
-        tracing::info!("proxy-server resources removed (no TUN / route / iptables)");
-    } else {
-        tracing::info!("owned TUN / route / {} removed", cfg.raw.iptables_chain);
-    }
+    tracing::info!("conet-l0d runtime state removed");
     Ok(())
 }
 

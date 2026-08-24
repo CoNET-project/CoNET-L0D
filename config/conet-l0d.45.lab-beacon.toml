@@ -2,10 +2,8 @@
 # Pair with config/conet-l0d.98.lab-beacon.toml on hub.
 # No prod .82 channels (avoids extra occupy). UDP :4300 omitted; L0_ONLY uses static TCP --peer.
 
-tun_name = "conet-l0"
 overlay_cidr = "100.64.0.0/10"
 local_vip = "100.64.0.5"
-iptables_chain = "CONET_L0D"
 state_path = "/home/peter/conet-l0d-lab/run/state.json"
 
 [identity]
