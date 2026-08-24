@@ -1724,6 +1724,11 @@ impl L0Client {
         let seq = self.proxy_seq.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_for_cleanup = cancel.clone();
+        let listen_owners = self.listen_owners.clone();
+        let listen_wallet = sess
+            .accept_identity
+            .as_ref()
+            .map(|identity| identity.wallet_address().to_owned());
         tokio::spawn(async move {
             if !matches!(
                 tokio::time::timeout(
@@ -1737,6 +1742,9 @@ impl L0Client {
                     session = %session_id,
                     "temporary proxy route/listen did not become ready"
                 );
+                if let Some(wallet) = listen_wallet.as_deref() {
+                    let _ = listen_owners.release_by_wallet(wallet);
+                }
                 receiver_registry
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1884,6 +1892,9 @@ impl L0Client {
                 );
             }
             cancel_for_cleanup.store(true, Ordering::Release);
+            if let Some(wallet) = listen_wallet.as_deref() {
+                let _ = listen_owners.release_by_wallet(wallet);
+            }
             receiver_registry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2868,6 +2879,25 @@ fn try_send_proxy_frame(
     Ok(())
 }
 
+/// Dropping a local TCP task must abort its exclusive `l0_listen` so Entry C
+/// sees FIN/RST and mailbox B releases the slot. Beacon kill only closes this
+/// socket; without this guard the listen worker keeps POSTing SI.
+struct ReleaseListenOnDrop {
+    owners: listen::ListenOwnerRegistry,
+    wallet: String,
+}
+
+impl Drop for ReleaseListenOnDrop {
+    fn drop(&mut self) {
+        if self.owners.release_by_wallet(&self.wallet) {
+            tracing::info!(
+                eoa = %self.wallet,
+                "released l0_listen after local TCP or handshake ended"
+            );
+        }
+    }
+}
+
 async fn run_dynamic_local_tcp_stream(
     stream: TcpStream,
     duplex: Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
@@ -2955,6 +2985,10 @@ async fn run_dynamic_local_tcp_stream(
             (identity, false)
         }
     };
+    let _listen_guard = ReleaseListenOnDrop {
+        owners: listen_owners.clone(),
+        wallet: identity.wallet_address().to_owned(),
+    };
     let session_id = identity.session_id.clone();
     let (return_tx, return_rx) = mpsc::channel::<Vec<u8>>(64);
     {
@@ -3022,7 +3056,7 @@ async fn run_dynamic_local_tcp_stream(
             Some(identity.clone()),
             Some(identity.session_id.clone()),
             Some(ready_tx),
-            listen_owners,
+            listen_owners.clone(),
         ) {
             return Err(L0dError::L0(
                 "dynamic client l0_listen failed to start".into(),
@@ -4318,7 +4352,7 @@ async fn warm_one_ready_identity(
         // rebinds via spawn_dynamic_accept_listen.
         None,
         Some(ready_tx),
-        listen_owners,
+        listen_owners.clone(),
     ) {
         return Err(L0dError::L0(
             "temporary identity pre-warm listen failed to start".into(),
@@ -4332,6 +4366,7 @@ async fn warm_one_ready_identity(
         .await,
         Ok(Ok(()))
     ) {
+        let _ = listen_owners.release_by_wallet(identity.wallet_address());
         return Err(L0dError::L0(
             "temporary identity pre-warm listen did not become ready".into(),
         ));

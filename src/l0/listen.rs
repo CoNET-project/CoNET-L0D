@@ -165,8 +165,17 @@ impl ListenOwnerRegistry {
         let Some(session) = self.get(owner) else {
             return false;
         };
-        session.cancel();
+        abort_listen_session(&session);
         true
+    }
+
+    /// Stop the listen SSE for this wallet and drop the HTTP socket so Entry C / mailbox B see FIN/RST.
+    pub fn release_by_wallet(&self, wallet: &str) -> bool {
+        let Some(session) = self.find_by_wallet(wallet) else {
+            return false;
+        };
+        abort_listen_session(&session);
+        self.remove(&session.id).is_some()
     }
 
     pub fn remove(&self, owner: &str) -> Option<Arc<OwnedListenSession>> {
@@ -175,6 +184,15 @@ impl ListenOwnerRegistry {
 
     pub fn len(&self) -> usize {
         self.owners.lock().map(|owners| owners.len()).unwrap_or(0)
+    }
+}
+
+fn abort_listen_session(session: &OwnedListenSession) {
+    session.cancel();
+    if let Ok(mut task) = session.task.lock() {
+        if let Some(handle) = task.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -981,6 +999,20 @@ mod tests {
         assert!(registry.get(&second.id).is_some());
         assert!(registry.remove(&first.id).is_some());
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn release_by_wallet_cancels_and_removes_listen() {
+        let registry = ListenOwnerRegistry::default();
+        let owner = OwnedListenSession::new(
+            "0xabc",
+            Some("session-temp".to_owned()),
+            "l0",
+        );
+        assert!(registry.register(owner.clone()));
+        assert!(registry.release_by_wallet("0xAbC"));
+        assert!(owner.is_cancelled());
+        assert_eq!(registry.len(), 0);
     }
 
     #[test]
