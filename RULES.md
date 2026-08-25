@@ -306,4 +306,26 @@ Keep `cargo fmt --check`, `cargo clippy --all-targets --all-features`, and tests
 green. Tests use local mocks/wiremock and must not contact production services.
 
 ## SI pool discovery
-With `l0.si_pool_from_contract = true` (the default), use GuardianNodesInfoV6 discovery rather than requiring static SI URLs. Pool acquisition qualifies TCP `:80`, randomizes candidates, and applies a failure cooldown. Static lists are used only when the pool is disabled or unavailable; do not reintroduce a Chat mining SSE for a pure `--clientDuplex` spoke.
+With `l0.si_pool_from_contract = true` (the default), use GuardianNodesInfoV6 discovery rather than requiring static SI URLs. Pool acquisition qualifies TCP `:80`, randomizes candidates, and applies a failure cooldown for future connections. A `pool_full` response is a mailbox-local capacity failure: the current duplex must terminate, while a later APP-created duplex may choose another candidate. Static lists are used only when the pool is disabled or unavailable; do not reintroduce a Chat mining SSE for a pure `--clientDuplex` spoke.
+
+## SSE heartbeat and abandonment
+
+The mailbox SSE lifecycle contract is:
+
+- idle `l0_listen` is kept alive by the SI's `: keepalive` comment every 15 seconds;
+- an L0d receiver closes and rebuilds the SSE after 180 seconds without any SSE comment, handshake, or valid frame;
+- after `l0_connect`, L0d sends an encrypted `duplex_ping` every 60 seconds and SI reclaims either occupied socket after 180 seconds without input;
+- `close`, `error`, EOF, failed writes, and unusable sockets release the local owner and socket;
+- retrying a failed listen releases the old temporary identity and local TCP first.
+- `pool_full` while establishing `l0_listen` is terminal for that duplex
+  incarnation: the worker drops its ready signal, closes the APP TCP socket,
+  and does not repeat the same 3-second POST.
+- Any `l0_connect` occupation failure is also terminal for that duplex
+  incarnation. Both sides discard the pipe handle/session; the peer receives
+  an encrypted `duplex_reject` with `reason=pipe_failed` and
+  `retryable=true` when a final control delivery is possible. Only the APP may
+  create a new duplex.
+
+The 180-second rule is a receive-side contract. A successful one-way SSE write is
+not an application acknowledgement of a remote peer; TCP keepalive and close/error
+events remain part of remote-exit cleanup.

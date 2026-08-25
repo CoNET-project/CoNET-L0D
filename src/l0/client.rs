@@ -32,19 +32,15 @@ const POST_QUEUE: usize = 2048;
 const POST_CONCURRENCY: usize = 4;
 const LISTEN_QUEUE: usize = 512;
 const LISTEN_RECONNECT_SECS: u64 = 3;
+/// Only a clean, already-established pipe may be rebuilt after its peer ends.
+/// Occupation failures never use this delay; they terminate the duplex.
+const L0_PIPE_RETRY_SECS: u64 = 3;
 /// Temporary lines no longer wait on AddressPGP. Keep the local socket paused
 /// until mailbox SI returns a real `text/event-stream` L0 listen handshake.
 const DYNAMIC_LISTEN_READY_TIMEOUT_SECS: u64 = 120;
 /// After `responseChunk`, keep the proxy upstream read side paused only until
 /// the initiator occupy attaches. Geth / beacon often send no extra bytes
 /// after Hello until the return pipe is live, so an empty first blob is OK.
-/// After `l0_connect` fails (e.g. peer L0 listen not idle yet), retry instead of
-/// permanently clearing `pipe_tx` and falling back to P1.
-const L0_PIPE_RETRY_SECS: u64 = 3;
-/// SI signaled explicit teardown on the occupied inbound TCP; retry quickly.
-const L0_PIPE_END_RETRY_SECS: u64 = 1;
-/// Peer L0 listen still occupied (HTTP 409); back off to avoid occupy storms.
-const L0_PIPE_OCCUPIED_RETRY_SECS: u64 = 5;
 /// Duplex offer/accept must reach a healthy entry; a failed line is closed and
 /// its bytes are discarded rather than falling back to P1 gossip.
 const DUPLEX_CONTROL_POST_RETRY_SECS: u64 = 5;
@@ -970,8 +966,14 @@ impl L0Client {
             self.apply_duplex_accept(accept);
             return Ok(0);
         }
-        if let Some(session_id) = duplex::parse_reject(trimmed) {
-            self.mark_duplex_rejected(&session_id);
+        if let Some(reject) = duplex::parse_reject_details(trimmed) {
+            tracing::warn!(
+                session = %reject.session_id,
+                reason = %reject.reason,
+                retryable = reject.retryable,
+                "received duplex_reject; terminating duplex so the application can reconnect"
+            );
+            self.mark_duplex_rejected(&reject.session_id);
             return Ok(0);
         }
         let mut last_err = L0dError::L0("inbound decrypt failed for every listen wallet".into());
@@ -1043,8 +1045,14 @@ impl L0Client {
             self.apply_duplex_accept(accept);
             return Ok(0);
         }
-        if let Some(session_id) = duplex::parse_reject(plain) {
-            self.mark_duplex_rejected(&session_id);
+        if let Some(reject) = duplex::parse_reject_details(plain) {
+            tracing::warn!(
+                session = %reject.session_id,
+                reason = %reject.reason,
+                retryable = reject.retryable,
+                "received duplex_reject; terminating duplex so the application can reconnect"
+            );
+            self.mark_duplex_rejected(&reject.session_id);
             return Ok(0);
         }
         if let Some((session_id, payload)) = duplex::parse_duplex_frame_json(plain) {
@@ -1503,7 +1511,13 @@ impl L0Client {
         }
         if let Some((wire, target, route, key, session_id)) = send_reject {
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
-            let first = duplex::encode_reject_command(&wire.eoa, &session_id, ts)
+            let first = duplex::encode_reject_command(
+                &wire.eoa,
+                &session_id,
+                ts,
+                "unsupported",
+                false,
+            )
                 .ok()
                 .and_then(|json| aes::seal(&key, json.as_bytes()).ok());
             let dummy = DuplexSession {
@@ -1707,6 +1721,40 @@ impl L0Client {
                     session = %session_id,
                     "temporary proxy route/listen did not become ready"
                 );
+                // The initiator already has a live l0_listen and is waiting
+                // for this side's accept.  Report the local SSE capacity
+                // failure over one final occupied control pipe instead of
+                // leaving the initiator waiting until its generic timeout.
+                if let Some(key) = sess.key {
+                    let responder = sess
+                        .accept_identity
+                        .as_ref()
+                        .map(|identity| identity.wallet_address().to_owned())
+                        .unwrap_or_else(|| wire.eoa.clone());
+                    if let Ok(json) = duplex::encode_reject_command(
+                        &responder,
+                        &session_id,
+                        chrono::Utc::now().timestamp().max(0) as u64,
+                        "pool_full",
+                        true,
+                    ) {
+                        if let Ok(first) = aes::seal(&key, json.as_bytes()) {
+                            let mut reject_sess = sess.clone();
+                            reject_sess.rejected = true;
+                            reject_sess.pipe_tx = None;
+                            reject_sess.pipe_cancel = None;
+                            spawn_l0_pipe(
+                                wire.clone(),
+                                route.clone(),
+                                target.clone(),
+                                Some(first),
+                                reject_sess,
+                                duplex.clone(),
+                                PipeExtras::empty(),
+                            );
+                        }
+                    }
+                }
                 if let Some(wallet) = listen_wallet.as_deref() {
                     let _ = listen_owners.release_by_wallet(wallet);
                 }
@@ -2588,6 +2636,8 @@ fn spawn_listen_worker_with_ready(
         tracing::warn!(eoa = %routing_eoa, l0 = l0_exclusive, "listen owner already registered");
         return false;
     }
+    let owner_registry = owners.clone();
+    let registered_owner_id = owner.id.clone();
     let task_owner = owner.clone();
     let task = handle.spawn(async move {
         let user_pgp_key_id = temporary_identity
@@ -2656,7 +2706,10 @@ fn spawn_listen_worker_with_ready(
                             }
                             Err(err) => {
                                 if l0_exclusive
-                                    && err.to_string().contains("no inbound data for 120s")
+                                    && err.to_string().contains(&format!(
+                                        "no inbound data for {}s",
+                                        pipe::PIPE_DATA_TIMEOUT.as_secs()
+                                    ))
                                 {
                                     clear_l0_pipe_after_listen_timeout(
                                         &routing_eoa,
@@ -2681,12 +2734,36 @@ fn spawn_listen_worker_with_ready(
                             error = %err,
                             "listen SSE failed"
                         );
+                        if l0_exclusive && err.to_string().contains("pool_full") {
+                            // `pool_full` is a terminal failure for this
+                            // duplex incarnation.  Retrying the same
+                            // l0_listen every three seconds only creates
+                            // another abandoned SSE and amplifies the
+                            // saturation.  Dropping `ready` wakes the
+                            // caller immediately; the APP owns reconnect.
+                            task_owner.cancel();
+                            owner_registry.remove(&registered_owner_id);
+                            tracing::warn!(
+                                eoa = %routing_eoa,
+                                "l0_listen pool_full; closing duplex incarnation without retry"
+                            );
+                            return;
+                        }
                         last_failed = Some(entry.clone());
                                 if let Some(pool) = si_pool.as_ref() { pool.mark_failed(&entry).await; }
                     }
                 },
                 Err(err) => {
                     tracing::warn!(eoa = %routing_eoa, error = %err, "listen wrap refused");
+                    if l0_exclusive && err.to_string().contains("pool_full") {
+                        task_owner.cancel();
+                        owner_registry.remove(&registered_owner_id);
+                        tracing::warn!(
+                            eoa = %routing_eoa,
+                            "l0_listen pool_full while preparing request; closing duplex incarnation"
+                        );
+                        return;
+                    }
                     last_failed = Some(entry.clone());
                                 if let Some(pool) = si_pool.as_ref() { pool.mark_failed(&entry).await; }
                 }
@@ -3424,15 +3501,6 @@ fn duplex_duplicate_offer_should_ignore(
     // l0_connect is still pending. Rejecting that second copy tears down the
     // valid first handshake.
     had_key && !sess.rejected && sess.key == Some(offered_key)
-}
-
-fn l0_pipe_retry_secs(err: &L0dError) -> u64 {
-    match err {
-        L0dError::L0PipeEnd { .. } => L0_PIPE_END_RETRY_SECS,
-        L0dError::L0(msg) if msg.contains("peer disconnected") => L0_PIPE_END_RETRY_SECS,
-        L0dError::L0(msg) if msg.contains("409") => L0_PIPE_OCCUPIED_RETRY_SECS,
-        _ => L0_PIPE_RETRY_SECS,
-    }
 }
 
 /// Occupy TCP ended (`Ok` EOF or `Err`). Drop a stale `pipe_tx` so TUN does
@@ -4189,21 +4257,60 @@ fn spawn_l0_pipe(
                     return;
                 }
                 Err(err) => {
-                    let retry_secs = l0_pipe_retry_secs(&err);
-                    tracing::warn!(session = %session_id, error = %err, "l0_connect pipe failed");
+                    tracing::warn!(
+                        session = %session_id,
+                        error = %err,
+                        "l0_connect pipe occupation failed; terminating duplex incarnation"
+                    );
                     if oneshot_reject || gen.is_none() {
                         return;
                     }
-                    let gen = gen.expect("tracked pipe");
-                    if !l0_pipe_closed_should_retry(&duplex, dest, port, &session_id, gen) {
-                        return;
+                    let _gen = gen.expect("tracked pipe");
+                    // A failed occupation means this SSE/duplex pair is no
+                    // longer a valid transport.  Do not reuse its wallet,
+                    // pipe handle, or l0_listen worker: that combination was
+                    // the source of the 3-second storm.
+                    // Give the peer one final, explicit control-plane
+                    // rejection.  This is a single best-effort occupation
+                    // carrying the reject blob, not a retry of the failed
+                    // duplex; failure of this notification is harmless
+                    // because the local APP socket is closed below.
+                    if let Some(key) = sess.key {
+                        if let Ok(json) = duplex::encode_reject_command(
+                            &listen_wallet,
+                            &session_id,
+                            chrono::Utc::now().timestamp().max(0) as u64,
+                            "pipe_failed",
+                            true,
+                        ) {
+                            if let Ok(first) = aes::seal(&key, json.as_bytes()) {
+                                let mut reject_sess = sess.clone();
+                                reject_sess.rejected = true;
+                                reject_sess.pipe_tx = None;
+                                reject_sess.pipe_cancel = None;
+                                spawn_l0_pipe(
+                                    wire.clone(),
+                                    peer_route_pgp.clone(),
+                                    target_wallet.clone(),
+                                    Some(first),
+                                    reject_sess,
+                                    duplex.clone(),
+                                    PipeExtras::empty(),
+                                );
+                            }
+                        }
                     }
-                    tracing::info!(
+                    let mut guard = duplex.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(live) = guard.get(&duplex_key(dest, port, &session_id)) {
+                        cancel_duplex_pipe(live);
+                    }
+                    retain_duplex_except_session_id(&mut guard, &session_id);
+                    tracing::warn!(
                         session = %session_id,
-                        retry_secs,
-                        "l0_connect failed; retrying occupy pipe"
+                        reason = "pipe_failed",
+                        "duplex rejected locally; application must create a new connection"
                     );
-                    tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                    return;
                 }
             }
         }
@@ -5156,30 +5263,6 @@ mod tests {
             &sess,
             sess.accept_identity.as_ref().unwrap().wallet_address()
         ));
-    }
-
-    #[test]
-    fn l0_pipe_retry_secs_treats_409_as_occupied() {
-        assert_eq!(
-            l0_pipe_retry_secs(&L0dError::L0(
-                "l0 pipe HTTP not 2xx: HTTP/1.1 409 Conflict".into()
-            )),
-            L0_PIPE_OCCUPIED_RETRY_SECS
-        );
-        assert_eq!(
-            l0_pipe_retry_secs(&L0dError::L0(
-                "l0 pipe peer disconnected: HTTP/1.1 410 Gone".into()
-            )),
-            L0_PIPE_END_RETRY_SECS
-        );
-        assert_eq!(
-            l0_pipe_retry_secs(&L0dError::L0PipeEnd {
-                reason: "test".into(),
-                session_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .into(),
-            }),
-            L0_PIPE_END_RETRY_SECS
-        );
     }
 
     #[test]

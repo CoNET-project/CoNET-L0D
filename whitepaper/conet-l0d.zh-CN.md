@@ -246,7 +246,30 @@ Linux 运行时提供：
 
 进程存活不能证明应用 request 或 stream 已完成。
 
-## 11. 故障模型
+## 11. SSE 心跳与废弃策略
+
+mailbox SI 的 `l0_listen` 是长期 SSE。空闲阶段由 SI 每 15 秒发送
+`: keepalive`；L0d 以最后收到的 comment、握手或合法 frame 为活动时间，
+连续 180 秒没有任何输入就关闭该 SSE、释放临时 session，并从链上 SI 池
+重新随机选择入口。`pool_full` 是单个 SI 的本地 256 槽位容量错误；
+对于当前 duplex incarnation 它是终止性错误：listen worker 丢弃 ready
+信号、关闭 APP TCP socket，不能用相同临时钱包每 3 秒重复 POST。
+
+`l0_connect` 占用后不再发送 comment，L0d 每 60 秒发送加密
+`duplex_ping`；SI 的 occupied 两端连续 180 秒没有输入即释放 entry 并
+关闭两端 socket。`close`、`error`、EOF、失败写入和明确不可用的 socket
+都立即触发释放。
+
+这是接收端超时合同。单向 SSE 中发送方的成功写入不是接收确认；半开 TCP
+仍需依靠 TCP keepalive、close/error 事件和另一端的 180 秒接收超时回收。
+重试前必须先释放旧的临时 identity、本地 TCP 和 SSE pump，避免重试制造
+重复 listen。如果 `l0_connect` 占用失败，同一 duplex 在双方都视为失效：
+L0d 丢弃 pipe handle 并关闭 APP stream；尽力发送一次加密的
+`duplex_reject`（`reason=pipe_failed`、`retryable=true`）。只有 APP 使用
+新 duplex 重连。该策略只影响 L0d 自己的 session，不要求重启 geth、
+beacon 或 validator。
+
+## 12. 故障模型
 
 客户端与运营者应区分：
 
@@ -262,7 +285,7 @@ Linux 运行时提供：
 
 传输失败不得转换为“成功但空”的响应。应用应根据自身缓存策略保留上次可信数据。
 
-## 12. 可选 L1 组合
+## 13. 可选 L1 组合
 
 选定 geth 或 Prysm TCP 数据流可用于受控 Linux-to-Linux duplex 实验。
 该组合：
@@ -275,7 +298,7 @@ Linux 运行时提供：
 这不代表 CoNET L1 共识已普遍迁移到 L0。有限实验记录见
 [`docs/P2.zh-CN.md`](../docs/P2.zh-CN.md)。
 
-## 13. 成熟度
+## 14. 成熟度
 
 | 能力 | 状态 |
 |---|---|
@@ -291,7 +314,7 @@ Linux 运行时提供：
 文档必须保留这些区别。Locator 或 Linux runtime 可用，不代表所有浏览器能力
 或未来协议扩展都已达到生产状态。
 
-## 14. 非目标
+## 15. 非目标
 
 该协议不是：
 

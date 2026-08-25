@@ -22,10 +22,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, Instant};
 
-/// The sender must put at least one application blob on the occupied pipe
-/// during this window. The listener uses the same deadline for inbound SSE
-/// bytes. Keep the heartbeat comfortably below the deadline.
-pub const PIPE_DATA_TIMEOUT: Duration = Duration::from_secs(120);
+/// The sender must put at least one application blob or encrypted heartbeat on
+/// the occupied pipe during this window. The listener uses the same deadline
+/// for inbound SSE bytes. Keep the heartbeat comfortably below the deadline.
+pub const PIPE_DATA_TIMEOUT: Duration = Duration::from_secs(180);
 pub const PIPE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 use tokio_rustls::TlsConnector;
 
@@ -388,6 +388,13 @@ fn tls_connector() -> Result<TlsConnector, L0dError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_interval_is_below_abandonment_timeout() {
+        assert_eq!(PIPE_DATA_TIMEOUT, Duration::from_secs(180));
+        assert_eq!(PIPE_HEARTBEAT_INTERVAL, Duration::from_secs(60));
+        assert!(PIPE_HEARTBEAT_INTERVAL < PIPE_DATA_TIMEOUT);
+    }
 
     #[test]
     fn json_body_bytes_is_data_only() {

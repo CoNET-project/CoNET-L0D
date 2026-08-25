@@ -156,16 +156,24 @@ pub fn encode_accept_command(
     serde_json::to_string(&json).map_err(|e| L0dError::L0(e.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn encode_reject_command(
     responder_wallet: &str,
     session_id: &str,
     timestamp: u64,
+    reason: &str,
+    retryable: bool,
 ) -> Result<String, L0dError> {
+    let reason = match reason {
+        "pool_full" | "pipe_failed" | "unsupported" => reason,
+        _ => return Err(L0dError::L0("duplex_reject unknown reason".into())),
+    };
     let json = serde_json::json!({
         "command": "duplex_reject",
         "walletAddress": normalize_eoa(responder_wallet)?,
         "pipe_handle": session_id,
-        "reason": "unsupported",
+        "reason": reason,
+        "retryable": retryable,
         "timestamp": timestamp,
     });
     let text = serde_json::to_string(&json).map_err(|e| L0dError::L0(e.to_string()))?;
@@ -665,19 +673,43 @@ pub fn parse_accept_from_inbound_plain(plain: &str) -> Result<DuplexAccept, L0dE
     Ok(accept)
 }
 
-pub fn parse_reject(payload: &str) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplexReject {
+    pub session_id: String,
+    pub reason: String,
+    pub retryable: bool,
+}
+
+pub fn parse_reject_details(payload: &str) -> Option<DuplexReject> {
     parse_signed_or_raw(payload, |inner| {
         let v: Value = serde_json::from_str(inner.trim())
             .map_err(|e| L0dError::L0(format!("duplex_reject: {e}")))?;
         if v.get("command").and_then(Value::as_str) != Some("duplex_reject") {
             return Err(L0dError::L0("not duplex_reject".into()));
         }
-        v.get("pipe_handle")
+        let session_id = v.get("pipe_handle")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| L0dError::L0("duplex_reject missing pipe_handle".into()))
+            .ok_or_else(|| L0dError::L0("duplex_reject missing pipe_handle".into()))?;
+        let reason = v
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unsupported")
+            .to_string();
+        if !matches!(reason.as_str(), "pool_full" | "pipe_failed" | "unsupported") {
+            return Err(L0dError::L0("duplex_reject unknown reason".into()));
+        }
+        Ok(DuplexReject {
+            session_id,
+            reason,
+            retryable: v.get("retryable").and_then(Value::as_bool).unwrap_or(false),
+        })
     })
     .ok()
+}
+
+pub fn parse_reject(payload: &str) -> Option<String> {
+    parse_reject_details(payload).map(|reject| reject.session_id)
 }
 
 #[cfg(test)]
@@ -751,10 +783,23 @@ mod tests {
             "0x1111111111111111111111111111111111111111",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             2,
+            "unsupported",
+            false,
         )
         .unwrap();
         assert!(reject.contains("duplex_reject"));
         assert!(!reject.contains("Securitykey"));
+        let pool_reject = encode_reject_command(
+            "0x1111111111111111111111111111111111111111",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            2,
+            "pool_full",
+            true,
+        )
+        .unwrap();
+        let details = parse_reject_details(&pool_reject).expect("pool_full reject");
+        assert_eq!(details.reason, "pool_full");
+        assert!(details.retryable);
         let frame = encode_frame_json(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "YmFzZQ==",
@@ -832,7 +877,9 @@ mod tests {
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         );
         assert_eq!(got.key, key);
-        let reject = encode_reject_command(eth.address(), &got.session_id, 5).unwrap();
+        let reject =
+            encode_reject_command(eth.address(), &got.session_id, 5, "unsupported", false)
+                .unwrap();
         let sign_r = eth.personal_sign(reject.as_bytes()).unwrap();
         let wrap_r = serde_json::json!({ "message": reject, "signMessage": sign_r }).to_string();
         assert_eq!(

@@ -267,7 +267,35 @@ Useful evidence includes:
 A process being alive is not proof that an application request or stream
 completed.
 
-## 11. Failure model
+## 11. SSE heartbeat and abandonment
+
+The mailbox SI `l0_listen` is a long-lived SSE. While idle, the SI sends a
+`: keepalive` comment every 15 seconds. L0d treats the last comment, handshake,
+or valid frame as activity; after 180 seconds with no input it closes the SSE,
+releases the temporary session, and randomly selects another SI from the
+on-chain pool. `pool_full` is a local 256-slot capacity error at one SI. It is
+terminal for the current duplex incarnation: the listen worker drops its ready
+signal, closes the application TCP socket, and must not repeat the same
+temporary wallet/POST every three seconds.
+
+After `l0_connect` occupies the line, comments stop and L0d sends an encrypted
+`duplex_ping` every 60 seconds. SI releases the entry and closes both sockets
+after 180 seconds without input on either occupied direction. `close`, `error`,
+EOF, failed writes, and explicitly unusable sockets release the owner
+immediately.
+
+This is a receiver-side timeout contract. A successful write on one-way SSE is
+not an application acknowledgement that the peer received it; half-open TCP
+still relies on TCP keepalive, close/error events, and the other side's
+180-second receive timeout. Before retrying, L0d must release the old temporary
+identity, local TCP socket, and SSE pump. If `l0_connect` occupation fails, the
+same duplex is invalid on both sides: L0d discards the pipe handle and closes
+the application stream. It sends one best-effort encrypted `duplex_reject` with
+`reason=pipe_failed` and `retryable=true`; only the application may reconnect
+with a new duplex. This policy affects only L0d sessions; it does not require
+restarting geth, beacon, or validator.
+
+## 12. Failure model
 
 Clients and operators should distinguish:
 
@@ -285,7 +313,7 @@ Transport failure must not be converted into a successful empty response.
 Applications preserve their last trusted data according to their own cache
 policy.
 
-## 12. Optional L1 composition
+## 13. Optional L1 composition
 
 Selected geth or Prysm TCP streams can be used as a controlled Linux-to-Linux
 duplex experiment. This composition:
@@ -298,7 +326,7 @@ duplex experiment. This composition:
 It does not mean that CoNET L1 consensus has generally moved to L0. See
 [`docs/P2.md`](../docs/P2.md) for the bounded laboratory record.
 
-## 13. Maturity
+## 14. Maturity
 
 | Capability | Status |
 |---|---|
@@ -315,7 +343,7 @@ Documentation must preserve these distinctions. A working locator or Linux
 runtime is not proof that every browser feature or future protocol extension
 is production-ready.
 
-## 14. Non-goals
+## 15. Non-goals
 
 The protocol is not:
 

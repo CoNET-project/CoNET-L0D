@@ -557,7 +557,20 @@ pub async fn open_listen_sse(
         .map_err(|e| L0dError::L0(post::format_reqwest_error("listen POST failed", e)))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        return Err(L0dError::L0(format!("listen POST HTTP {status}")));
+        let detail = tokio::time::timeout(Duration::from_secs(3), response.text())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let detail: String = detail.trim().chars().take(256).collect();
+        return Err(L0dError::L0(format!(
+            "listen POST HTTP {status}{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        )));
     }
     let content_type = response
         .headers()
