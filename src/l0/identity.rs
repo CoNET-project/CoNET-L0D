@@ -3,13 +3,13 @@
 //! A temporary identity is deliberately process-memory-only.  It is the
 //! routing subject of one duplex line; the configured main wallet remains the
 //! billing/signing identity and is never reused as the line identity.
+//! Temporary wallets and user PGP are not registered in AddressPGP. The
+//! mailbox SI that accepted `l0_listen` is announced in offer/accept.
 
 use crate::error::L0dError;
-use crate::l0::{address_pgp, aes, eip191::EthSecret, pgp};
-use base64::Engine;
+use crate::l0::{aes, eip191::EthSecret, pgp};
 use rand::{rngs::OsRng, RngCore};
 use sequoia_openpgp::cert::prelude::*;
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct TemporaryIdentity {
@@ -60,60 +60,6 @@ impl TemporaryIdentity {
 
     pub fn wallet_address(&self) -> &str {
         self.wallet.address()
-    }
-
-    /// Register this ephemeral route in AddressPGP through the public API.
-    ///
-    /// The private OpenPGP cert is encrypted exactly as the existing
-    /// `regiestChatRoute` client contract expects: AES-256-GCM with a
-    /// SHA-256-derived key from the temporary Ethereum private key.
-    pub async fn register_route(
-        &self,
-        register_url: &str,
-        route_key_id: &str,
-        rpc: Option<&str>,
-    ) -> Result<(), L0dError> {
-        let mut key = [0u8; aes::KEY_LEN];
-        let digest = Sha256::digest(self.wallet.secret_bytes());
-        key.copy_from_slice(&digest);
-        let encrypted_private = aes::seal(&key, self.user_secret_armor.as_bytes())?;
-        let body = serde_json::json!({
-            "wallet": self.wallet_address(),
-            "keyID": self.user_key_id,
-            "publicKeyArmored": base64::engine::general_purpose::STANDARD
-                .encode(self.user_public_armor.as_bytes()),
-            "encrypKeyArmored": encrypted_private,
-            "routeKeyID": route_key_id.to_uppercase(),
-        });
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(12))
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|e| L0dError::L0(format!("route registration client: {e}")))?;
-        let response = client
-            .post(register_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| L0dError::L0(format!("route registration failed: {e}")))?;
-        let status = response.status();
-        let payload: serde_json::Value = response.json().await.unwrap_or_default();
-        if !status.is_success() || payload.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-            let error = payload
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown registration error");
-            return Err(L0dError::L0(format!(
-                "route registration HTTP {}: {}",
-                status.as_u16(),
-                error
-            )));
-        }
-        // HTTP 200 / ok is not SI isMyRoute. Mailbox reads AddressPGP searchKey.
-        if let Some(rpc) = rpc.filter(|url| !url.trim().is_empty()) {
-            address_pgp::wait_until_route_visible(rpc, self.wallet_address(), route_key_id).await?;
-        }
-        Ok(())
     }
 }
 

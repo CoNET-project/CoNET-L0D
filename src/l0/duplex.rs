@@ -71,6 +71,7 @@ pub fn encode_offer_command(
         listen_wallet,
         listen_user_pgp,
         listen_route_pgp,
+        "",
         0,
         session_id,
         key,
@@ -89,6 +90,7 @@ pub fn encode_offer_command_for_port(
     listen_wallet: &str,
     listen_user_pgp: &str,
     listen_route_pgp: &str,
+    listen_mailbox_wallet: &str,
     port: u16,
     session_id: &str,
     key: &[u8; aes::KEY_LEN],
@@ -110,6 +112,9 @@ pub fn encode_offer_command_for_port(
         "Securitykey": aes::key_to_standard_b64(key),
         "timestamp": timestamp,
     });
+    if !listen_mailbox_wallet.trim().is_empty() {
+        json["listenMailboxWallet"] = Value::String(normalize_eoa(listen_mailbox_wallet)?);
+    }
     if let Some(first_chunk) = first_chunk {
         json["firstChunk"] =
             Value::String(base64::engine::general_purpose::STANDARD.encode(first_chunk));
@@ -123,6 +128,7 @@ pub fn encode_accept_command(
     listen_wallet: &str,
     listen_user_pgp: &str,
     listen_route_pgp: &str,
+    listen_mailbox_wallet: &str,
     session_id: &str,
     key: &[u8; aes::KEY_LEN],
     timestamp: u64,
@@ -140,6 +146,9 @@ pub fn encode_accept_command(
         "Securitykey": aes::key_to_standard_b64(key),
         "timestamp": timestamp,
     });
+    if !listen_mailbox_wallet.trim().is_empty() {
+        json["listenMailboxWallet"] = Value::String(normalize_eoa(listen_mailbox_wallet)?);
+    }
     if let Some(response_chunk) = response_chunk {
         json["responseChunk"] =
             Value::String(base64::engine::general_purpose::STANDARD.encode(response_chunk));
@@ -413,6 +422,11 @@ pub fn parse_offer_plain(plain: &str) -> Result<DuplexOffer, L0dError> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let listen_mailbox_wallet = v
+        .get("listenMailboxWallet")
+        .and_then(Value::as_str)
+        .and_then(|raw| normalize_eoa(raw).ok())
+        .unwrap_or_default();
     let timestamp = v
         .get("timestamp")
         .and_then(Value::as_u64)
@@ -432,6 +446,7 @@ pub fn parse_offer_plain(plain: &str) -> Result<DuplexOffer, L0dError> {
         listen_wallet,
         listen_user_pgp,
         listen_route_pgp,
+        listen_mailbox_wallet,
         from,
         billing_wallet,
         timestamp,
@@ -520,10 +535,11 @@ pub struct DuplexOffer {
     pub key: [u8; aes::KEY_LEN],
     pub listen_wallet: String,
     pub listen_user_pgp: String,
-    /// Mailbox route public key registered for `listen_wallet`. The peer must
-    /// encrypt `l0_connect` to this exact route; a static peer route is not a
-    /// valid substitute for a per-socket temporary wallet.
+    /// Mailbox SI route PGP that is holding this listen SSE. The peer wraps
+    /// user-PGP ciphertext to this key so entry SI can forward without AddressPGP.
     pub listen_route_pgp: String,
+    /// Mailbox SI node wallet that accepted the listen SSE.
+    pub listen_mailbox_wallet: String,
     pub from: String,
     /// Main paid wallet recovered from the signed control envelope.  The
     /// temporary `from` wallet is the per-socket mailbox identity and cannot
@@ -539,6 +555,7 @@ pub struct DuplexAccept {
     pub listen_wallet: String,
     pub listen_user_pgp: String,
     pub listen_route_pgp: String,
+    pub listen_mailbox_wallet: String,
     pub billing_wallet: String,
     pub timestamp: u64,
     pub key: [u8; aes::KEY_LEN],
@@ -605,6 +622,11 @@ pub(crate) fn parse_accept_plain(plain: &str) -> Result<DuplexAccept, L0dError> 
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let listen_mailbox_wallet = v
+        .get("listenMailboxWallet")
+        .and_then(Value::as_str)
+        .and_then(|raw| normalize_eoa(raw).ok())
+        .unwrap_or_default();
     let timestamp = v
         .get("timestamp")
         .and_then(Value::as_u64)
@@ -620,6 +642,7 @@ pub(crate) fn parse_accept_plain(plain: &str) -> Result<DuplexAccept, L0dError> 
         listen_wallet,
         listen_user_pgp,
         listen_route_pgp,
+        listen_mailbox_wallet,
         billing_wallet,
         timestamp,
         key,
@@ -691,6 +714,7 @@ mod tests {
             initiator,
             "",
             "route-pgp",
+            "",
             8400,
             &new_pipe_handle(),
             &key,
@@ -713,6 +737,7 @@ mod tests {
             "0x1111111111111111111111111111111111111111",
             "",
             "route-pgp",
+            "",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &key,
             1,
@@ -792,6 +817,7 @@ mod tests {
             eth.address(),
             "",
             "route-pgp",
+            "",
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             &key,
             4,
@@ -830,6 +856,7 @@ mod tests {
             socket_wallet,
             "",
             "route-pgp",
+            "",
             8400,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &key,
@@ -858,6 +885,7 @@ mod tests {
             signer.address(),
             "",
             "route-pgp",
+            "",
             8400,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             &key,

@@ -116,8 +116,18 @@ pub fn wrap_overlay_for_post(
     route_pub_armored: &str,
 ) -> Result<String, L0dError> {
     let inner = encrypt_utf8(envelope_json, user_pub_armored)?;
-    let work = mailbox_work_json(&inner)?;
-    encrypt_utf8(&work, route_pub_armored)
+    wrap_user_armor_for_mailbox_si(&inner, route_pub_armored)
+}
+
+/// Entry SI routes by mailbox SI route-PGP key ID (Guardian node key), not
+/// AddressPGP. Mailbox peels this wrap and delivers the inner user-PGP
+/// ciphertext to the matching SSE in its local pool.
+pub fn wrap_user_armor_for_mailbox_si(
+    user_armor: &str,
+    mailbox_si_pgp: &str,
+) -> Result<String, L0dError> {
+    let work = mailbox_work_json(user_armor)?;
+    encrypt_utf8(&work, mailbox_si_pgp)
 }
 
 /// Load an armored OpenPGP **public** cert (mailbox B route). Do not log contents.

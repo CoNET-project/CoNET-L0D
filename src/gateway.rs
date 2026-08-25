@@ -157,6 +157,7 @@ async fn listen_loop(
                         &armor_tx,
                         owner.clone(),
                         None,
+                        None,
                     )
                     .await
                     {

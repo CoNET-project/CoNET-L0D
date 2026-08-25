@@ -57,9 +57,14 @@ Every line has its own:
 - occupied socket;
 - bounded byte queues.
 
-Temporary identities are memory-only, registered before routing, and destroyed
-on EOF, failed HTTP status, timeout, or socket close. Lines on the same logical
-port must not share wallets, keys, handles, queues, or sockets.
+Temporary identities are memory-only and are **not** registered in AddressPGP.
+The client announces the mailbox SI (route PGP + node wallet) that accepted
+its `l0_listen` SSE inside `duplex_offer`. The server's accept packet carries
+the mailbox SI of its own temporary SSE. Entry SI posts wrap the peer's
+user-PGP ciphertext with that mailbox SI PGP so forwarding does not need
+`searchKey`. Destroyed on EOF, failed HTTP status, timeout, or socket close.
+Lines on the same logical port must not share wallets, keys, handles, queues,
+or sockets.
 
 The occupied line is a byte transport. Forward bytes unchanged to the
 configured upstream with bounded asynchronous bidirectional copying. A failed
@@ -108,8 +113,9 @@ Linux-only `@LOCAL` suffix pins the loopback bind and does not walk.
 
 Each `TcpListener.accept()` event is the sole connection handle. A newly
 accepted socket receives a fresh temporary wallet, OpenPGP identity, AES key,
-opaque `pipe_handle`, return queue, and occupied line. Register the temporary
-route and verify AddressPGP `searchKey.routeKeyID` before opening `l0_listen`.
+opaque `pipe_handle`, return queue, and occupied line. Open `l0_listen` on the
+configured mailbox SI without AddressPGP registration; include the temporary
+user-PGP key ID so mailbox can index the local SSE pool.
 
 All bytes from that socket stay attached to the same handle until EOF/error.
 Return bytes may be written only to that socket. Concurrent sockets on one
@@ -119,10 +125,11 @@ correlation.
 
 ## firstChunk / responseChunk bootstrap
 
-The client pauses a new local socket after its first bytes, creates and
-registers exactly one temporary route, waits for its temporary `l0_listen` SSE,
-then sends those bytes as `firstChunk` in `duplex_offer`. An existing handle
-must never allocate a second line.
+The client pauses a new local socket after its first bytes, creates exactly
+one temporary identity, waits for its temporary `l0_listen` SSE handshake
+(mailbox SI wallet), then sends those bytes as `firstChunk` in `duplex_offer`
+together with the mailbox SI PGP/wallet. An existing handle must never allocate
+a second line.
 
 A duplex proxy may open a line only when the recovered signer, configured
 `billingWallet`, `mainWallet:port`, explicit `--proxyDuplex` target, and

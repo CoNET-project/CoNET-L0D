@@ -32,10 +32,8 @@ const POST_QUEUE: usize = 2048;
 const POST_CONCURRENCY: usize = 4;
 const LISTEN_QUEUE: usize = 512;
 const LISTEN_RECONNECT_SECS: u64 = 3;
-/// `regiestChatRoute` acknowledges queue admission before the AddressPGP write
-/// is necessarily visible to every SI.  A temporary line is not usable until
-/// an entry returns a real `text/event-stream` L0 listen, so keep the local
-/// socket paused across several propagation/retry cycles.
+/// Temporary lines no longer wait on AddressPGP. Keep the local socket paused
+/// until mailbox SI returns a real `text/event-stream` L0 listen handshake.
 const DYNAMIC_LISTEN_READY_TIMEOUT_SECS: u64 = 120;
 /// After `responseChunk`, keep the proxy upstream read side paused only until
 /// the initiator occupy attaches. Geth / beacon often send no extra bytes
@@ -65,7 +63,7 @@ const BATCH_MAX_PACKETS: usize = 16;
 const BATCH_MAX_BYTES: usize = 12 * 1024;
 /// Keep this many listen-ready temporary identities per duplex port so
 /// `duplex_offer` / `duplex_accept` can fire before RLPx / libp2p RST the
-/// local TCP (AddressPGP + SSE ready is typically 2–6s).
+/// local TCP (mailbox SSE handshake is typically well under a second).
 const READY_IDENTITY_POOL_TARGET: usize = 2;
 
 /// Pre-registered, listen-ready ephemeral identities for one logical port.
@@ -174,7 +172,7 @@ struct ChannelWire {
     si_pool: Option<Arc<SiPool>>,
     /// Own session-listen user PGP (channel EOA in crate MVP).
     user_pub: String,
-    /// CoNET L1 RPC used after `regiestChatRoute` HTTP 200 to wait for searchKey.
+    /// CoNET L1 RPC (AddressPGP / destination lookup for configured peers).
     rpc: String,
 }
 
@@ -243,10 +241,11 @@ struct DuplexSession {
     host_eoa: String,
     /// Peer's session-listen user PGP (from accept, or offer for the initiator).
     peer_listen_user_pgp: Option<String>,
-    /// Exact mailbox route PGP registered for the peer's per-socket temporary
-    /// listen wallet. Dynamic lines must never substitute a static peer route.
+    /// Mailbox SI route PGP holding the peer's temporary listen SSE.
     peer_listen_route_pgp: Option<String>,
     peer_listen_wallet: Option<String>,
+    /// Mailbox SI node wallet that accepted the peer's temporary listen.
+    peer_listen_mailbox_wallet: Option<String>,
     /// Acceptor-side temporary identity, allocated after mainWallet:port
     /// matching. It is never reused by another line.
     accept_identity: Option<crate::l0::identity::TemporaryIdentity>,
@@ -1277,6 +1276,9 @@ impl L0Client {
                 if !offer.listen_route_pgp.trim().is_empty() {
                     sess.peer_listen_route_pgp = Some(offer.listen_route_pgp.clone());
                 }
+                if !offer.listen_mailbox_wallet.trim().is_empty() {
+                    sess.peer_listen_mailbox_wallet = Some(offer.listen_mailbox_wallet.clone());
+                }
                 if !had_key {
                     sess.peer_attached = true;
                     sess.rejected = false;
@@ -1377,6 +1379,10 @@ impl L0Client {
                                 peer_listen_user_pgp: Some(offer.listen_user_pgp.clone()),
                                 peer_listen_route_pgp: Some(offer.listen_route_pgp.clone()),
                                 peer_listen_wallet: Some(offer.listen_wallet.clone()),
+                                peer_listen_mailbox_wallet: (!offer.listen_mailbox_wallet
+                                    .trim()
+                                    .is_empty())
+                                .then(|| offer.listen_mailbox_wallet.clone()),
                                 accept_identity: Some(identity),
                                 peer_return_attached: false,
                                 response_chunk_delivered: false,
@@ -1465,6 +1471,7 @@ impl L0Client {
                 sess.clone(),
                 self.duplex.clone(),
                 None,
+                self.listen_owners.clone(),
             );
             spawn_l0_pipe(
                 wire,
@@ -1514,6 +1521,7 @@ impl L0Client {
                 peer_listen_user_pgp: None,
                 peer_listen_route_pgp: Some(route.clone()),
                 peer_listen_wallet: Some(target.clone()),
+                peer_listen_mailbox_wallet: None,
                 accept_identity: None,
                 peer_return_attached: false,
                 response_chunk_delivered: false,
@@ -1582,17 +1590,14 @@ impl L0Client {
             );
             return None;
         };
-        let route_key_id = match pgp::transport_key_id_armored(&wire.route_pgp) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(
-                    session = %sess.session_id,
-                    error = %err,
-                    "cannot start temporary duplex listen: mailbox route key is invalid"
-                );
-                return None;
-            }
-        };
+        if let Err(err) = pgp::transport_key_id_armored(&wire.route_pgp) {
+            tracing::warn!(
+                session = %sess.session_id,
+                error = %err,
+                "cannot start temporary duplex listen: mailbox route key is invalid"
+            );
+            return None;
+        }
         let (ready_tx, ready_rx) = oneshot::channel();
         let identity = identity.clone();
         let entries = wire.listen_entries.clone();
@@ -1602,48 +1607,8 @@ impl L0Client {
         let billing_wallet = wire.main_wallet.clone();
         let session_id = sess.session_id.clone();
         let port = sess.port;
-        let rpc = wire.rpc.clone();
         let listen_owners = self.listen_owners.clone();
         tokio::spawn(async move {
-            let mut registered = false;
-            for attempt in 1..=5 {
-                match identity
-                    .register_route(
-                        "https://beamio.app/api/regiestChatRoute",
-                        &route_key_id,
-                        Some(rpc.as_str()),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        registered = true;
-                        tracing::info!(
-                            session = %session_id,
-                            port,
-                            temporary_wallet = %identity.wallet_address(),
-                            route_key_id = %route_key_id,
-                            "temporary proxy route registered"
-                        );
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            session = %session_id,
-                            port,
-                            attempt,
-                            error = %err,
-                            "temporary proxy route registration failed"
-                        );
-                        tokio::time::sleep(Duration::from_secs(
-                            LISTEN_RECONNECT_SECS.saturating_mul(attempt as u64),
-                        ))
-                        .await;
-                    }
-                }
-            }
-            if !registered {
-                return;
-            }
             // Handshake owns reverse occupy after duplex_accept. Passing a
             // rebuild here raced spawn_proxy_handshake and 409'd the
             // initiator mailbox as soon as this temporary SSE came up.
@@ -1793,6 +1758,7 @@ impl L0Client {
                 sess.clone(),
                 duplex.clone(),
                 Some(response),
+                listen_owners.clone(),
             );
 
             let needs_reverse = {
@@ -1941,7 +1907,7 @@ impl L0Client {
                     tracing::warn!(
                         session = %accept.session_id,
                         listen_wallet = %accept.listen_wallet,
-                        "duplex_accept lacks a distinct registered temporary route"
+                        "duplex_accept lacks a distinct temporary listen mailbox"
                     );
                     return;
                 }
@@ -1963,6 +1929,9 @@ impl L0Client {
                 }
                 sess.peer_listen_route_pgp = Some(accept.listen_route_pgp.clone());
                 sess.peer_listen_wallet = Some(accept.listen_wallet.clone());
+                if !accept.listen_mailbox_wallet.trim().is_empty() {
+                    sess.peer_listen_mailbox_wallet = Some(accept.listen_mailbox_wallet.clone());
+                }
                 sess.peer_attached = true;
                 sess.rejected = false;
                 if !accept.response_chunk.is_empty() && !sess.response_chunk_delivered {
@@ -2621,11 +2590,9 @@ fn spawn_listen_worker_with_ready(
     }
     let task_owner = owner.clone();
     let task = handle.spawn(async move {
-        // Dynamic duplex identities are registered by
-        // `run_dynamic_local_tcp_stream` before this worker is spawned.
-        // Registering here as well causes a replacement-fee race: the
-        // second request can be rejected with "replacement fee too low",
-        // while the worker still starts an SSE for an unconfirmed route.
+        let user_pgp_key_id = temporary_identity
+            .as_ref()
+            .map(|identity| identity.user_key_id.clone());
         let mut last_failed: Option<String> = None;
         loop {
             if task_owner.is_cancelled() {
@@ -2647,6 +2614,7 @@ fn spawn_listen_worker_with_ready(
                         &mailbox_route,
                         &entry,
                         eth,
+                        user_pgp_key_id.as_deref(),
                     ),
                     _ => listen::prepare_l0_listen_post(
                         &routing_eoa,
@@ -2654,6 +2622,7 @@ fn spawn_listen_worker_with_ready(
                         &mailbox_route,
                         &entry,
                         &signer_eth,
+                        user_pgp_key_id.as_deref(),
                     ),
                 }
             } else {
@@ -2663,9 +2632,6 @@ fn spawn_listen_worker_with_ready(
                 Ok((url, armor)) => match listen::open_listen_sse(&client, &url, &armor).await {
                     Ok(response) => {
                         task_owner.set_entry(&entry);
-                        if let Some(ready) = ready.take() {
-                            let _ = ready.send(());
-                        }
                         last_failed = None;
                         if l0_exclusive {
                             if let Some(ctx) = pipe_rebuild.as_ref() {
@@ -2677,6 +2643,7 @@ fn spawn_listen_worker_with_ready(
                             &tx,
                             task_owner.clone(),
                             l0_exclusive.then_some(pipe::PIPE_DATA_TIMEOUT),
+                            ready.take(),
                         )
                         .await
                         {
@@ -2927,10 +2894,8 @@ async fn run_dynamic_local_tcp_stream(
         return Ok(());
     }
     first_chunk.truncate(first_len);
-    // This temporary wallet is listened to by this client, so its AddressPGP
-    // route must be this client's mailbox route. Registering the destination
-    // proxy route here makes the proxy's reverse l0_connect hit the wrong B
-    // and return 404 even though the offer itself was delivered.
+    // Temporary wallets stay local. Mailbox SI is announced in duplex_offer
+    // after this host's l0_listen handshake; do not register AddressPGP.
     let (identity, listen_already_up) = match ready_pool.as_ref().and_then(|pool| pool.take()) {
         Some(identity) => {
             tracing::info!(
@@ -2943,45 +2908,10 @@ async fn run_dynamic_local_tcp_stream(
         }
         None => {
             let identity = crate::l0::identity::TemporaryIdentity::generate()?;
-            let route_key_id = pgp::transport_key_id_armored(&wire.route_pgp)?;
-            let mut registered = false;
-            for attempt in 1..=5 {
-                match identity
-                    .register_route(
-                        "https://beamio.app/api/regiestChatRoute",
-                        &route_key_id,
-                        Some(wire.rpc.as_str()),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        registered = true;
-                        tracing::info!(
-                            eoa = %identity.wallet_address(),
-                            route_key_id = %route_key_id,
-                            "temporary route registered before duplex offer"
-                        );
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            eoa = %identity.wallet_address(),
-                            attempt,
-                            error = %err,
-                            "temporary route registration failed before duplex offer"
-                        );
-                        tokio::time::sleep(Duration::from_secs(
-                            LISTEN_RECONNECT_SECS.saturating_mul(attempt as u64),
-                        ))
-                        .await;
-                    }
-                }
-            }
-            if !registered {
-                return Err(L0dError::L0(
-                    "temporary route registration exhausted before duplex offer".into(),
-                ));
-            }
+            tracing::info!(
+                eoa = %identity.wallet_address(),
+                "temporary identity minted before duplex offer (no AddressPGP registration)"
+            );
             (identity, false)
         }
     };
@@ -3011,6 +2941,7 @@ async fn run_dynamic_local_tcp_stream(
         peer_listen_user_pgp: None,
         peer_listen_route_pgp: None,
         peer_listen_wallet: None,
+        peer_listen_mailbox_wallet: None,
         accept_identity: Some(identity.clone()),
         peer_return_attached: false,
         response_chunk_delivered: false,
@@ -3086,10 +3017,16 @@ async fn run_dynamic_local_tcp_stream(
     spawn_duplex_offer(
         wire.clone(),
         peer_keys.user.0,
+        peer_keys.route.0.clone(),
         peer_keys.peer_eoa.clone(),
         session,
         duplex.clone(),
         Some(first_chunk),
+        listen_owners
+            .find_by_wallet(identity.wallet_address())
+            .and_then(|owner| owner.mailbox_si_wallet())
+            .unwrap_or_default(),
+        listen_owners.clone(),
     );
     tracing::info!(
         session = %session_id,
@@ -3761,6 +3698,7 @@ fn spawn_duplex_runtime(
                             peer_listen_user_pgp: None,
                             peer_listen_route_pgp: None,
                             peer_listen_wallet: None,
+                            peer_listen_mailbox_wallet: None,
                             accept_identity: None,
                             peer_return_attached: false,
                             response_chunk_delivered: false,
@@ -3799,10 +3737,13 @@ fn spawn_duplex_runtime(
             spawn_duplex_offer(
                 wire.clone(),
                 keys.user.0.clone(),
+                keys.route.0.clone(),
                 peer_eoa.clone(),
                 sess,
                 duplex.clone(),
                 None,
+                String::new(),
+                listen::ListenOwnerRegistry::default(),
             );
         }
     }
@@ -3856,10 +3797,13 @@ async fn post_control_armor_with_retry(
 fn spawn_duplex_offer(
     wire: ChannelWire,
     peer_user_pgp: String,
+    peer_mailbox_si_pgp: String,
     peer_eoa: String,
     sess: DuplexSession,
     duplex: Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
     first_chunk: Option<Vec<u8>>,
+    own_mailbox_si_wallet: String,
+    listen_owners: listen::ListenOwnerRegistry,
 ) {
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return;
@@ -3904,6 +3848,10 @@ fn spawn_duplex_offer(
                 continue;
             };
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
+            let mailbox_si_wallet = listen_owners
+                .find_by_wallet(&listen_wallet)
+                .and_then(|owner| owner.mailbox_si_wallet())
+                .unwrap_or_else(|| own_mailbox_si_wallet.clone());
             match duplex::encode_offer_command_for_port(
                 &initiator_wallet,
                 wire.eth.address(),
@@ -3912,6 +3860,7 @@ fn spawn_duplex_offer(
                 &listen_wallet,
                 &listen_user_pgp,
                 &wire.route_pgp,
+                &mailbox_si_wallet,
                 sess.port,
                 &session_id,
                 &key,
@@ -3919,6 +3868,7 @@ fn spawn_duplex_offer(
                 first_chunk.as_deref(),
             )
             .and_then(|cmd| duplex::wrap_offer_for_user_pgp(&cmd, &peer_user_pgp, &wire.eth))
+            .and_then(|inner| pgp::wrap_user_armor_for_mailbox_si(&inner, &peer_mailbox_si_pgp))
             {
                 Ok(armor) => {
                     let expected = pgp::transport_key_id_armored(&peer_user_pgp).ok();
@@ -3944,6 +3894,7 @@ fn spawn_duplex_accept_chat(
     sess: DuplexSession,
     duplex: Arc<Mutex<HashMap<DuplexKey, DuplexSession>>>,
     response_chunk: Option<Vec<u8>>,
+    listen_owners: listen::ListenOwnerRegistry,
 ) {
     let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
         return;
@@ -3952,6 +3903,7 @@ fn spawn_duplex_accept_chat(
     let dest = sess.dest;
     let port = sess.port;
     let session_id = sess.session_id.clone();
+    let initiator_mailbox_si_pgp = sess.peer_listen_route_pgp.clone().unwrap_or_default();
     // The billing wallet signs the application accept, but the listen wallet
     // is unique to this accepted proxy line.  Reusing wire.eoa here makes all
     // clients for mainWallet:port contend for one SI-exclusive occupation.
@@ -3990,18 +3942,32 @@ fn spawn_duplex_accept_chat(
                 continue;
             };
             let ts = chrono::Utc::now().timestamp().max(0) as u64;
+            let mailbox_si_wallet = listen_owners
+                .find_by_wallet(&accept_wallet)
+                .and_then(|owner| owner.mailbox_si_wallet())
+                .unwrap_or_default();
             match duplex::encode_accept_command(
                 &accept_wallet,
                 wire.eth.address(),
                 &accept_wallet,
                 &accept_user_pgp,
                 &wire.route_pgp,
+                &mailbox_si_wallet,
                 &session_id,
                 &key,
                 ts,
                 response_chunk.as_deref(),
             )
             .and_then(|cmd| duplex::wrap_accept_for_user_pgp(&cmd, &initiator_pipe_pgp, &wire.eth))
+            .and_then(|inner| {
+                if initiator_mailbox_si_pgp.trim().is_empty() {
+                    Err(L0dError::L0(
+                        "duplex_accept missing initiator mailbox SI PGP".into(),
+                    ))
+                } else {
+                    pgp::wrap_user_armor_for_mailbox_si(&inner, &initiator_mailbox_si_pgp)
+                }
+            })
             {
                 Ok(armor) => {
                     tracing::info!(
@@ -4301,40 +4267,6 @@ async fn warm_one_ready_identity(
     listen_owners: listen::ListenOwnerRegistry,
 ) -> Result<crate::l0::identity::TemporaryIdentity, L0dError> {
     let identity = crate::l0::identity::TemporaryIdentity::generate()?;
-    let route_key_id = pgp::transport_key_id_armored(&wire.route_pgp)?;
-    let mut registered = false;
-    for attempt in 1..=5 {
-        match identity
-            .register_route(
-                "https://beamio.app/api/regiestChatRoute",
-                &route_key_id,
-                Some(wire.rpc.as_str()),
-            )
-            .await
-        {
-            Ok(()) => {
-                registered = true;
-                break;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    eoa = %identity.wallet_address(),
-                    attempt,
-                    error = %err,
-                    "temporary identity pre-warm registration failed"
-                );
-                tokio::time::sleep(Duration::from_secs(
-                    LISTEN_RECONNECT_SECS.saturating_mul(attempt as u64),
-                ))
-                .await;
-            }
-        }
-    }
-    if !registered {
-        return Err(L0dError::L0(
-            "temporary identity pre-warm registration exhausted".into(),
-        ));
-    }
     let (ready_tx, ready_rx) = oneshot::channel();
     if !spawn_listen_worker_with_ready(
         wire.listen_entries.clone(),
@@ -4566,6 +4498,7 @@ mod tests {
                 peer_listen_user_pgp: None,
                 peer_listen_route_pgp: None,
                 peer_listen_wallet: None,
+                peer_listen_mailbox_wallet: None,
                 accept_identity: None,
                 peer_return_attached: false,
                 response_chunk_delivered: false,
@@ -4609,6 +4542,7 @@ mod tests {
                 peer_listen_user_pgp: None,
                 peer_listen_route_pgp: None,
                 peer_listen_wallet: Some("0x2222222222222222222222222222222222222222".into()),
+                peer_listen_mailbox_wallet: None,
                 accept_identity: None,
                 peer_return_attached: false,
                 response_chunk_delivered: false,
@@ -4658,6 +4592,7 @@ mod tests {
                 peer_listen_user_pgp: None,
                 peer_listen_route_pgp: None,
                 peer_listen_wallet: None,
+                peer_listen_mailbox_wallet: None,
                 accept_identity: None,
                 peer_return_attached: false,
                 response_chunk_delivered: false,
@@ -5051,6 +4986,7 @@ mod tests {
             peer_listen_user_pgp: None,
             peer_listen_route_pgp: None,
             peer_listen_wallet: Some("0x2222222222222222222222222222222222222222".into()),
+            peer_listen_mailbox_wallet: None,
             accept_identity: None,
             peer_return_attached: false,
             response_chunk_delivered: false,

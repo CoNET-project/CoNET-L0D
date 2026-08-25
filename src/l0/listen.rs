@@ -53,6 +53,7 @@ pub struct OwnedListenSession {
     session_id: Mutex<Option<String>>,
     pub listen_kind: String,
     pub entry: Mutex<Option<String>>,
+    pub mailbox_si_wallet: Mutex<Option<String>>,
     pub cancel: Arc<AtomicBool>,
     pub task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -94,6 +95,7 @@ impl OwnedListenSession {
             session_id: Mutex::new(session_id),
             listen_kind,
             entry: Mutex::new(None),
+            mailbox_si_wallet: Mutex::new(None),
             cancel: Arc::new(AtomicBool::new(false)),
             task: Mutex::new(None),
         })
@@ -124,6 +126,23 @@ impl OwnedListenSession {
         if let Ok(mut current) = self.entry.lock() {
             *current = Some(entry.into());
         }
+    }
+
+    pub fn set_mailbox_si_wallet(&self, wallet: impl Into<String>) {
+        let wallet = wallet.into();
+        if wallet.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut current) = self.mailbox_si_wallet.lock() {
+            *current = Some(wallet.to_ascii_lowercase());
+        }
+    }
+
+    pub fn mailbox_si_wallet(&self) -> Option<String> {
+        self.mailbox_si_wallet
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     pub fn attach_task(&self, task: JoinHandle<()>) {
@@ -225,13 +244,21 @@ pub fn encode_listen_command(wallet: &str, timestamp: u64) -> Result<String, L0d
 }
 
 /// Exclusive L0 listen. Encrypt to B route PGP. Never put overlay Securitykey here.
-pub fn encode_l0_listen_command(wallet: &str, timestamp: u64) -> Result<String, L0dError> {
-    let json = serde_json::json!({
+/// `user_pgp_key_id` lets mailbox index the pool without AddressPGP.
+pub fn encode_l0_listen_command(
+    wallet: &str,
+    timestamp: u64,
+    user_pgp_key_id: Option<&str>,
+) -> Result<String, L0dError> {
+    let mut json = serde_json::json!({
         "command": "l0_listen",
         "listenKind": "l0",
         "walletAddress": wallet.to_ascii_lowercase(),
         "timestamp": timestamp,
     });
+    if let Some(key_id) = user_pgp_key_id.map(str::trim).filter(|s| !s.is_empty()) {
+        json["userPgpKeyId"] = Value::String(key_id.to_ascii_uppercase());
+    }
     let text = serde_json::to_string(&json).map_err(|e| L0dError::L0(e.to_string()))?;
     if text.contains("Securitykey") || text.contains("signMessage") {
         return Err(L0dError::L0(
@@ -239,6 +266,19 @@ pub fn encode_l0_listen_command(wallet: &str, timestamp: u64) -> Result<String, 
         ));
     }
     Ok(text)
+}
+
+/// First SSE event after mailbox accepts `l0_listen`.
+pub fn parse_l0_listen_handshake(payload: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(payload.trim()).ok()?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let wallet = v.get("nodeWallet").and_then(Value::as_str)?.trim();
+    if wallet.len() != 42 || !wallet.starts_with("0x") {
+        return None;
+    }
+    Some(wallet.to_ascii_lowercase())
 }
 
 /// First occupy packet. Encrypt to **target** mailbox B route PGP. No overlay key.
@@ -425,8 +465,9 @@ pub fn prepare_l0_listen_post(
     route_pub_armored: &str,
     entry: &str,
     eth: &EthSecret,
+    user_pgp_key_id: Option<&str>,
 ) -> Result<(String, String), L0dError> {
-    let cmd = encode_l0_listen_command(wallet, timestamp)?;
+    let cmd = encode_l0_listen_command(wallet, timestamp, user_pgp_key_id)?;
     let armor = wrap_listen_for_post_as(&cmd, route_pub_armored, eth)?;
     let url = post::post_url(entry)?;
     Ok((url, armor))
@@ -439,9 +480,10 @@ pub fn prepare_l0_listen_post_with_billing(
     route_pub_armored: &str,
     entry: &str,
     billing_eth: &EthSecret,
+    user_pgp_key_id: Option<&str>,
 ) -> Result<(String, String), L0dError> {
     let cmd = encode_signed_listen_plaintext_with_billing(
-        &encode_l0_listen_command(wallet, timestamp)?,
+        &encode_l0_listen_command(wallet, timestamp, user_pgp_key_id)?,
         billing_eth,
         billing_wallet,
     )?;
@@ -494,9 +536,8 @@ pub fn listen_http_client() -> Result<reqwest::Client, L0dError> {
 /// POST listen armor. Require both HTTP 2xx and an actual SSE response.
 ///
 /// SI intentionally returns a finite `text/html` JSON body for protocol-level
-/// failures such as `not_my_route`.  Treating that 200 response as ready lets a
-/// temporary duplex line connect its upstream before AddressPGP propagation
-/// has made the listen route usable.
+/// failures such as `pool_full`. Treating a non-SSE 200 as ready would let a
+/// temporary duplex line occupy before mailbox actually holds the listen.
 pub async fn open_listen_sse(
     client: &reqwest::Client,
     url: &str,
@@ -663,7 +704,8 @@ fn extract_armors_from_frame(frame: &str) -> Vec<String> {
     }
     let trimmed = payload.trim();
     if trimmed.starts_with('{')
-        && (crate::l0::duplex::parse_duplex_frame_json(trimmed).is_some()
+        && (parse_l0_listen_handshake(trimmed).is_some()
+            || crate::l0::duplex::parse_duplex_frame_json(trimmed).is_some()
             || crate::l0::duplex::parse_accept_plain(trimmed).is_ok()
             || crate::l0::duplex::parse_reject(trimmed).is_some()
             || crate::l0::duplex::parse_l0_occupied(trimmed)
@@ -815,6 +857,24 @@ pub async fn pump_sse_armors_owned(
     }
 }
 
+fn note_listen_handshake_or_ready(
+    owner: &OwnedListenSession,
+    payload: &str,
+    ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) -> bool {
+    if let Some(wallet) = parse_l0_listen_handshake(payload) {
+        owner.set_mailbox_si_wallet(wallet);
+        if let Some(tx) = ready.take() {
+            let _ = tx.send(());
+        }
+        return true;
+    }
+    if let Some(tx) = ready.take() {
+        let _ = tx.send(());
+    }
+    false
+}
+
 /// Owned SSE pump.  Cancellation is checked before reads and before queueing
 /// each frame, so a wrong-key/session error can close only this connection.
 pub async fn pump_sse_armors_owned_session(
@@ -822,6 +882,7 @@ pub async fn pump_sse_armors_owned_session(
     armor_tx: &mpsc::Sender<InboundChunk>,
     owner: Arc<OwnedListenSession>,
     idle_timeout: Option<Duration>,
+    mut ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), L0dError> {
     let mut buf = String::new();
     loop {
@@ -848,6 +909,9 @@ pub async fn pump_sse_armors_owned_session(
                     if owner.is_cancelled() {
                         return Ok(());
                     }
+                    if note_listen_handshake_or_ready(&owner, &armor, &mut ready) {
+                        continue;
+                    }
                     if armor_tx
                         .send(InboundChunk::new(
                             owner.id.clone(),
@@ -865,6 +929,9 @@ pub async fn pump_sse_armors_owned_session(
                 for armor in extract_inbound_armors(&buf) {
                     if owner.is_cancelled() {
                         return Ok(());
+                    }
+                    if note_listen_handshake_or_ready(&owner, &armor, &mut ready) {
+                        continue;
                     }
                     if armor_tx
                         .send(InboundChunk::new(
@@ -1043,12 +1110,26 @@ mod tests {
     }
 
     #[test]
+    fn l0_listen_handshake_carries_mailbox_si_wallet() {
+        let wallet = parse_l0_listen_handshake(
+            r#"{"ok":true,"kind":"l0","wallet":"0x1111111111111111111111111111111111111111","nodeWallet":"0xAbCdeF0123456789abcdef0123456789aBcDef01"}"#,
+        )
+        .expect("handshake");
+        assert_eq!(wallet, "0xabcdef0123456789abcdef0123456789abcdef01");
+        assert!(parse_l0_listen_handshake(r#"{"ok":false}"#).is_none());
+    }
+
+    #[test]
     fn l0_listen_and_connect_have_no_overlay_key() {
-        let listen =
-            encode_l0_listen_command("0x1111111111111111111111111111111111111111", 1_710_000_000)
-                .unwrap();
+        let listen = encode_l0_listen_command(
+            "0x1111111111111111111111111111111111111111",
+            1_710_000_000,
+            Some("ABCD1234EFGH5678"),
+        )
+        .unwrap();
         assert!(listen.contains("\"l0_listen\""));
         assert!(listen.contains("\"l0\""));
+        assert!(listen.contains("userPgpKeyId"));
         assert!(!listen.contains("Securitykey"));
         let connect = encode_l0_connect_command(
             "0x1111111111111111111111111111111111111111",
